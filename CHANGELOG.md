@@ -4,6 +4,10 @@ All notable changes to this project are listed here.
 
 ## [Unreleased]
 
+### Added
+- Display themes: Light, Dark and Auto (dark between sunset and sunrise for the city on screen). Switch with the THEME button on the System page or on the web Settings page
+- Redesigned display: weather icons, a new home screen with a clock card, detail tiles and upcoming-rain bars, bold text, and anti-aliased cards on every page
+
 ### Fixed
 - A failed weather refresh no longer blanks the screen (0.0 °C) until the next attempt; the last good data stays up, with the status dot turning red
 - Open-Meteo (KNMI) no longer shows made-up "0/0 C CLEAR" forecast days: it now uses KNMI's seamless model (2 km Netherlands model, topped up with ECMWF), and any day a model doesn't cover shows "NO DATA"
@@ -21,6 +25,8 @@ All notable changes to this project are listed here.
 - Endpoints that change settings or history now require the `X-Requested-With: DesktopDisplay` header, so other websites can't change them through your browser
 
 ### Changed
+- Requires TFT_eSPI 2.5 or newer (anti-aliased drawing functions)
+- Atmosphere page shows label and value on one line; forecast rows show an icon and a temperature range bar
 - Opening the device's address now shows the Live Dashboard; Settings moved to `/settings`
 - The dashboard clock uses 7-segment digits like the device's own clock
 - Home screen: the temperature and its °C are now centered together, and the page dots no longer touch the card border
