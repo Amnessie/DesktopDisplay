@@ -11,6 +11,8 @@ A touch-screen weather station for the 3.5-inch **E32R35T / E32N35T** ESP32 disp
 - Current weather: temperature, feels-like, humidity, wind speed and direction, air pressure, visibility
 - Three cities, switchable from the screen or the web page
 - Rain in the next 2 hours on the home screen: "Rain from 14:35" / "Dry for the next 2 hours" with a bar per 5 minutes, from Buienradar's radar in the Netherlands and Belgium (Open-Meteo's 15-minute forecast elsewhere, labelled as forecast)
+- Past the first hour, the radar outlook is blended with Open-Meteo's 15-minute model ("rain possible from 16:45 (forecast)"), shown as faint bars behind the radar bars
+- Forecast check on the dashboard: in the radar area, the station scores each weather source's rain forecast against what the radar actually measured, and after 10 rainy periods tells you which source is most accurate where you live (one tap to switch)
 - Optional LED alert: two slow blue pulses when rain is expected within 30 minutes (once per rain spell; switch it on or off in the web Settings)
 - Pressure trend over the last 3 hours (steady / rising / falling / fast), using the official WMO classes, with an arrow in the pressure tile
 - Rain page with 1h/3h rainfall and upcoming rain in 3-hour steps
