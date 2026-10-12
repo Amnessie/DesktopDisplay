@@ -42,6 +42,7 @@
 SPIClass sdSPI(HSPI); // dedicated bus for the SD card only - genuinely separate hardware peripheral from the display/touch's VSPI
 bool sdOK = false;
 void handleHistoryPage(); // defined at the very end of the sketch (see [HISTORY WEB PAGE])
+extern const char SEG_CLOCK_JS[]; // dashboard 7-segment clock script, also at the end of the sketch
 // NOTE: history is now stored per city (/hist_c0.csv, /hist_c1.csv,
 // /hist_c2.csv) - see the [PER-CITY HISTORY] section further down.
 
@@ -87,7 +88,7 @@ String activeApiKeySource = "primary"; // NEW: which key served the last success
 // --- [DYNAMIC MULTI-CITY SETTINGS] ---
 const int NUM_CITIES = 3;
 String locs[NUM_CITIES];
-int timeZones[NUM_CITIES] = {0, 0, 0};
+long tzOffsetSec[NUM_CITIES] = {0, 0, 0}; // UTC offset per city in seconds (handles half-hour zones like India)
 int currentCity = 0; 
 Preferences prefs;            
 WebServer server(80); 
@@ -205,6 +206,20 @@ float upcomingRainMm[RAIN_GRAPH_POINTS];
 String upcomingRainLabel[RAIN_GRAPH_POINTS];
 int upcomingRainCount = 0;
 
+// NEW: everything a fetch overwrites, so a failed refresh can put the last good
+// data back instead of leaving the screen at 0.0 C until the next attempt.
+struct WeatherSnapshot {
+  float tempnum, tempMin, tempMax, feels_like, windSpeedKmH, rain1h, rain3h;
+  int huminum, pressure, visibility, clouds;
+  String weatherDesc, mainWeather, windDir, sunRise, sunSet;
+  time_t sysRise, sysSet;
+  ForecastDay forecast[5];
+  float upcomingRainMm[RAIN_GRAPH_POINTS];
+  String upcomingRainLabel[RAIN_GRAPH_POINTS];
+  int upcomingRainCount;
+};
+// (Declared up here, before any function, for the same prototype reason as SunCountdown.)
+
 bool isTouched = false, touchHandled = false;
 unsigned long touchStartTime = 0;
 uint16_t startX, startY;
@@ -227,6 +242,53 @@ void logDebug(String msg) {
   if (debugLogCount < DEBUG_LOG_SIZE) debugLogCount++;
 }
 
+// --- [ESCAPING HELPERS] ---
+// For text from the user or an API that ends up inside a JSON string
+// (quotes in a city name or an HTTP error body would otherwise break the JSON).
+String jsonEsc(String s) {
+  s.replace("\\", "\\\\"); s.replace("\"", "\\\"");
+  s.replace("\n", "\\n"); s.replace("\r", "\\r"); s.replace("\t", "\\t");
+  return s;
+}
+
+// For text placed inside an HTML attribute value or element (e.g. "Val-d'Or").
+String htmlEsc(String s) {
+  s.replace("&", "&amp;"); s.replace("<", "&lt;"); s.replace(">", "&gt;");
+  s.replace("\"", "&quot;"); s.replace("'", "&#39;");
+  return s;
+}
+
+// Percent-encodes everything except unreserved characters (RFC 3986), so city
+// names containing '&', '#', accents etc. survive being put in a query string.
+String urlEncode(String s) {
+  const char *hex = "0123456789ABCDEF";
+  String out;
+  out.reserve(s.length() * 3);
+  for (unsigned int i = 0; i < s.length(); i++) {
+    uint8_t c = (uint8_t)s[i];
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') out += (char)c;
+    else { out += '%'; out += hex[c >> 4]; out += hex[c & 0x0F]; }
+  }
+  return out;
+}
+
+// --- [CSRF PROTECTION] ---
+// Every endpoint that changes something requires this header. Browsers won't
+// let another website add a custom header to a request aimed at the device
+// (it would need a CORS preflight, which the device never approves), and plain
+// links, <img> tags or <form> posts can't add one at all - so a random page you
+// visit can no longer change settings or wipe history behind your back.
+const char* APP_HEADER_NAME  = "X-Requested-With";
+const char* APP_HEADER_VALUE = "DesktopDisplay";
+
+bool hasAppHeader() { return server.header(APP_HEADER_NAME) == APP_HEADER_VALUE; }
+
+bool requireAppHeader() {
+  if (hasAppHeader()) return true;
+  server.send(403, "text/plain", "Forbidden: missing X-Requested-With: DesktopDisplay header");
+  return false;
+}
+
 // NEW: layout constants for newly-added UI elements.
 // (Pre-existing layout numbers are left as inline literals to limit the size of this change;
 //  these are just for the bits added in this update, and are the easiest to retune on real hardware.)
@@ -236,7 +298,7 @@ const int HOME_ARROW_Y        = 25;
 const int STATUS_DOT_X        = 270;
 const int STATUS_DOT_Y        = 395; // NEW: raised to sit level with the "NEXT RAIN" title, was overlapping the rain preview's rightmost point down at 450
 const int STATUS_DOT_R        = 5;
-const int NAV_DOT_Y           = 474;
+const int NAV_DOT_Y           = 475; // cards end at y=466, so the dots no longer touch their border
 const int CITY_DOT_Y          = 44;
 const int UPDATE_BADGE_X      = 270;
 const int UPDATE_BADGE_Y      = 6;
@@ -369,6 +431,29 @@ void applyCustomColor() {
 }
 
 void updateBacklight() { analogWrite(LCD_BL_PIN, globalBrightness); }
+
+// Screen/LED brightness are saved a few seconds after the last change rather
+// than on every slider step, so dragging a slider doesn't hammer the flash.
+bool brightnessDirty = false;
+unsigned long brightnessChangedAt = 0;
+const unsigned long BRIGHTNESS_SAVE_DELAY_MS = 3000;
+
+void markBrightnessDirty() { brightnessDirty = true; brightnessChangedAt = millis(); }
+
+void saveBrightnessIfDue() {
+  if (!brightnessDirty || millis() - brightnessChangedAt < BRIGHTNESS_SAVE_DELAY_MS) return;
+  brightnessDirty = false;
+  prefs.putInt("bright", globalBrightness);
+  prefs.putInt("ledB", ledBrightness);
+}
+
+// Saves the custom LED color as the boot default. Hue/saturation/value are
+// stored too, so the sliders come back exactly where they were (R/G/B alone
+// can't reproduce a reduced saturation or lightness setting).
+void saveCustomColor() {
+  prefs.putInt("cR", custR); prefs.putInt("cG", custG); prefs.putInt("cB", custB);
+  prefs.putInt("cHue", customHue); prefs.putInt("cSat", customSat); prefs.putInt("cVal", customVal);
+}
 
 void touch_calibrate() {
   uint16_t calData[5]; uint8_t calDataOK = 0;
@@ -572,7 +657,7 @@ bool getCityCoords(int idx, double &lat, double &lon) {
   String currentLoc = loc;
   currentLoc.replace(",UK", ",GB");
   currentLoc.replace(",uk", ",GB");
-  String encodedLoc = currentLoc; encodedLoc.replace(" ", "%20");
+  String encodedLoc = urlEncode(currentLoc);
   String geoUrl = "http://api.openweathermap.org/geo/1.0/direct?q=" + encodedLoc + "&limit=1";
 
   String payload;
@@ -608,7 +693,7 @@ bool fetchFromOpenWeatherMap() {
   String currentLoc = locs[currentCity];
   currentLoc.replace(",UK", ",GB");
   currentLoc.replace(",uk", ",GB");
-  String encodedLoc = currentLoc; encodedLoc.replace(" ", "%20");
+  String encodedLoc = urlEncode(currentLoc);
 
   // Step 2: Weather Call
   String weatherUrl;
@@ -617,7 +702,6 @@ bool fetchFromOpenWeatherMap() {
 
   String weatherPayload;
   if (httpGetJson(weatherUrl, weatherPayload) == HTTP_CODE_OK) {
-    Serial.println("RAW WEATHER DATA: " + weatherPayload);
     DynamicJsonDocument doc(3072); deserializeJson(doc, weatherPayload);
     if (doc.containsKey("main")) {
       tempnum = doc["main"]["temp"].as<float>(); 
@@ -636,9 +720,9 @@ bool fetchFromOpenWeatherMap() {
       rain1h = doc["rain"]["1h"] | 0.0; 
       rain3h = doc["rain"]["3h"] | 0.0;
       if (!foundByGeo && doc.containsKey("coord")) { lat = doc["coord"]["lat"]; lon = doc["coord"]["lon"]; }
-      timeZones[currentCity] = doc["timezone"].as<int>() / 3600; 
-      sysRise = doc["sys"]["sunrise"].as<long>() + (timeZones[currentCity] * 3600);
-      sysSet  = doc["sys"]["sunset"].as<long>() + (timeZones[currentCity] * 3600);
+      tzOffsetSec[currentCity] = doc["timezone"].as<long>();
+      sysRise = doc["sys"]["sunrise"].as<long>() + tzOffsetSec[currentCity];
+      sysSet  = doc["sys"]["sunset"].as<long>() + tzOffsetSec[currentCity];
       sunRise = (hour(sysRise) < 10 ? "0" : "") + String(hour(sysRise)) + ":" + (minute(sysRise) < 10 ? "0" : "") + String(minute(sysRise));
       sunSet  = (hour(sysSet) < 10 ? "0" : "") + String(hour(sysSet)) + ":" + (minute(sysSet) < 10 ? "0" : "") + String(minute(sysSet));
       setWeatherLED(mainWeather);
@@ -653,12 +737,22 @@ bool fetchFromOpenWeatherMap() {
 
   String forecastPayload;
   if (httpGetJson(forecastUrl, forecastPayload) == HTTP_CODE_OK) {
-    DynamicJsonDocument fdoc(20000); deserializeJson(fdoc, forecastPayload);
-    if (fdoc.containsKey("list")) {
+    // Only keep the fields we actually use - the full 40-slice response is far
+    // bigger than needed and could run out of memory part-way through parsing
+    // (silently dropping the later forecast days).
+    DynamicJsonDocument filter(512);
+    filter["list"][0]["dt"] = true;
+    filter["list"][0]["main"]["temp"] = true;
+    filter["list"][0]["weather"][0]["main"] = true;
+    filter["list"][0]["rain"]["3h"] = true;
+    DynamicJsonDocument fdoc(12288);
+    DeserializationError ferr = deserializeJson(fdoc, forecastPayload, DeserializationOption::Filter(filter));
+    if (ferr) logDebug("Forecast JSON error: " + String(ferr.c_str()));
+    if (!ferr && fdoc.containsKey("list")) {
       JsonArray list = fdoc["list"];
       int dIdx = -1; String curL = "";
       for (JsonObject slice : list) {
-        long dt = slice["dt"].as<long>() + (timeZones[currentCity] * 3600);
+        long dt = slice["dt"].as<long>() + tzOffsetSec[currentCity];
 
         // Grab the rainfall figure for each of the next few 3-hour slices,
         // independent of the day-bucketing below, for the precipitation graph
@@ -691,19 +785,24 @@ bool fetchFromOpenWeatherMap() {
 }
 
 // NEW: fetches from Open-Meteo - no API key needed, one combined request
-// gets current + hourly + daily data. useKnmiModel pins the request to
-// KNMI's own Harmonie AROME Netherlands model (2km resolution) instead of
-// Open-Meteo's global best-match model.
+// gets current + hourly + daily data. useKnmiModel uses KNMI's "seamless"
+// blend: their 2km Harmonie AROME Netherlands model where it has data, filled
+// in with KNMI's Europe model and then ECMWF beyond its ~2.5-day range or
+// outside the Netherlands - so all 5 forecast days always get real values.
+// Reads a JSON number as float, or def if it's missing/null (Open-Meteo uses
+// null for values a model doesn't cover).
+float jsonNum(JsonVariant v, float def) { return v.isNull() ? def : v.as<float>(); }
+
 bool fetchFromOpenMeteo(bool useKnmiModel) {
   double lat = 0, lon = 0;
   if (!getCityCoords(currentCity, lat, lon)) return false; // Open-Meteo needs coordinates, not a free-text city name
 
   String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 6) + "&longitude=" + String(lon, 6)
-    + "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,surface_pressure,wind_speed_10m,wind_direction_10m,visibility,cloud_cover"
+    + "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,pressure_msl,wind_speed_10m,wind_direction_10m,visibility,cloud_cover"
     + "&hourly=weather_code,precipitation"
     + "&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset"
     + "&timezone=auto&forecast_days=5&forecast_hours=15";
-  if (useKnmiModel) url += "&models=knmi_harmonie_arome_netherlands";
+  if (useKnmiModel) url += "&models=knmi_seamless";
 
   HTTPClient http;
   http.setTimeout(5000);
@@ -712,28 +811,30 @@ bool fetchFromOpenMeteo(bool useKnmiModel) {
   if (code != HTTP_CODE_OK) { http.end(); return false; }
   String payload = http.getString();
   http.end();
-  Serial.println("RAW OPEN-METEO DATA: " + payload);
 
   DynamicJsonDocument doc(8192);
   DeserializationError err = deserializeJson(doc, payload);
   if (err || !doc.containsKey("current")) return false;
 
   JsonObject cur = doc["current"];
+  // A model without data for this place/time returns nulls - treat that as a
+  // failed fetch rather than showing 0.0 C.
+  if (cur["temperature_2m"].isNull() || cur["weather_code"].isNull()) return false;
   tempnum = cur["temperature_2m"].as<float>();
-  feels_like = cur["apparent_temperature"].as<float>();
-  huminum = (int)cur["relative_humidity_2m"];
-  pressure = (int)cur["surface_pressure"];
-  clouds = (int)cur["cloud_cover"];
-  visibility = (int)cur["visibility"] / 1000;
-  windSpeedKmH = cur["wind_speed_10m"].as<float>(); // Open-Meteo's default unit is already km/h
-  windDir = getWindDir(cur["wind_direction_10m"].as<int>());
+  feels_like = jsonNum(cur["apparent_temperature"], tempnum);
+  huminum = (int)round(jsonNum(cur["relative_humidity_2m"], 0));
+  pressure = (int)round(jsonNum(cur["pressure_msl"], 0)); // sea level, same as OpenWeatherMap and the history log
+  clouds = (int)round(jsonNum(cur["cloud_cover"], 0));
+  visibility = (int)(jsonNum(cur["visibility"], 0) / 1000);
+  windSpeedKmH = jsonNum(cur["wind_speed_10m"], 0); // Open-Meteo's default unit is already km/h
+  windDir = getWindDir((int)jsonNum(cur["wind_direction_10m"], 0));
   int codeNow = cur["weather_code"].as<int>();
   mainWeather = wmoToMain(codeNow);
   weatherDesc = wmoToDesc(codeNow);
   setWeatherLED(mainWeather);
 
-  int utcOffsetSec = doc["utc_offset_seconds"] | 0;
-  timeZones[currentCity] = utcOffsetSec / 3600;
+  long utcOffsetSec = doc["utc_offset_seconds"] | 0L;
+  tzOffsetSec[currentCity] = utcOffsetSec;
 
   // Daily: today's high/low, sunrise/sunset, and the 5-day forecast page
   if (doc.containsKey("daily")) {
@@ -745,13 +846,16 @@ bool fetchFromOpenMeteo(bool useKnmiModel) {
     JsonArray dSunrise = daily["sunrise"];
     JsonArray dSunset = daily["sunset"];
 
-    if (dMax.size() > 0) tempMax = dMax[0].as<float>();
-    if (dMin.size() > 0) tempMin = dMin[0].as<float>();
-    if (dSunrise.size() > 0) sunRise = dSunrise[0].as<String>().substring(11, 16);
-    if (dSunset.size() > 0) sunSet = dSunset[0].as<String>().substring(11, 16);
+    if (dMax.size() > 0 && !dMax[0].isNull()) tempMax = dMax[0].as<float>();
+    if (dMin.size() > 0 && !dMin[0].isNull()) tempMin = dMin[0].as<float>();
+    if (dSunrise.size() > 0 && !dSunrise[0].isNull()) sunRise = dSunrise[0].as<String>().substring(11, 16);
+    if (dSunset.size() > 0 && !dSunset[0].isNull()) sunSet = dSunset[0].as<String>().substring(11, 16);
 
     int days = min((int)dTime.size(), 5);
     for (int i = 0; i < days; i++) {
+      // Days the model doesn't cover come back as null - show "NO DATA"
+      // for them instead of a made-up 0/0 C "CLEAR" day.
+      if (dMax[i].isNull() || dMin[i].isNull() || dCode[i].isNull()) { forecast[i].valid = false; continue; }
       forecast[i].dayName = getDayName(dayOfWeekFromDateString(dTime[i].as<String>()));
       forecast[i].high = dMax[i].as<float>();
       forecast[i].low = dMin[i].as<float>();
@@ -761,21 +865,25 @@ bool fetchFromOpenMeteo(bool useKnmiModel) {
     }
   }
 
-  // Hourly: 1h/3h rainfall totals, and the upcoming-rain graph (sampled
-  // every 3rd hour to match the existing 5-point "3H STEPS" layout)
+  // Hourly: 1h/3h rainfall totals, and the upcoming-rain graph. Each graph
+  // point is the SUM of three hourly values, so it's a true 3-hour total -
+  // the same thing OpenWeatherMap's 3-hour forecast slices report.
   if (doc.containsKey("hourly")) {
     JsonObject hourlyObj = doc["hourly"];
     JsonArray hTime = hourlyObj["time"];
     JsonArray hPrecip = hourlyObj["precipitation"];
+    int nHours = min((int)hPrecip.size(), (int)hTime.size());
 
-    rain1h = hPrecip.size() > 0 ? hPrecip[0].as<float>() : 0.0;
+    rain1h = nHours > 0 ? jsonNum(hPrecip[0], 0) : 0.0f;
     rain3h = 0.0;
-    for (int i = 0; i < 3 && i < (int)hPrecip.size(); i++) rain3h += hPrecip[i].as<float>();
+    for (int i = 0; i < 3 && i < nHours; i++) rain3h += jsonNum(hPrecip[i], 0);
 
     for (int i = 0; i < RAIN_GRAPH_POINTS; i++) {
       int idx = i * 3;
-      if (idx >= (int)hPrecip.size() || idx >= (int)hTime.size()) break;
-      upcomingRainMm[upcomingRainCount] = hPrecip[idx].as<float>();
+      if (idx >= nHours) break;
+      float sum = 0;
+      for (int h = idx; h < idx + 3 && h < nHours; h++) sum += jsonNum(hPrecip[h], 0);
+      upcomingRainMm[upcomingRainCount] = sum;
       upcomingRainLabel[upcomingRainCount] = hTime[idx].as<String>().substring(11, 13) + "h";
       upcomingRainCount++;
     }
@@ -784,9 +892,47 @@ bool fetchFromOpenMeteo(bool useKnmiModel) {
   return true;
 }
 
+void saveForecastTo(WeatherSnapshot &s) {
+  for (int i = 0; i < 5; i++) s.forecast[i] = forecast[i];
+  for (int i = 0; i < RAIN_GRAPH_POINTS; i++) { s.upcomingRainMm[i] = upcomingRainMm[i]; s.upcomingRainLabel[i] = upcomingRainLabel[i]; }
+  s.upcomingRainCount = upcomingRainCount;
+}
+
+void restoreForecastFrom(const WeatherSnapshot &s) {
+  for (int i = 0; i < 5; i++) forecast[i] = s.forecast[i];
+  for (int i = 0; i < RAIN_GRAPH_POINTS; i++) { upcomingRainMm[i] = s.upcomingRainMm[i]; upcomingRainLabel[i] = s.upcomingRainLabel[i]; }
+  upcomingRainCount = s.upcomingRainCount;
+}
+
+void restoreCurrentFrom(const WeatherSnapshot &s) {
+  tempnum = s.tempnum; tempMin = s.tempMin; tempMax = s.tempMax; feels_like = s.feels_like;
+  windSpeedKmH = s.windSpeedKmH; rain1h = s.rain1h; rain3h = s.rain3h;
+  huminum = s.huminum; pressure = s.pressure; visibility = s.visibility; clouds = s.clouds;
+  weatherDesc = s.weatherDesc; mainWeather = s.mainWeather; windDir = s.windDir;
+  sunRise = s.sunRise; sunSet = s.sunSet; sysRise = s.sysRise; sysSet = s.sysSet;
+}
+
+int lastDataCity = -1;  // which city the data currently in memory belongs to
+bool lastDataOK = false; // whether that data came from a successful fetch
+
 void getOpenWeatherData() {
   if (WiFi.status() != WL_CONNECTED) { lastFetchOK = false; return; }
-  // RESET ALL DATA: Clears ghost data from previous city
+
+  // Keep a copy of the current data if it's a good set for this same city -
+  // a refresh that fails (or only half-succeeds) then falls back to it.
+  bool canRestore = (lastDataCity == currentCity && lastDataOK);
+  WeatherSnapshot snap;
+  if (canRestore) {
+    snap.tempnum = tempnum; snap.tempMin = tempMin; snap.tempMax = tempMax; snap.feels_like = feels_like;
+    snap.windSpeedKmH = windSpeedKmH; snap.rain1h = rain1h; snap.rain3h = rain3h;
+    snap.huminum = huminum; snap.pressure = pressure; snap.visibility = visibility; snap.clouds = clouds;
+    snap.weatherDesc = weatherDesc; snap.mainWeather = mainWeather; snap.windDir = windDir;
+    snap.sunRise = sunRise; snap.sunSet = sunSet; snap.sysRise = sysRise; snap.sysSet = sysSet;
+    saveForecastTo(snap);
+  }
+
+  // RESET ALL DATA: clears ghost data (from the previous city, or from the
+  // last fetch) so nothing stale gets mixed into the new results
   tempnum = 0; tempMin = 0; tempMax = 0;
   huminum = 0; feels_like = 0;
   pressure = 0; visibility = 0; clouds = 0; rain1h = 0; rain3h = 0;
@@ -801,9 +947,24 @@ void getOpenWeatherData() {
     weatherFetchSuccess = fetchFromOpenMeteo(cityProvider[currentCity] == PROVIDER_OPENMETEO_KNMI);
   }
 
+  if (canRestore) {
+    if (!weatherFetchSuccess) {
+      // Whole refresh failed - put everything back (the status dot still
+      // turns red so you can see the data is getting old).
+      restoreCurrentFrom(snap);
+      restoreForecastFrom(snap);
+      setWeatherLED(mainWeather);
+      logDebug("Weather refresh failed - keeping previous data");
+    } else if (upcomingRainCount == 0 && !forecast[0].valid) {
+      // Current weather OK but the separate forecast request failed
+      restoreForecastFrom(snap);
+    }
+  }
+
   // NEW: record fetch outcome/time for the status indicator
   lastFetchOK = weatherFetchSuccess;
   if (weatherFetchSuccess) lastFetchMillis = millis();
+  if (weatherFetchSuccess || !canRestore) { lastDataCity = currentCity; lastDataOK = weatherFetchSuccess; }
   // NOTE: history is no longer sampled here - see historyLoop(), which logs
   // all three cities in the background regardless of which one is shown.
 }
@@ -862,8 +1023,8 @@ String buildProviderSelect(String fieldName, int currentProvider) {
 }
 
 // --- [SMARTER WEB PORTAL FUNCTIONS] ---
-// UPDATE 2: Added API key input to HTML and Saving Process
-void handleRoot() {
+// Settings page (served at /settings - the dashboard is the start page at /)
+void handleSettingsPage() {
   // NEW: current values, converted to the 0-100% scale the sliders use
   int screenPct = map(globalBrightness, 10, 255, 0, 100);
   int ledPct    = map(ledBrightness, 0, 255, 0, 100);
@@ -873,7 +1034,7 @@ void handleRoot() {
   int textSatPct  = map(textSat, 0, 255, 0, 100);
   int textValPct  = map(textVal, 0, 255, 0, 100);
 
-  String html = "<html><head><style>";
+  String html = "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><style>";
   html += "body{font-family:sans-serif;text-align:center;max-width:480px;margin:0 auto;padding:10px;}";
   html += "h1{font-size:1.4em;} h2{font-size:1.1em;margin-top:30px;border-top:1px solid #ccc;padding-top:15px;}";
   html += "input[type=range]{width:90%;height:22px;-webkit-appearance:none;border-radius:11px;margin:8px 0;}";
@@ -887,18 +1048,20 @@ void handleRoot() {
   html += "<h1>Weather Station Portal</h1>";
   html += navBar("settings");
 
-  html += "<form action='/save' method='POST'>";
-  html += "City 1: <input type='text' name='c1' value='" + locs[0] + "'> " + buildProviderSelect("provider1", cityProvider[0]) + "<br><br>";
-  html += "City 2: <input type='text' name='c2' value='" + locs[1] + "'> " + buildProviderSelect("provider2", cityProvider[1]) + "<br><br>";
-  html += "City 3: <input type='text' name='c3' value='" + locs[2] + "'> " + buildProviderSelect("provider3", cityProvider[2]) + "<br><br>";
-  html += "<p style='font-size:0.9em;color:#555;'>OpenWeatherMap uses the API key below. Open-Meteo needs no key at all - the KNMI option pins to KNMI's own 2km Netherlands model.</p>";
+  // Submitted from JavaScript (saveSettings below) so the request can carry the
+  // X-Requested-With header that /save requires - see requireAppHeader().
+  html += "<form id='settingsForm' onsubmit='return saveSettings(this)'>";
+  html += "City 1: <input type='text' name='c1' value='" + htmlEsc(locs[0]) + "'> " + buildProviderSelect("provider1", cityProvider[0]) + "<br><br>";
+  html += "City 2: <input type='text' name='c2' value='" + htmlEsc(locs[1]) + "'> " + buildProviderSelect("provider2", cityProvider[1]) + "<br><br>";
+  html += "City 3: <input type='text' name='c3' value='" + htmlEsc(locs[2]) + "'> " + buildProviderSelect("provider3", cityProvider[2]) + "<br><br>";
+  html += "<p style='font-size:0.9em;color:#555;'>OpenWeatherMap uses the API key below. The Open-Meteo weather itself needs no key (the key is still used to look up the city's coordinates). The KNMI option uses KNMI's 2km Netherlands model, topped up with ECMWF beyond its ~2.5-day range.</p>";
   html += "<p style='font-size:0.85em;color:#777;'>Renaming a city starts a fresh history for it (the old log is kept on the SD card).</p>";
-  html += "API Key: <input type='text' name='api' style='width:300px;' value='" + apiKey + "'><br><br>";
-  html += "Backup API Key (optional): <input type='text' name='apiBackup' style='width:300px;' value='" + apiKeyBackup + "'><br><br>";
+  html += "API Key: <input type='text' name='api' style='width:300px;' value='" + htmlEsc(apiKey) + "'><br><br>";
+  html += "Backup API Key (optional): <input type='text' name='apiBackup' style='width:300px;' value='" + htmlEsc(apiKeyBackup) + "'><br><br>";
   html += "Show Home Animation: <input type='checkbox' name='animOn' value='1'" + String(showAnimation ? " checked" : "") + "><br><br>";
   html += "Show Upcoming Rain Preview: <input type='checkbox' name='rainPrevOn' value='1'" + String(showRainPreview ? " checked" : "") + "><br>";
   html += "<span style='font-size:0.85em;color:#777;'>(shares the same spot as the animation above - only one shows at a time)</span><br><br>";
-  html += "<input type='submit' value='Update Settings'>";
+  html += "<input type='submit' value='Update Settings'> <span id='saveMsg'></span>";
   html += "</form>";
 
   // NEW: Display controls - mirrors the touchscreen's System Info page, but
@@ -957,11 +1120,15 @@ void handleRoot() {
   html += "var screenSlider=document.getElementById('screenSlider'),ledSlider=document.getElementById('ledSlider');";
   html += "var hueSlider=document.getElementById('hueSlider'),satSlider=document.getElementById('satSlider'),valSlider=document.getElementById('valSlider');";
   html += "var textHueSlider=document.getElementById('textHueSlider'),textSatSlider=document.getElementById('textSatSlider'),textValSlider=document.getElementById('textValSlider');";
-  html += "var lastSent=0;";
-  html += "function liveSend(action,value,force){var now=Date.now();if(!force&&now-lastSent<60)return;lastSent=now;fetch('/live?action='+action+'&value='+value);}";
-  html += "function setMode(m){fetch('/live?action=mode&value='+m);document.getElementById('colorSection').style.display=(m==1?'block':'none');}";
-  html += "function saveColor(){fetch('/saveColor');}";
-  html += "function saveTextColor(){fetch('/saveTextColor');}";
+  html += "var lastSent=0,H={'X-Requested-With':'DesktopDisplay'};";
+  html += "function api(u,o){o=o||{};o.headers=Object.assign({},o.headers||{},H);return fetch(u,o);}";
+  html += "function saveSettings(f){var m=document.getElementById('saveMsg');m.innerText='Saving...';";
+  html += "api('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(new FormData(f))})";
+  html += ".then(r=>r.text().then(t=>{m.innerText=r.ok?'Saved - refreshing weather...':t;})).catch(e=>{m.innerText='Save failed: '+e;});return false;}";
+  html += "function liveSend(action,value,force){var now=Date.now();if(!force&&now-lastSent<60)return;lastSent=now;api('/live?action='+action+'&value='+value);}";
+  html += "function setMode(m){api('/live?action=mode&value='+m);document.getElementById('colorSection').style.display=(m==1?'block':'none');}";
+  html += "function saveColor(){api('/saveColor');}";
+  html += "function saveTextColor(){api('/saveTextColor');}";
   html += "function updateGradients(){";
   html += "var h=hueSlider.value,s=satSlider.value,v=valSlider.value;";
   html += "satSlider.style.background='linear-gradient(to right, hsl('+h+',0%,'+Math.round(v/2)+'%), hsl('+h+',100%,50%))';";
@@ -1002,6 +1169,7 @@ void handleRoot() {
 }
 
 void handleSave() {
+  if (!requireAppHeader()) return;
   // NEW: invalidate the geocode cache for any city whose text actually changed
   if (server.hasArg("c1") && server.arg("c1") != locs[0]) { locs[0] = server.arg("c1"); cityGeoCached[0] = false; }
   if (server.hasArg("c2") && server.arg("c2") != locs[1]) { locs[1] = server.arg("c2"); cityGeoCached[1] = false; }
@@ -1029,18 +1197,19 @@ void handleSave() {
   prefs.putString("api", apiKey);
   prefs.putString("apiBackup", apiKeyBackup); // NEW
 
-  server.send(200, "text/html; charset=utf-8", "<html><body><h1>Settings Updated!</h1><a href='/'>Go Back</a></body></html>");
+  server.send(200, "text/plain", "OK");
   triggerWeatherUpdate();
 }
 
 // NEW: live-update endpoint for the web portal's sliders. Applies a change
 // immediately (LED color, backlight, sync mode) the moment the browser sends
-// it - the web equivalent of dragging a slider on the touchscreen. Nothing
-// here is written to flash except the sync-mode toggle (which the
-// touchscreen also persists immediately) - the custom color itself is only
-// saved permanently via handleSaveColor()/"Save Color as Default" below,
-// matching the touchscreen's separate "SAVE CUSTOM AS DEFAULT" button.
+// it - the web equivalent of dragging a slider on the touchscreen. The
+// sync-mode toggle is saved right away and brightness a few seconds after the
+// last change (markBrightnessDirty); the custom color itself is only saved
+// permanently via handleSaveColor()/"Save Color as Default" below, matching
+// the touchscreen's separate "SAVE CUSTOM AS DEFAULT" button.
 void handleLive() {
+  if (!requireAppHeader()) return;
   String action = server.arg("action");
   int value = server.arg("value").toInt();
 
@@ -1056,9 +1225,11 @@ void handleLive() {
   } else if (action == "screenBright") {
     globalBrightness = map(constrain(value, 0, 100), 0, 100, 10, 255);
     updateBacklight();
+    markBrightnessDirty();
   } else if (action == "ledBright") {
     ledBrightness = map(constrain(value, 0, 100), 0, 100, 0, 255);
     setWeatherLED(mainWeather);
+    markBrightnessDirty();
   } else if (action == "mode") {
     useCustomColor = (value == 1);
     prefs.putBool("useC", useCustomColor); // matches the touchscreen: mode persists immediately
@@ -1089,6 +1260,7 @@ void handleLive() {
 // NEW: persists the current text color (clock minutes + IP address) as the
 // boot default - the text-color equivalent of handleSaveColor() below.
 void handleSaveTextColor() {
+  if (!requireAppHeader()) return;
   prefs.putInt("txHue", textHue);
   prefs.putInt("txSat", textSat);
   prefs.putInt("txVal", textVal);
@@ -1097,19 +1269,19 @@ void handleSaveTextColor() {
 
 // NEW: persists the current custom color (whatever the live sliders last set
 // it to) as the boot default - the web equivalent of the touchscreen's
-// "SAVE CUSTOM AS DEFAULT" button. Screen/LED brightness are intentionally
-// NOT saved here, matching the touchscreen, where they were never persisted
-// either (they always reset to the last saved default at boot).
+// "SAVE CUSTOM AS DEFAULT" button. (Screen/LED brightness don't need a save
+// button - they're saved automatically a few seconds after you change them.)
 void handleSaveColor() {
-  prefs.putInt("cR", custR); prefs.putInt("cG", custG); prefs.putInt("cB", custB);
+  if (!requireAppHeader()) return;
+  saveCustomColor();
   server.send(200, "text/plain", "OK");
 }
 
-// NEW: small nav bar shared by all three web pages, so they feel like one site
+// NEW: small nav bar shared by all the web pages, so they feel like one site
 String navBar(String current) {
   String html = "<div style='text-align:center;margin-bottom:15px;font-size:0.95em;'>";
-  html += "<a href='/' style='margin:0 10px;" + String(current == "settings" ? "font-weight:bold;text-decoration:underline;" : "") + "'>Settings</a>";
-  html += "<a href='/dashboard' style='margin:0 10px;" + String(current == "dashboard" ? "font-weight:bold;text-decoration:underline;" : "") + "'>Live Dashboard</a>";
+  html += "<a href='/' style='margin:0 10px;" + String(current == "dashboard" ? "font-weight:bold;text-decoration:underline;" : "") + "'>Live Dashboard</a>";
+  html += "<a href='/settings' style='margin:0 10px;" + String(current == "settings" ? "font-weight:bold;text-decoration:underline;" : "") + "'>Settings</a>";
   html += "<a href='/history' style='margin:0 10px;" + String(current == "history" ? "font-weight:bold;text-decoration:underline;" : "") + "'>History</a>";
   html += "<a href='/debug' style='margin:0 10px;" + String(current == "debug" ? "font-weight:bold;text-decoration:underline;" : "") + "'>Debug</a>";
   html += "</div>";
@@ -1134,7 +1306,7 @@ void handleApiDebug() {
   for (int i = 0; i < n; i++) {
     int idx = (debugLogIndex - 1 - i + DEBUG_LOG_SIZE) % DEBUG_LOG_SIZE; // newest first
     if (i > 0) json += ",";
-    json += "\"" + debugLog[idx] + "\"";
+    json += "\"" + jsonEsc(debugLog[idx]) + "\"";
   }
   json += "]}";
   server.send(200, "application/json", json);
@@ -1145,7 +1317,7 @@ void handleApiDebug() {
 // Serial Monitor connection (which the README notes can itself trigger a
 // hardware reset on this board). Polls every 400ms.
 void handleDebugPage() {
-  String html = "<html><head><meta charset='UTF-8'><style>";
+  String html = "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><style>";
   html += "body{font-family:'Courier New',monospace;max-width:600px;margin:0 auto;padding:10px;background:#111;color:#0f0;}";
   html += "h1{font-size:1.2em;text-align:center;color:#fff;font-family:sans-serif;}";
   html += ".card{background:#000;border:1px solid #333;border-radius:8px;padding:12px;margin-top:12px;}";
@@ -1192,16 +1364,16 @@ void handleDebugPage() {
 }
 
 void handleApiStatus() {
-  time_t localT = now() + (timeZones[currentCity] * 3600);
+  time_t localT = now() + tzOffsetSec[currentCity];
   unsigned long ageMin = lastFetchMillis == 0 ? 0 : (millis() - lastFetchMillis) / 60000;
   SunCountdown sc = computeSunCountdown();
   int moonIdx = getMoonPhaseIndex(day(localT), month(localT), year(localT));
 
   String json = "{";
   json += "\"cityIndex\":" + String(currentCity) + ",";
-  json += "\"cityNames\":[\"" + getDisplayCity(locs[0]) + "\",\"" + getDisplayCity(locs[1]) + "\",\"" + getDisplayCity(locs[2]) + "\"],";
-  json += "\"city\":\"" + getDisplayCity(locs[currentCity]) + "\",";
-  json += "\"weatherDesc\":\"" + weatherDesc + "\",";
+  json += "\"cityNames\":[\"" + jsonEsc(getDisplayCity(locs[0])) + "\",\"" + jsonEsc(getDisplayCity(locs[1])) + "\",\"" + jsonEsc(getDisplayCity(locs[2])) + "\"],";
+  json += "\"city\":\"" + jsonEsc(getDisplayCity(locs[currentCity])) + "\",";
+  json += "\"weatherDesc\":\"" + jsonEsc(weatherDesc) + "\",";
   json += "\"temp\":" + String(tempnum, 1) + ",";
   json += "\"feelsLike\":" + String(feels_like, 1) + ",";
   json += "\"tempMin\":" + String(tempMin, 1) + ",";
@@ -1209,9 +1381,9 @@ void handleApiStatus() {
   json += "\"humid\":" + String(huminum) + ",";
   json += "\"pressure\":" + String(pressure) + ",";
   json += "\"windSpeed\":" + String(windSpeedKmH, 1) + ",";
-  json += "\"windDir\":\"" + windDir + "\",";
-  json += "\"sunRise\":\"" + sunRise + "\",";
-  json += "\"sunSet\":\"" + sunSet + "\",";
+  json += "\"windDir\":\"" + jsonEsc(windDir) + "\",";
+  json += "\"sunRise\":\"" + jsonEsc(sunRise) + "\",";
+  json += "\"sunSet\":\"" + jsonEsc(sunSet) + "\",";
   json += "\"sunEvent\":\"" + sc.eventName + "\",";
   json += "\"sunDiffMin\":" + String(sc.diffMin) + ",";
   json += "\"moonPhase\":\"" + getMoonPhaseName(moonIdx) + "\",";
@@ -1233,7 +1405,7 @@ void handleApiStatus() {
   for (int i = 0; i < 5; i++) {
     if (i > 0) json += ",";
     if (forecast[i].valid) {
-      json += "{\"day\":\"" + forecast[i].dayName + "\",\"low\":" + String(forecast[i].low, 1) + ",\"high\":" + String(forecast[i].high, 1) + ",\"main\":\"" + forecast[i].main + "\"}";
+      json += "{\"day\":\"" + forecast[i].dayName + "\",\"low\":" + String(forecast[i].low, 1) + ",\"high\":" + String(forecast[i].high, 1) + ",\"main\":\"" + jsonEsc(forecast[i].main) + "\"}";
     } else {
       json += "{\"day\":\"\",\"low\":0,\"high\":0,\"main\":\"\"}";
     }
@@ -1243,7 +1415,7 @@ void handleApiStatus() {
   int n = min(upcomingRainCount, 3);
   for (int i = 0; i < n; i++) {
     if (i > 0) json += ",";
-    json += "{\"mm\":" + String(upcomingRainMm[i], 1) + ",\"label\":\"" + upcomingRainLabel[i] + "\"}";
+    json += "{\"mm\":" + String(upcomingRainMm[i], 1) + ",\"label\":\"" + jsonEsc(upcomingRainLabel[i]) + "\"}";
   }
   json += "]}";
   server.send(200, "application/json", json);
@@ -1254,15 +1426,15 @@ void handleApiStatus() {
 // clock, weather card, LED/text color swatches, feels/wind/humid/baro grid,
 // mini rain preview) without needing to walk over and look at the screen.
 void handleDashboardPage() {
-  String html = "<html><head><meta charset='UTF-8'><style>";
+  String html = "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><style>";
   html += "body{font-family:sans-serif;text-align:center;max-width:480px;margin:0 auto;padding:10px;background:#eef1f5;}";
   html += "h1{font-size:1.4em;} h3{font-size:1em;color:#4a5a7a;margin:0 0 8px 0;}";
   html += ".card{background:#fff;border-radius:15px;border:2px solid #4a5a7a;padding:20px 10px;margin-top:15px;}";
   html += ".cityRow{display:flex;align-items:center;justify-content:center;gap:14px;}";
   html += ".cityRow button{border:none;background:none;font-size:1.4em;color:#4a5a7a;cursor:pointer;padding:0 8px;}";
-  html += ".clock{font-family:'Courier New',monospace;font-weight:bold;font-size:3em;letter-spacing:2px;}";
+  html += ".clock{margin:14px 0 6px;min-height:70px;} .clock svg{display:block;margin:0 auto;max-width:100%;}";
   html += ".temp{font-size:2.2em;}";
-  html += ".grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;text-align:left;margin-top:15px;font-size:0.95em;}";
+  html += ".grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;text-align:center;margin-top:15px;font-size:0.95em;}";
   html += ".swatchRow{display:flex;justify-content:center;gap:20px;margin-top:12px;}";
   html += ".swatch{width:36px;height:36px;border-radius:8px;border:2px solid #333;display:inline-block;vertical-align:middle;}";
   html += ".dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:5px;}";
@@ -1312,11 +1484,12 @@ void handleDashboardPage() {
   html += "</div>";
 
   html += "<script>";
+  html += FPSTR(SEG_CLOCK_JS); // segClock(): 7-segment digits like the device's clock
   html += "var ctx=document.getElementById('rainChart').getContext('2d');";
   html += "var curData=null;";
   html += "function cityNav(delta){";
   html += "if(!curData)return;var n=curData.cityIndex+delta;if(n<0)n=curData.cityNames.length-1;if(n>=curData.cityNames.length)n=0;";
-  html += "fetch('/live?action=city&value='+n).then(refresh);";
+  html += "fetch('/live?action=city&value='+n,{headers:{'X-Requested-With':'DesktopDisplay'}}).then(refresh);";
   html += "}";
   html += "function drawRain(rain){";
   html += "ctx.clearRect(0,0,400,110);";
@@ -1341,8 +1514,10 @@ void handleDashboardPage() {
   html += "document.getElementById('desc').innerText=d.weatherDesc;";
   html += "document.getElementById('temp').innerText=d.temp.toFixed(1)+'\\u00B0C';";
   html += "document.getElementById('minmax').innerText='L:'+d.tempMin.toFixed(1)+'  H:'+d.tempMax.toFixed(1);";
-  html += "document.getElementById('clock').innerText=String(d.hour).padStart(2,'0')+':'+String(d.minute).padStart(2,'0');";
-  html += "document.getElementById('clock').style.color='rgb('+d.textR+','+d.textG+','+d.textB+')';";
+  // Hour black, minutes in the text color - same as the device (incl. its
+  // near-white -> black fallback, since the card behind it is white).
+  html += "var minCol=(d.textR>235&&d.textG>235&&d.textB>235)?'#000':'rgb('+d.textR+','+d.textG+','+d.textB+')';";
+  html += "document.getElementById('clock').innerHTML=segClock(d.hour,d.minute,minCol);";
   html += "document.getElementById('date').innerText=d.dateStr;";
   html += "document.getElementById('feels').innerText=d.feelsLike.toFixed(1);";
   html += "document.getElementById('wind').innerText=d.windSpeed.toFixed(1)+' '+d.windDir;";
@@ -1476,7 +1651,6 @@ int histSplit(String line, String *f, int maxF) {
   return n;
 }
 
-String histJsonEsc(String s) { s.replace("\\", "\\\\"); s.replace("\"", "\\\""); return s; }
 
 bool histFieldOK(String s) {
   if (s.length() == 0) return false;
@@ -1485,6 +1659,67 @@ bool histFieldOK(String s) {
     if (!((c >= '0' && c <= '9') || c == '-' || c == '.')) return false; // rejects nan/inf, which would break the JSON
   }
   return true;
+}
+
+// Reads a text file line by line in 2 KB blocks. File::readStringUntil()
+// fetches ONE byte per call from the SD card (each one a full trip through the
+// filesystem layers) and grows the String a character at a time - with years
+// of history that's what made the History page take ~10+ seconds to load.
+class LineReader {
+ public:
+  explicit LineReader(File &file) : f(file), buf((uint8_t *)malloc(BUF_SIZE)) {}
+  ~LineReader() { free(buf); }
+  // Next line into out, without the line ending. Returns false at the end of the file.
+  bool next(String &out) {
+    out = "";
+    bool got = false;
+    while (buf) {
+      if (pos >= len) {
+        len = f.read(buf, BUF_SIZE);
+        pos = 0;
+        if (len == 0) return got;
+      }
+      uint8_t *start = buf + pos;
+      uint8_t *nl = (uint8_t *)memchr(start, '\n', len - pos);
+      size_t n = nl ? (size_t)(nl - start) : len - pos;
+      if (out.length() < MAX_LINE) out.concat((const char *)start, n);
+      got = true;
+      pos += n + (nl ? 1 : 0);
+      if (nl) { if (out.endsWith("\r")) out.remove(out.length() - 1); return true; }
+    }
+    return false;
+  }
+ private:
+  static const size_t BUF_SIZE = 2048, MAX_LINE = 512;
+  File &f;
+  uint8_t *buf;
+  size_t len = 0, pos = 0;
+  LineReader(const LineReader &) = delete;
+  LineReader &operator=(const LineReader &) = delete;
+};
+
+// Sends the rest of an open file to the client as-is, in 4 KB blocks.
+void histStreamFileBody(File &f) {
+  const size_t BLOCK = 4096;
+  uint8_t *b = (uint8_t *)malloc(BLOCK);
+  if (!b) return;
+  WiFiClient client = server.client();
+  size_t n;
+  while ((n = f.read(b, BLOCK)) > 0) {
+    if (client.write(b, n) != n) break; // browser went away
+  }
+  free(b);
+}
+
+// Each city's file gets a version number that goes up whenever the file is
+// written. Together with a per-boot random id it forms the file's ETag, so a
+// browser that already has the data gets a tiny "304 Not Modified" instead of
+// downloading the whole file again.
+uint32_t histBootId = 0;
+uint32_t histGen[NUM_CITIES] = {0, 0, 0};
+void histTouch(int i) { histGen[i]++; }
+String histEtag(int i, size_t size) {
+  return "\"" + String(histBootId, HEX) + "-" + String(histGen[i]) + "-" + String((unsigned long)size) + "\"";
 }
 
 String histReadMeta(int i) {
@@ -1512,6 +1747,7 @@ void histArchive(int i) {
   String dst;
   do { dst = "/hist_c" + String(i) + "_old" + String(n) + ".csv"; n++; } while (SD.exists(dst));
   SD.rename(src, dst);
+  histTouch(i);
   logDebug("HIST city " + String(i + 1) + " renamed - old log kept as " + dst);
 }
 
@@ -1641,8 +1877,9 @@ bool histMergeDays(int i, int n, int overwriteFrom, String dropFrom) {
 
   if (SD.exists(path)) {
     File in = SD.open(path, FILE_READ);
-    while (in && in.available()) {
-      String line = in.readStringUntil('\n');
+    LineReader lr(in);
+    String line;
+    while (in && lr.next(line)) {
       line.trim();
       if (line.length() < 11) continue;
       String d = line.substring(0, 10);
@@ -1661,6 +1898,7 @@ bool histMergeDays(int i, int n, int overwriteFrom, String dropFrom) {
   out.close();
 
   if (SD.exists(path)) SD.remove(path);
+  histTouch(i);
   return SD.rename(tmp, path);
 }
 
@@ -1868,21 +2106,18 @@ int histListArchives(bool deleteThem) {
 
 void histWipeCity(int i) {
   if (SD.exists(histPath(i))) SD.remove(histPath(i));
+  histTouch(i);
   histTodayValid[i] = false;
   histFullDone[i] = false;
   histNextSync[i] = 0; // re-download the last 92 days right away
 }
 
 void histSendJson(bool ok, String msg) {
-  server.send(ok ? 200 : 400, "application/json", "{\"ok\":" + String(ok ? "true" : "false") + ",\"msg\":\"" + histJsonEsc(msg) + "\"}");
+  server.send(ok ? 200 : 400, "application/json", "{\"ok\":" + String(ok ? "true" : "false") + ",\"msg\":\"" + jsonEsc(msg) + "\"}");
 }
 
-// GET /api/history?city=N  (no city = whichever city the device is showing)
-// Streamed in chunks, so there's no size limit.
-// days: [date,tMin,tMax,rain,humid,pressure,gust|null,sun|null(,1 = today's forecast)]
-void handleApiHistory() {
-  int city = server.hasArg("city") ? constrain(server.arg("city").toInt(), 0, NUM_CITIES - 1) : currentCity;
-
+// Fields shared by /api/history and /api/history/meta (no surrounding braces).
+String histMetaFields() {
   uint32_t histBytes = 0;
   int archives = 0;
   if (sdOK) {
@@ -1893,29 +2128,81 @@ void handleApiHistory() {
     }
     archives = histListArchives(false);
   }
+  String j = "\"currentCity\":" + String(currentCity) + ",\"names\":[";
+  for (int i = 0; i < NUM_CITIES; i++) {
+    if (i > 0) j += ",";
+    j += "\"" + jsonEsc(getDisplayCity(locs[i])) + "\"";
+  }
+  j += "],\"sdOK\":" + String(sdOK ? "true" : "false");
+  j += ",\"cardTotalKB\":" + String(histCardTotalKB) + ",\"cardUsedKB\":" + String(histCardUsedKB);
+  j += ",\"histKB\":" + String((histBytes + 1023) / 1024);
+  j += ",\"archives\":" + String(archives);
+  return j;
+}
+
+// Today's forecast row for a city as a JSON array (with a trailing 1 marking
+// it as a forecast), or "null" if there isn't one yet.
+String histTodayJson(int city) {
+  if (!histTodayValid[city]) return "null";
+  return "[\"" + histTodayDate[city] + "\"," + String(histTodayMin[city], 1) + "," + String(histTodayMax[city], 1)
+       + "," + String(histTodayRain[city], 1) + "," + String(histTodayHum[city], 0) + "," + String(histTodayPres[city], 0)
+       + "," + (histTodayGustOK[city] ? String(histTodayGust[city], 0) : String("null"))
+       + "," + (histTodaySunOK[city] ? String(histTodaySun[city], 1) : String("null")) + ",1]";
+}
+
+// GET /api/history/meta - everything the History page needs except the day
+// rows themselves: names, storage info and today's forecast row per city.
+void handleHistoryMeta() {
+  String j = "{" + histMetaFields() + ",\"today\":[";
+  for (int i = 0; i < NUM_CITIES; i++) { if (i > 0) j += ","; j += histTodayJson(i); }
+  j += "]}";
+  server.send(200, "application/json", j);
+}
+
+// GET /api/history/raw?city=N - the city's history file exactly as stored
+// (CSV: date,tMin,tMax,rainMm,humidAvg,pressureAvg,gustMaxKmh,sunHours).
+// The History page parses it in the browser, which is far faster than
+// building JSON on the ESP32. Supports ETag/If-None-Match, so reloading the
+// page only re-downloads files that actually changed.
+void handleHistoryRaw() {
+  int city = constrain(server.arg("city").toInt(), 0, NUM_CITIES - 1);
+  File f;
+  if (sdOK && SD.exists(histPath(city))) f = SD.open(histPath(city), FILE_READ);
+  size_t size = f ? f.size() : 0;
+  String etag = histEtag(city, size);
+  server.sendHeader("Cache-Control", "no-cache"); // always revalidate - a 304 is cheap
+  server.sendHeader("ETag", etag);
+  if (server.header("If-None-Match") == etag) {
+    if (f) f.close();
+    server.send(304);
+    return;
+  }
+  server.setContentLength(size);
+  server.send(200, "text/csv", "");
+  if (f) { histStreamFileBody(f); f.close(); }
+}
+
+// GET /api/history?city=N  (no city = whichever city the device is showing)
+// Streamed in chunks, so there's no size limit. (The History page itself uses
+// the faster /api/history/meta + /api/history/raw; this stays for scripts.)
+// days: [date,tMin,tMax,rain,humid,pressure,gust|null,sun|null(,1 = today's forecast)]
+void handleApiHistory() {
+  int city = server.hasArg("city") ? constrain(server.arg("city").toInt(), 0, NUM_CITIES - 1) : currentCity;
 
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "application/json", "");
 
   String chunk;
   chunk.reserve(1400);
-  chunk = "{\"city\":" + String(city) + ",\"currentCity\":" + String(currentCity) + ",\"names\":[";
-  for (int i = 0; i < NUM_CITIES; i++) {
-    if (i > 0) chunk += ",";
-    chunk += "\"" + histJsonEsc(getDisplayCity(locs[i])) + "\"";
-  }
-  chunk += "],\"sdOK\":" + String(sdOK ? "true" : "false");
-  chunk += ",\"cardTotalKB\":" + String(histCardTotalKB) + ",\"cardUsedKB\":" + String(histCardUsedKB);
-  chunk += ",\"histKB\":" + String((histBytes + 1023) / 1024);
-  chunk += ",\"archives\":" + String(archives);
-  chunk += ",\"days\":[";
+  chunk = "{\"city\":" + String(city) + "," + histMetaFields() + ",\"days\":[";
 
   bool first = true;
   if (sdOK && SD.exists(histPath(city))) {
     File f = SD.open(histPath(city), FILE_READ);
     if (f) {
-      while (f.available()) {
-        String line = f.readStringUntil('\n');
+      LineReader lr(f);
+      String line;
+      while (lr.next(line)) {
         line.trim();
         String fl[8];
         int n = histSplit(line, fl, 8);
@@ -1935,10 +2222,7 @@ void handleApiHistory() {
   }
   if (histTodayValid[city]) {
     if (!first) chunk += ",";
-    chunk += "[\"" + histTodayDate[city] + "\"," + String(histTodayMin[city], 1) + "," + String(histTodayMax[city], 1)
-           + "," + String(histTodayRain[city], 1) + "," + String(histTodayHum[city], 0) + "," + String(histTodayPres[city], 0)
-           + "," + (histTodayGustOK[city] ? String(histTodayGust[city], 0) : String("null"))
-           + "," + (histTodaySunOK[city] ? String(histTodaySun[city], 1) : String("null")) + ",1]";
+    chunk += histTodayJson(city);
   }
   chunk += "]}";
   server.sendContent(chunk);
@@ -1951,7 +2235,7 @@ void handleHistoryStatus() {
   for (int i = 0; i < NUM_CITIES; i++) {
     if (i > 0) j += ",";
     j += "{\"active\":" + String(bfActive[i] ? "true" : "false") + ",\"start\":\"" + bfStart[i] + "\",\"cursor\":\"" + bfCursor[i]
-       + "\",\"end\":\"" + bfEnd[i] + "\",\"msg\":\"" + histJsonEsc(bfMsg[i]) + "\"}";
+       + "\",\"end\":\"" + bfEnd[i] + "\",\"msg\":\"" + jsonEsc(bfMsg[i]) + "\"}";
   }
   j += "]}";
   server.send(200, "application/json", j);
@@ -1959,6 +2243,7 @@ void handleHistoryStatus() {
 
 // POST /api/history/backfill?target=0|1|2|all&years=1..10   (add &stop=1 to stop)
 void handleHistoryBackfill() {
+  if (!requireAppHeader()) return;
   String t = server.arg("target");
   bool stop = server.hasArg("stop");
   int years = constrain(server.arg("years").toInt(), 1, 10);
@@ -1989,8 +2274,9 @@ void handleApiLocal() {
   bool first = true;
   if (sdOK && SD.exists(LOCAL_LOG)) {
     File f = SD.open(LOCAL_LOG, FILE_READ);
-    while (f && f.available()) {
-      String line = f.readStringUntil('\n');
+    LineReader lr(f);
+    String line;
+    while (f && lr.next(line)) {
       line.trim();
       String fl[4];
       if (histSplit(line, fl, 4) < 4 || !histFieldOK(fl[0]) || !histFieldOK(fl[1]) || !histFieldOK(fl[2]) || !histFieldOK(fl[3])) continue;
@@ -2021,9 +2307,10 @@ void handleLocalExport() {
   String chunk = "timeUTC,epochUTC,tempC,humidity,pressureHpa\n";
   if (sdOK && SD.exists(LOCAL_LOG)) {
     File f = SD.open(LOCAL_LOG, FILE_READ);
+    LineReader lr(f);
+    String line;
     char tb[20];
-    while (f && f.available()) {
-      String line = f.readStringUntil('\n');
+    while (f && lr.next(line)) {
       line.trim();
       if (line.length() < 10) continue;
       time_t e = (time_t)line.substring(0, line.indexOf(',')).toInt();
@@ -2046,25 +2333,14 @@ void handleHistoryExport() {
   for (unsigned int k = 0; k < name.length(); k++) safe += isalnum((unsigned char)name[k]) ? name[k] : '_';
 
   server.sendHeader("Content-Disposition", "attachment; filename=\"history_" + safe + ".csv\"");
-  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-  server.send(200, "text/csv", "");
 
-  String chunk = "date,tMin,tMax,rainMm,humidAvg,pressureAvg,gustMaxKmh,sunHours\n";
-  if (sdOK && SD.exists(histPath(city))) {
-    File f = SD.open(histPath(city), FILE_READ);
-    if (f) {
-      while (f.available()) {
-        String line = f.readStringUntil('\n');
-        line.trim();
-        if (line.length() < 10) continue;
-        chunk += line + "\n";
-        if (chunk.length() > 1200) { server.sendContent(chunk); chunk = ""; }
-      }
-      f.close();
-    }
-  }
-  server.sendContent(chunk);
-  server.sendContent("");
+  // The file is already plain CSV, so it's sent as-is after a header row.
+  File f;
+  if (sdOK && SD.exists(histPath(city))) f = SD.open(histPath(city), FILE_READ);
+  String header = "date,tMin,tMax,rainMm,humidAvg,pressureAvg,gustMaxKmh,sunHours\r\n";
+  server.setContentLength(header.length() + (f ? f.size() : 0));
+  server.send(200, "text/csv", header);
+  if (f) { histStreamFileBody(f); f.close(); }
 }
 
 const char* HIST_IMPORT_TMP = "/hist_import.tmp";
@@ -2086,7 +2362,7 @@ void handleHistoryUpload() {
   HTTPUpload &up = server.upload();
   if (up.status == UPLOAD_FILE_START) {
     histUploadOK = false;
-    if (!sdOK) return;
+    if (!sdOK || !hasAppHeader()) return; // nothing is written for a request without the header
     if (SD.exists(HIST_IMPORT_TMP)) SD.remove(HIST_IMPORT_TMP);
     histUploadFile = SD.open(HIST_IMPORT_TMP, FILE_WRITE);
     histUploadOK = (bool)histUploadFile;
@@ -2149,7 +2425,11 @@ bool histImportProcess(int city, bool replaceAll, String &msg) {
   int count = 0;
   File in = SD.open(HIST_IMPORT_TMP, FILE_READ);
   if (!in) { msg = "Upload failed."; return false; }
-  while (in.available()) { String line = in.readStringUntil('\n'); if (histParseImportLine(line, key, v)) count++; }
+  {
+    LineReader lr(in);
+    String line;
+    while (lr.next(line)) if (histParseImportLine(line, key, v)) count++;
+  }
   in.close();
 
   if (count == 0) { msg = "No valid rows found. Expected columns: date,tMin,tMax,rainMm,humidAvg,pressureAvg,gustMaxKmh,sunHours with dates as YYYY-MM-DD."; return false; }
@@ -2161,8 +2441,10 @@ bool histImportProcess(int city, bool replaceAll, String &msg) {
   in = SD.open(HIST_IMPORT_TMP, FILE_READ);
   if (!in) { msg = "Upload failed."; return false; }
   uint16_t seq = 0;
-  while (in.available() && (int)rows.size() < count) {
-    String line = in.readStringUntil('\n');
+  {
+  LineReader lr(in);
+  String line;
+  while ((int)rows.size() < count && lr.next(line)) {
     if (!histParseImportLine(line, key, v)) continue;
     HistImportRow r;
     r.key = key;
@@ -2175,6 +2457,7 @@ bool histImportProcess(int city, bool replaceAll, String &msg) {
     r.sun10  = isnan(v[6]) ? HIST_NONE : (uint16_t)constrain(lroundf(v[6] * 10), 0L, 300L);
     r.seq    = seq++;
     rows.push_back(r);
+  }
   }
   in.close();
 
@@ -2209,8 +2492,9 @@ bool histImportProcess(int city, bool replaceAll, String &msg) {
   size_t ri = 0;
   if (!replaceAll && SD.exists(path)) {
     File ex = SD.open(path, FILE_READ);
-    while (ex && ex.available()) {
-      String line = ex.readStringUntil('\n');
+    LineReader lr(ex);
+    String line;
+    while (ex && lr.next(line)) {
       line.trim();
       if (line.length() < 10) continue;
       uint32_t k = (uint32_t)(line.substring(0, 4).toInt() * 10000L + line.substring(5, 7).toInt() * 100L + line.substring(8, 10).toInt());
@@ -2225,6 +2509,7 @@ bool histImportProcess(int city, bool replaceAll, String &msg) {
   out.close();
 
   if (SD.exists(path)) SD.remove(path);
+  histTouch(city);
   if (!SD.rename(tmp, path)) { msg = "Could not save the merged file."; return false; }
 
   String name = getDisplayCity(locs[city]);
@@ -2235,6 +2520,7 @@ bool histImportProcess(int city, bool replaceAll, String &msg) {
 
 // POST /api/history/import?city=N&mode=merge|replace (multipart file upload)
 void handleHistoryImportDone() {
+  if (!requireAppHeader()) return;
   int city = constrain(server.arg("city").toInt(), 0, NUM_CITIES - 1);
   bool replaceAll = server.arg("mode") == "replace";
   String msg;
@@ -2250,6 +2536,7 @@ void handleHistoryImportDone() {
 
 // POST /api/history/wipe?target=0|1|2|all|archives|local
 void handleHistoryWipe() {
+  if (!requireAppHeader()) return;
   String t = server.arg("target");
   String msg;
   if (!sdOK) { histSendJson(false, "SD card not found."); return; }
@@ -2309,18 +2596,24 @@ void drawPageBackground(int mode) {
     tft.drawString(">", HOME_ARROW_RIGHT_X, HOME_ARROW_Y, 4);
     tft.setTextColor(0x4228); tft.drawString(weatherDesc, 160, 60, 2);
     tft.setTextColor(TFT_BLACK);
-    String tNum = String(tempnum, 1); 
-    tft.drawString(tNum, 160, 110, 7);
-    int nW = tft.textWidth(tNum, 7); tft.setTextDatum(TL_DATUM);
-    tft.drawString("o", 160 + (nW/2) + 2, 85, 2);
-    tft.drawString("C", 160 + (nW/2) + 12, 95, 4);
+    // Center the number AND its unit together - centering only the number
+    // left the whole "14.6 °C" group sitting visibly right of center.
+    String tNum = String(tempnum, 1);
+    int nW = tft.textWidth(tNum, 7);
+    int groupW = nW + 12 + tft.textWidth("C", 4); // number + gap/degree mark + "C"
+    int tx = 160 - groupW / 2;
+    tft.setTextDatum(ML_DATUM);
+    tft.drawString(tNum, tx, 110, 7);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString("o", tx + nW + 2, 85, 2);
+    tft.drawString("C", tx + nW + 12, 95, 4);
     tft.setTextDatum(CC_DATUM);
     tft.drawString("L:" + String(tempMin, 1) + "  H:" + String(tempMax, 1), 160, 145, 2);
-    tft.fillRoundRect(15, 165, 290, 305, 15, TFT_WHITE);
-    tft.drawRoundRect(15, 165, 290, 305, 15, 0x4228);
+    tft.fillRoundRect(15, 165, 290, 302, 15, TFT_WHITE);
+    tft.drawRoundRect(15, 165, 290, 302, 15, 0x4228);
   } else {
-    tft.fillRoundRect(15, 70, 290, 400, 15, TFT_WHITE);
-    tft.drawRoundRect(15, 70, 290, 400, 15, 0x4228);
+    tft.fillRoundRect(15, 70, 290, 397, 15, TFT_WHITE);
+    tft.drawRoundRect(15, 70, 290, 397, 15, 0x4228);
     String titles[] = {"", "ATMOSPHERIC LOG", "PRECIPITATION", "SOLAR & LUNAR", "SYSTEM INFO", "5-DAY FORECAST", "7-DAY HISTORY"};
     tft.drawString(titles[mode], 160, 35, 4);
   }
@@ -2432,7 +2725,7 @@ void drawPageHome() {
     lastGridUpdate = millis();
   }
   if (now() != prevDisplay || drawnMode != 0) {
-    time_t localT = now() + (timeZones[currentCity] * 3600);
+    time_t localT = now() + tzOffsetSec[currentCity];
     // NEW: Font 7 (TFT_eSPI's built-in pseudo-7-segment digit font) replaces
     // the old per-digit JPEG images - it's already linked into the binary
     // since the temperature display uses it too, so this adds no extra font
@@ -2587,7 +2880,7 @@ SunCountdown computeSunCountdown() {
   int setMin = timeStrToMinutes(sunSet);
   if (riseMin < 0 || setMin < 0) return c;
 
-  time_t localT = now() + (timeZones[currentCity] * 3600);
+  time_t localT = now() + tzOffsetSec[currentCity];
   int nowMin = hour(localT) * 60 + minute(localT);
 
   if (nowMin < riseMin) { c.eventName = "SUNRISE"; c.diffMin = riseMin - nowMin; }
@@ -2661,7 +2954,7 @@ void drawPageAstro() {
     tft.fillRoundRect(25, moonCardY, 270, moonCardH, 10, moonBg);
     tft.drawRoundRect(25, moonCardY, 270, moonCardH, 10, 0x4228);
 
-    time_t localT = now() + (timeZones[currentCity] * 3600);
+    time_t localT = now() + tzOffsetSec[currentCity];
     int pIdx = getMoonPhaseIndex(day(localT), month(localT), year(localT));
 
     uint16_t jw = 0, jh = 0;
@@ -3009,7 +3302,14 @@ void setup() {
   globalBrightness = prefs.getInt("bright", 255); ledBrightness = prefs.getInt("ledB", 255);
   useCustomColor = prefs.getBool("useC", false); 
   custR = prefs.getInt("cR", 255); custG = prefs.getInt("cG", 255); custB = prefs.getInt("cB", 255); 
-  customHue = rgbToHueApprox(custR, custG, custB); // one-time derivation at boot only - never repeated during runtime
+  if (prefs.getInt("cHue", -1) >= 0) {
+    // Saved by this version: restore the exact hue/saturation/lightness
+    customHue = prefs.getInt("cHue", 0);
+    customSat = prefs.getInt("cSat", 255);
+    customVal = prefs.getInt("cVal", 255);
+  } else {
+    customHue = rgbToHueApprox(custR, custG, custB); // older saves only stored R/G/B - approximate once at boot
+  }
 
   // NEW: independent text color (clock minutes + IP), loaded separately from the LED's color
   textHue = prefs.getInt("txHue", 0);
@@ -3071,21 +3371,28 @@ void setup() {
 #endif
 
 #if USE_SD_HISTORY
+  histBootId = esp_random(); // makes this boot's history ETags unique
   historySetup(); // NEW: per-city history files (migrates the old /history.csv to City 1 on first boot)
 #endif
 
-  server.on("/", handleRoot);
-  server.on("/save", handleSave);
+  // The WebServer only keeps request headers it's told about up front
+  const char* collectedHeaders[] = { APP_HEADER_NAME, "If-None-Match" };
+  server.collectHeaders(collectedHeaders, 2);
+  server.on("/", handleDashboardPage);         // the live dashboard is the start page
+  server.on("/settings", handleSettingsPage);
+  server.on("/save", HTTP_POST, handleSave);
   server.on("/live", handleLive);           // NEW: live slider updates (color, brightness, mode)
   server.on("/saveColor", handleSaveColor); // NEW: persists the current custom color as the boot default
   server.on("/saveTextColor", handleSaveTextColor); // NEW: persists the current text color as the boot default
-  server.on("/dashboard", handleDashboardPage); // NEW: live-mirroring dashboard
+  server.on("/dashboard", handleDashboardPage); // old address, kept so existing bookmarks still work
   server.on("/api/status", handleApiStatus);    // NEW: JSON feed for the dashboard
   server.on("/debug", handleDebugPage);         // NEW: live touch/system debug console
   server.on("/api/debug", handleApiDebug);      // NEW: JSON feed for the debug console
 #if USE_SD_HISTORY
   server.on("/history", handleHistoryPage);     // NEW: charted history page
   server.on("/api/history", handleApiHistory);  // NEW: JSON feed for the history page
+  server.on("/api/history/meta", handleHistoryMeta);                                      // NEW: page metadata + today's forecast rows
+  server.on("/api/history/raw", handleHistoryRaw);                                        // NEW: raw history CSV (fast, cacheable)
   server.on("/api/history/export", handleHistoryExport);                                  // NEW: CSV download per city
   server.on("/api/history/import", HTTP_POST, handleHistoryImportDone, handleHistoryUpload); // NEW: CSV upload (merge/replace)
   server.on("/api/history/wipe", HTTP_POST, handleHistoryWipe);                            // NEW: wipe a city / all / archived logs / local log
@@ -3142,6 +3449,7 @@ void loop() {
   server.handleClient();
   checkWifiHealth(); // NEW: watches for a dropped connection and recovers automatically
   handleSerialCommand(); // NEW: read-only ping/status over Serial
+  saveBrightnessIfDue(); // persists slider changes once you've stopped dragging
 #if USE_SD_HISTORY
   historyLoop(); // NEW: background per-city history sync (one city at a time, every 6h)
 #endif
@@ -3235,6 +3543,7 @@ void loop() {
       if (newBrightness != globalBrightness) {
         globalBrightness = newBrightness;
         updateBacklight();
+        markBrightnessDirty();
         drawScreenBrightnessSlider();
       }
       touchHandled = true;
@@ -3244,6 +3553,7 @@ void loop() {
       if (newLed != ledBrightness) {
         ledBrightness = newLed;
         setWeatherLED(mainWeather);
+        markBrightnessDirty();
         drawLedBrightnessSlider();
       }
       touchHandled = true;
@@ -3273,7 +3583,7 @@ void loop() {
         drawSystemDynamicInfo(); // refreshes the IP-text color preview to match the new mode's LED color
         touchHandled = true;
       } else if (ty > SAVE_BTN_Y && ty < SAVE_BTN_Y + SAVE_BTN_H) {
-        prefs.putInt("cR", custR); prefs.putInt("cG", custG); prefs.putInt("cB", custB);
+        saveCustomColor();
         showSaveConfirmation = true; saveConfirmationTime = millis();
         drawSaveButton(true);
         touchHandled = true;
@@ -3457,10 +3767,23 @@ var monthTitle=function(k){return MONTHS[+k.slice(5,7)-1]+' '+k.slice(0,4);}
 var lbl=function(d,n){if(d.length==7)return MONTHS[+d.slice(5,7)-1]+" '"+d.slice(2,4);return n>400?d.slice(0,7):d.slice(5);}
 
 // ---------- data
+// Raw CSV from /api/history/raw -> the same row arrays /api/history returns.
+// Same validation as the device used to do: numeric fields only, and skip the
+// old logger's 999/-999 placeholder days.
+var NUMF=/^-?[0-9]*\.?[0-9]+$/;
+var parseCsv=function(t){var out=[];t.split('\n').forEach(l=>{l=l.trim();if(!l)return;var f=l.split(',');
+  if(f.length<6||f[0].length!=10)return;var v=[];
+  for(var k=1;k<6;k++){if(!NUMF.test(f[k]))return;v.push(+f[k]);}
+  if(v[0]>900||v[1]<-900)return;
+  var opt=k=>(f.length>k&&NUMF.test(f[k]))?+f[k]:null;
+  out.push([f[0]].concat(v,[opt(6),opt(7)]));});return out;}
 var loadAll=async function(){
   try{
-    var cities=[],meta=null,i=0,n=1;
-    while(i<n){var j=await (await fetch('/api/history?city='+i)).json();meta=j;n=j.names.length;cities.push({name:j.names[i],days:parseDays(j.days)});i++;}
+    var meta=await (await fetch('/api/history/meta')).json(),cities=[];
+    for(var i=0;i<meta.names.length;i++){
+      var rows=parseCsv(await (await fetch('/api/history/raw?city='+i)).text());
+      if(meta.today[i])rows.push(meta.today[i]);
+      cities.push({name:meta.names[i],days:parseDays(rows)});}
     S.cities=cities;S.meta=meta;
     if(!S.loaded){S.sel=meta.currentCity;S.loaded=true;}
     buildStatic();render();
@@ -3773,7 +4096,7 @@ $('sameScale').onchange=e=>{S.same=e.target.checked;render();};
 
 // ---------- manage data
 var msg=function(t,bad){var m=$('msg');m.innerText=t;m.style.color=bad?'#a00':'#2e6b2e';}
-var post=async function(u,body){try{var r=await fetch(u,{method:'POST',body:body});return await r.json();}catch(e){return{ok:false,msg:'Request failed: '+e};}}
+var post=async function(u,body){try{var r=await fetch(u,{method:'POST',body:body,headers:{'X-Requested-With':'DesktopDisplay'}});return await r.json();}catch(e){return{ok:false,msg:'Request failed: '+e};}}
 var doImport=async function(){
   var f=$('impFile').files[0];if(!f){msg('Choose a CSV file first.',true);return;}
   var city=$('impCity').value,mode=document.querySelector('input[name=impMode]:checked').value,name=S.cities[city].name;
@@ -3826,3 +4149,24 @@ void handleHistoryPage() {
 }
 
 #endif // USE_SD_HISTORY
+
+// --- [DASHBOARD 7-SEGMENT CLOCK] ---
+// Draws the time as SVG 7-segment digits, styled after TFT_eSPI's Font 7 that
+// the device's own clock uses (bevelled segments with small gaps). Kept down
+// here with the history page for the same reason: quote-heavy JavaScript
+// confuses the Arduino IDE's prototype generator for any C++ after it.
+const char SEG_CLOCK_JS[] PROGMEM = R"rawliteral(
+var SEG=(function(){var T=11,h=T/2,G=1.3,W=70,L=h,R=W-h,TP=h,M=50,B=100-h;
+function H(y,a,b){a+=G;b-=G;return [[a,y],[a+h,y-h],[b-h,y-h],[b,y],[b-h,y+h],[a+h,y+h]];}
+function V(x,a,b){a+=G;b-=G;return [[x,a],[x+h,a+h],[x+h,b-h],[x,b],[x-h,b-h],[x-h,a+h]];}
+return {a:H(TP,L,R),g:H(M,L,R),d:H(B,L,R),f:V(L,TP,M),b:V(R,TP,M),e:V(L,M,B),c:V(R,M,B)};})();
+var DIG=['abcdef','bc','abdeg','abcdg','bcfg','acdfg','acdefg','abc','abcdefg','abcdfg'];
+function segDigit(d,x,col){return DIG[d].split('').map(s=>'<polygon fill="'+col+'" points="'+SEG[s].map(p=>(p[0]+x)+','+p[1]).join(' ')+'"/>').join('');}
+function segClock(hh,mm,minCol){
+  var hs=String(hh).padStart(2,'0'),ms=String(mm).padStart(2,'0'),blk='#000',o='',x=0;
+  o+=segDigit(+hs[0],x,blk);x+=82;o+=segDigit(+hs[1],x,blk);x+=70+24;
+  o+='<rect x="'+x+'" y="25" width="12" height="12" rx="2" fill="'+blk+'"/><rect x="'+x+'" y="63" width="12" height="12" rx="2" fill="'+blk+'"/>';x+=12+24;
+  o+=segDigit(+ms[0],x,minCol);x+=82;o+=segDigit(+ms[1],x,minCol);x+=70;
+  return '<svg viewBox="-2 -2 '+(x+4)+' 104" height="70" role="img" aria-label="'+hs+':'+ms+'">'+o+'</svg>';
+}
+)rawliteral";
