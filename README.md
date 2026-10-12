@@ -19,8 +19,8 @@ A touch-screen weather station for the 3.5-inch **E32R35T / E32N35T** ESP32 disp
 
 **Weather sources** (selectable per city)
 - OpenWeatherMap
-- Open-Meteo (best available model)
-- Open-Meteo with the KNMI model (good for the Netherlands)
+- Open-Meteo
+- Open-Meteo with the KNMI model
 
 **Web interface** (open the device's IP address in a browser)
 - Settings: cities, weather source per city, API keys (with an optional backup key), screen and LED brightness, colors
