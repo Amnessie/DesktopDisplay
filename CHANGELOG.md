@@ -31,7 +31,7 @@ All notable changes to this project are listed here.
 - Endpoints that change settings or history now require the `X-Requested-With: DesktopDisplay` header, so other websites can't change them through your browser
 
 ### Changed
-- The moon photo on the Sun & Moon page is cropped at the moon's own edge, so only the moon shows (no grey square or frame); the dark theme's inner cards are slightly darker
+- The moon on the Sun & Moon page is now drawn instead of a photo: exact phase with smooth edges in the theme's colors, mirrored for southern-hemisphere cities, plus % lit and days to the next full/new moon. It uses the same phase calculation as the web dashboard (the old 8-picture calculation could be a phase off). The 8 moon images are removed (~45 KB less flash); the dark theme's inner cards are slightly darker
 - The Settings page loads its values from the new `/api/settings` endpoint
 - Requires TFT_eSPI 2.5 or newer (anti-aliased drawing functions)
 - Atmosphere page shows label and value on one line; forecast rows show an icon and a temperature range bar

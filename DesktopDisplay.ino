@@ -150,20 +150,9 @@ unsigned int localPort = 8000;
 #include "img/pangzi/i7.h"
 #include "img/pangzi/i8.h"
 #include "img/pangzi/i9.h"
-#include "img/moon0.h"
-#include "img/moon1.h"
-#include "img/moon2.h"
-#include "img/moon3.h"
-#include "img/moon4.h"
-#include "img/moon5.h"
-#include "img/moon6.h"
-#include "img/moon7.h"
 
 
 // NEW: arrays of pointers instead of repeated switch statements (code hygiene)
-const uint8_t* moonImages[8] = { moon0, moon1, moon2, moon3, moon4, moon5, moon6, moon7 };
-const size_t   moonSizes[8]  = { sizeof(moon0), sizeof(moon1), sizeof(moon2), sizeof(moon3),
-                                  sizeof(moon4), sizeof(moon5), sizeof(moon6), sizeof(moon7) };
 
 const uint8_t* animFrames[10] = { i0, i1, i2, i3, i4, i5, i6, i7, i8, i9 };
 const size_t   animSizes[10]  = { sizeof(i0), sizeof(i1), sizeof(i2), sizeof(i3), sizeof(i4),
@@ -182,14 +171,15 @@ struct Theme {
   uint16_t bg, card, card2, border, text, muted, line, accent;
   uint16_t icon, rain, rainSoft, good, bad, hi, lo, sun, moon;
   uint16_t sunriseFg, sunriseBg, sunsetFg, sunsetBg;
+  uint16_t moonShadow; // the moon's unlit side (T.moon is the lit side)
 };
 const Theme THEME_LIGHT_COLORS = {
   RGB565(0xE9, 0xEE, 0xF5), RGB565(0xFF, 0xFF, 0xFF), RGB565(0xF3, 0xF6, 0xFA), RGB565(0xD6, 0xDE, 0xE9),
   RGB565(0x16, 0x20, 0x2F), RGB565(0x5F, 0x6F, 0x86), RGB565(0xC9, 0xD3, 0xE0), RGB565(0xF0, 0x8C, 0x2E),
   RGB565(0x9F, 0xB0, 0xC8), RGB565(0x3B, 0x82, 0xF6), RGB565(0xC3, 0xDA, 0xFA), RGB565(0x22, 0xA0, 0x6B),
   RGB565(0xDC, 0x26, 0x26), RGB565(0xCC, 0x33, 0x33), RGB565(0x1E, 0x63, 0xD6), RGB565(0xF5, 0xB4, 0x00),
-  RGB565(0xC9, 0xB2, 0x6B), RGB565(0xE6, 0x96, 0x1E), RGB565(0xFF, 0xF4, 0xE0), RGB565(0x1A, 0x2A, 0x5E),
-  RGB565(0xE0, 0xE7, 0xF5)
+  RGB565(0xDC, 0xC4, 0x84), RGB565(0xE6, 0x96, 0x1E), RGB565(0xFF, 0xF4, 0xE0), RGB565(0x1A, 0x2A, 0x5E),
+  RGB565(0xE0, 0xE7, 0xF5), RGB565(0xD2, 0xDA, 0xE5)
 };
 const Theme THEME_DARK_COLORS = {
   RGB565(0x0B, 0x12, 0x20), RGB565(0x14, 0x1E, 0x30), RGB565(0x18, 0x23, 0x3A), RGB565(0x1F, 0x2B, 0x42),
@@ -197,7 +187,7 @@ const Theme THEME_DARK_COLORS = {
   RGB565(0x7F, 0x93, 0xB0), RGB565(0x4C, 0x95, 0xFF), RGB565(0x1E, 0x3A, 0x66), RGB565(0x34, 0xD3, 0x99),
   RGB565(0xF8, 0x71, 0x71), RGB565(0xF8, 0x71, 0x71), RGB565(0x60, 0xA5, 0xFA), RGB565(0xFB, 0xBF, 0x24),
   RGB565(0xE8, 0xD9, 0xA8), RGB565(0xFB, 0xBF, 0x24), RGB565(0x2A, 0x24, 0x16), RGB565(0xA5, 0xB8, 0xFF),
-  RGB565(0x1A, 0x24, 0x40)
+  RGB565(0x1A, 0x24, 0x40), RGB565(0x2B, 0x38, 0x54)
 };
 enum ThemeMode { THEME_LIGHT = 0, THEME_DARK = 1, THEME_AUTO = 2 };
 int themeMode = THEME_AUTO; // saved as "theme"; set on the System page or the web Settings page
@@ -576,14 +566,19 @@ String getDisplayCity(String loc) {
   return loc;
 }
 
-int getMoonPhaseIndex(int d, int m, int y) {
-  int c, e; double jd; int b;
-  if (m < 3) { y--; m += 12; } m++;
-  c = 365.25 * y; e = 30.6 * m;
-  jd = c + e + d - 694039.09; jd /= 29.5305882; 
-  b = jd; jd -= b; b = jd * 8 + 0.5; b = b & 7;
-  return b;
+// Moon age as a fraction of the synodic month (0 = new, 0.5 = full), counted
+// from a known new moon on 6 Jan 2000 18:14 UTC. Same formula as the web
+// dashboard, so the display and the browser always agree.
+const double MOON_SYNODIC_DAYS = 29.530588853;
+float moonPhaseFraction() {
+  double days = now() / 86400.0 - 10962.7597;
+  double age = fmod(days, MOON_SYNODIC_DAYS);
+  if (age < 0) age += MOON_SYNODIC_DAYS;
+  return (float)(age / MOON_SYNODIC_DAYS);
 }
+
+// 0..7 = new, waxing crescent, first quarter, waxing gibbous, full, ... (see getMoonPhaseName)
+int moonPhaseIndex(float f) { return ((int)floorf(f * 8 + 0.5f)) & 7; }
 
 String getMoonPhaseName(int b) {
   switch (b) {
@@ -1635,7 +1630,7 @@ void handleApiStatus() {
   time_t localT = now() + tzOffsetSec[currentCity];
   unsigned long ageMin = lastFetchMillis == 0 ? 0 : (millis() - lastFetchMillis) / 60000;
   SunCountdown sc = computeSunCountdown();
-  int moonIdx = getMoonPhaseIndex(day(localT), month(localT), year(localT));
+  int moonIdx = moonPhaseIndex(moonPhaseFraction());
 
   String json = "{";
   json += "\"cityIndex\":" + String(currentCity) + ",";
@@ -1671,6 +1666,7 @@ void handleApiStatus() {
   json += "\"sunEvent\":\"" + sc.eventName + "\",";
   json += "\"sunDiffMin\":" + String(sc.diffMin) + ",";
   json += "\"moonPhase\":\"" + getMoonPhaseName(moonIdx) + "\",";
+  json += "\"southern\":" + String(cityGeoCached[currentCity] && cityLat[currentCity] < 0 ? "true" : "false") + ",";
   json += "\"hour\":" + String(hour(localT)) + ",";
   json += "\"minute\":" + String(minute(localT)) + ",";
   json += "\"dateStr\":\"" + String(day(localT)) + "/" + String(month(localT)) + "/" + String(year(localT)) + "\",";
@@ -2885,6 +2881,38 @@ void drawWeatherIcon(int kind, int x, int y, int size, bool night, uint16_t bg) 
   }
 }
 
+// The moon at phase f (0 = new, 0.5 = full), radius R, centred on cx/cy.
+// Each pixel is sampled 4x4 times to find how much of it is moon and how much
+// of that is lit, which gives smooth edges along both the outline and the
+// day/night line. mirror = southern-hemisphere view.
+void drawMoonPhase(int cx, int cy, int R, float f, bool mirror, uint16_t bg) {
+  float c = cosf(2 * PI * f);
+  bool waxing = f < 0.5f;
+  float R2 = (float)R * R;
+  for (int py = -R - 1; py <= R; py++) {
+    for (int px = -R - 1; px <= R; px++) {
+      int inDisc = 0, inLit = 0;
+      for (int sy = 0; sy < 4; sy++) {
+        float y = py + (sy + 0.5f) / 4;
+        float w2 = R2 - y * y;
+        if (w2 <= 0) continue;
+        float w = sqrtf(w2);
+        for (int sx = 0; sx < 4; sx++) {
+          float x = px + (sx + 0.5f) / 4;
+          if (x * x > w2) continue;
+          inDisc++;
+          float xm = mirror ? -x : x;
+          if (waxing ? (xm >= c * w) : (xm <= -c * w)) inLit++; // lit side grows from the right while waxing
+        }
+      }
+      if (!inDisc) continue;
+      uint16_t col = tft.alphaBlend(inLit * 255 / inDisc, T.moon, T.moonShadow);
+      if (inDisc < 16) col = tft.alphaBlend(inDisc * 255 / 16, col, bg);
+      tft.drawPixel(cx + px, cy + py, col);
+    }
+  }
+}
+
 // --- page frame
 void drawNavDots(int mode) {
   // Page dots along the bottom - shows which of the 7 pages you're on
@@ -3285,27 +3313,23 @@ void drawPageAstro() {
     int moonCardH = 470 - moonCardY - 10;
     drawCard(25, moonCardY, 270, moonCardH, 10, T.card2, T.border, T.card);
 
-    time_t localT = now() + tzOffsetSec[currentCity];
-    int pIdx = getMoonPhaseIndex(day(localT), month(localT), year(localT));
+    // The moon is drawn, not a photo: exact phase, theme colors, no edges.
+    // Seen from the southern hemisphere (e.g. Australia) it's mirrored.
+    float f = moonPhaseFraction();
+    int pIdx = moonPhaseIndex(f);
+    bool south = cityGeoCached[currentCity] && cityLat[currentCity] < 0;
+    drawMoonPhase(160, moonCardY + 80, 46, f, south, T.card2);
+    ffText(getMoonPhaseName(pIdx), 160, moonCardY + 150, &FreeSansBold9pt7b, MC_DATUM, T.text);
 
-    uint16_t jw = 0, jh = 0;
-    TJpgDec.getJpgSize(&jw, &jh, moonImages[pIdx], moonSizes[pIdx]);
-    int imgW = jw > 0 ? jw : 100, imgH = jh > 0 ? jh : 100;
-    int imgX = 160 - (imgW / 2);
-    int imgY = moonCardY + 40;
-
-    TJpgDec.drawJpg(imgX, imgY, moonImages[pIdx], moonSizes[pIdx]);
-    // The photos are the moon disc (radius ~35% of the image) on a light grey
-    // square. Paint everything outside the disc in the card color with a
-    // smooth ring, so only the moon itself shows - no grey frame or outline.
-    // The ring's inner edge is blended against a mid grey (the moon's edge is
-    // dark on the shadow side and light on the lit side); a second ring
-    // cleans up its outer edge against the card.
-    int mcx = imgX + imgW / 2, mcy = imgY + imgH / 2;
-    int rIn = (min(imgW, imgH) * 35) / 100, rOut = (max(imgW, imgH) * 72) / 100 + 2;
-    tft.drawArc(mcx, mcy, rOut, rIn, 0, 360, T.card2, RGB565(0x60, 0x64, 0x62), true);
-    tft.drawArc(mcx, mcy, rOut + 2, rOut - 2, 0, 360, T.card2, T.card2, true);
-    ffText(getMoonPhaseName(pIdx), 160, imgY + imgH + 26, &FreeSansBold9pt7b, MC_DATUM, T.text);
+    // "62% lit - full moon in 4 days" (whichever of full/new moon comes first)
+    int lit = (int)round((1 - cos(2 * PI * f)) / 2 * 100);
+    float toFull = (f < 0.5f ? 0.5f - f : 1.5f - f) * MOON_SYNODIC_DAYS, toNew = (1 - f) * MOON_SYNODIC_DAYS;
+    bool full = toFull < toNew;
+    int days = (int)round(full ? toFull : toNew);
+    String next = days == 0 ? String(full ? "full moon today" : "new moon today")
+                            : String(full ? "full moon in " : "new moon in ") + days + (days == 1 ? " day" : " days");
+    tft.setTextDatum(MC_DATUM); tft.setTextColor(T.muted);
+    tft.drawString(String(lit) + "% lit - " + next, 160, moonCardY + 176, 2);
   }
   drawAstroCountdown(); // ticks live even while already on this page
 }
@@ -4777,7 +4801,7 @@ function moonSvg(f){var r=18,c=22,k=Math.cos(2*Math.PI*f)*r,wax=f<.5,o='<circle 
  o+='<path d="M'+c+' '+(c-r)+' A'+r+' '+r+' 0 0 '+(wax?1:0)+' '+c+' '+(c+r)+' A'+Math.abs(k).toFixed(2)+' '+r+' 0 0 '+((k>0)==wax?0:1)+' '+c+' '+(c-r)+'Z" fill="#e8d9a8"/>';
  return o;}
 function moon(){var syn=29.530588853,age=((Date.now()/864e5-10962.7597)%syn+syn)%syn,f=age/syn;
- $('moonIcon').innerHTML=moonSvg(f);var toFull=f<.5?(.5-f)*syn:(1.5-f)*syn,toNew=(1-f)*syn;
+ $('moonIcon').innerHTML=cur&&cur.southern?'<g transform="matrix(-1 0 0 1 44 0)">'+moonSvg(f)+'</g>':moonSvg(f);var toFull=f<.5?(.5-f)*syn:(1.5-f)*syn,toNew=(1-f)*syn;
  $('moonNext').innerText=toFull<toNew?'Full moon in '+Math.round(toFull)+' day'+(Math.round(toFull)==1?'':'s'):'New moon in '+Math.round(toNew)+' day'+(Math.round(toNew)==1?'':'s');}
 function forecast(d){var v=d.forecast.filter(function(x){return x.day;});if(!v.length){$('fc').innerHTML='<div class="empty">No forecast data</div>';return;}
  var mn=Math.min.apply(null,v.map(function(x){return x.low;})),mx=Math.max.apply(null,v.map(function(x){return x.high;}));if(mx-mn<1)mx=mn+1;var o='';

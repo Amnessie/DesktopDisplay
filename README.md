@@ -14,7 +14,7 @@ A touch-screen weather station for the 3.5-inch **E32R35T / E32N35T** ESP32 disp
 - Optional LED alert: two slow blue pulses when rain is expected within 30 minutes (once per rain spell; switch it on or off in the web Settings)
 - Pressure trend over the last 3 hours (steady / rising / falling / fast), using the official WMO classes, with an arrow in the pressure tile
 - Rain page with 1h/3h rainfall and upcoming rain in 3-hour steps
-- Astro page with sunrise, sunset and the current moon phase
+- Astro page with sunrise, sunset and the current moon phase, drawn to the exact phase (mirrored for southern-hemisphere cities), with how much is lit and the days until the next full or new moon
 - Forecast page and an on-device 7-day history
 - Little animated astronaut on the home screen
 - Status indicator showing whether the weather data is fresh, updating or failed
