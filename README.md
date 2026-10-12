@@ -15,6 +15,8 @@ A touch-screen weather station for the 3.5-inch **E32R35T / E32N35T** ESP32 disp
 - Forecast page and an on-device 7-day history
 - Little animated astronaut on the home screen
 - Status indicator showing whether the weather data is fresh, updating or failed
+- Light and dark themes, or Auto: dark from sunset to sunrise
+- Weather icons drawn on the display (sun, moon at night, clouds, rain, drizzle, thunder, snow, fog)
 - RGB LED that changes color with the weather (or a fixed color you pick)
 
 **Weather sources** (selectable per city)
@@ -53,7 +55,7 @@ Install the [Arduino IDE](https://www.arduino.cc/en/software) and add ESP32 supp
 
 Install these through **Tools → Manage Libraries**:
 
-- **TFT_eSPI** by Bodmer
+- **TFT_eSPI** by Bodmer (version 2.5 or newer, for the anti-aliased drawing)
 - **TJpg_Decoder** by Bodmer
 - **WiFiManager** by tzapu
 - **ArduinoJson** by Benoit Blanchon
@@ -113,7 +115,7 @@ All settings are stored in the ESP32's flash and survive power cuts and new uplo
 
 The pages are: **Home**, **Stats**, **Rain**, **Astro**, **System**, **Forecast** and **History**.
 
-On the **System** page you can drag the sliders for screen and LED brightness (saved automatically a few seconds after you let go), switch the LED between weather colors and a custom color, pick the custom color, and save it as the default.
+On the **System** page you can drag the sliders for screen and LED brightness (saved automatically a few seconds after you let go), switch the LED between weather colors and a custom color, pick the custom color, and save it as the default. The **THEME** button cycles between Auto (dark after sunset), Light and Dark; the same setting is also on the web Settings page.
 
 LED weather colors: orange = clear, white = clouds, blue = rain, purple = thunderstorm, cyan = snow.
 

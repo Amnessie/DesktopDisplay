@@ -169,7 +169,37 @@ TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite clk = TFT_eSprite(&tft); 
 
 // --- [SYSTEM STATE] ---
-uint16_t bgColor = 0xCE79;
+// --- [THEMES] ---
+// Every color the screen uses comes from the active theme T, so the whole UI
+// can switch between light and dark. THEME_AUTO uses dark between sunset and
+// sunrise for the city on screen (see applyTheme()).
+#define RGB565(r, g, b) ((uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3)))
+struct Theme {
+  uint16_t bg, card, card2, border, text, muted, line, accent;
+  uint16_t icon, rain, rainSoft, good, bad, hi, lo, sun, moon;
+  uint16_t sunriseFg, sunriseBg, sunsetFg, sunsetBg;
+};
+const Theme THEME_LIGHT_COLORS = {
+  RGB565(0xE9, 0xEE, 0xF5), RGB565(0xFF, 0xFF, 0xFF), RGB565(0xF3, 0xF6, 0xFA), RGB565(0xD6, 0xDE, 0xE9),
+  RGB565(0x16, 0x20, 0x2F), RGB565(0x5F, 0x6F, 0x86), RGB565(0xC9, 0xD3, 0xE0), RGB565(0xF0, 0x8C, 0x2E),
+  RGB565(0x9F, 0xB0, 0xC8), RGB565(0x3B, 0x82, 0xF6), RGB565(0xC3, 0xDA, 0xFA), RGB565(0x22, 0xA0, 0x6B),
+  RGB565(0xDC, 0x26, 0x26), RGB565(0xCC, 0x33, 0x33), RGB565(0x1E, 0x63, 0xD6), RGB565(0xF5, 0xB4, 0x00),
+  RGB565(0xC9, 0xB2, 0x6B), RGB565(0xE6, 0x96, 0x1E), RGB565(0xFF, 0xF4, 0xE0), RGB565(0x1A, 0x2A, 0x5E),
+  RGB565(0xE0, 0xE7, 0xF5)
+};
+const Theme THEME_DARK_COLORS = {
+  RGB565(0x0B, 0x12, 0x20), RGB565(0x14, 0x1E, 0x30), RGB565(0x1A, 0x27, 0x40), RGB565(0x22, 0x30, 0x4A),
+  RGB565(0xE7, 0xED, 0xF7), RGB565(0x85, 0x96, 0xAD), RGB565(0x2B, 0x3A, 0x55), RGB565(0xFF, 0x9F, 0x43),
+  RGB565(0x7F, 0x93, 0xB0), RGB565(0x4C, 0x95, 0xFF), RGB565(0x1E, 0x3A, 0x66), RGB565(0x34, 0xD3, 0x99),
+  RGB565(0xF8, 0x71, 0x71), RGB565(0xF8, 0x71, 0x71), RGB565(0x60, 0xA5, 0xFA), RGB565(0xFB, 0xBF, 0x24),
+  RGB565(0xE8, 0xD9, 0xA8), RGB565(0xFB, 0xBF, 0x24), RGB565(0x2A, 0x24, 0x16), RGB565(0xA5, 0xB8, 0xFF),
+  RGB565(0x1A, 0x24, 0x40)
+};
+enum ThemeMode { THEME_LIGHT = 0, THEME_DARK = 1, THEME_AUTO = 2 };
+int themeMode = THEME_AUTO; // saved as "theme"; set on the System page or the web Settings page
+bool themeDark = false;
+Theme T = THEME_LIGHT_COLORS;
+uint16_t bgColor = RGB565(0xE9, 0xEE, 0xF5); // = T.bg (used by the boot/setup screens)
 int globalBrightness = 255, ledBrightness = 255;
 bool useCustomColor = false;
 int custR = 255, custG = 255, custB = 255;
@@ -295,9 +325,9 @@ bool requireAppHeader() {
 const int HOME_ARROW_LEFT_X   = 25;
 const int HOME_ARROW_RIGHT_X  = 295;
 const int HOME_ARROW_Y        = 25;
-const int STATUS_DOT_X        = 270;
-const int STATUS_DOT_Y        = 395; // NEW: raised to sit level with the "NEXT RAIN" title, was overlapping the rain preview's rightmost point down at 450
-const int STATUS_DOT_R        = 5;
+const int STATUS_DOT_X        = 296; // top-right of the home page rain card
+const int STATUS_DOT_Y        = 381;
+const int STATUS_DOT_R        = 4;
 const int NAV_DOT_Y           = 475; // cards end at y=466, so the dots no longer touch their border
 const int CITY_DOT_Y          = 44;
 const int UPDATE_BADGE_X      = 270;
@@ -332,7 +362,8 @@ const unsigned long SAVE_CONFIRMATION_MS = 1000;
 // text on our white card backgrounds, white-on-white is invisible. This
 // falls back to black whenever the color is too close to white to read.
 uint16_t safeTextColor(int r, int g, int b) {
-  if (r > 235 && g > 235 && b > 235) return TFT_BLACK;
+  int lum = (r * 299 + g * 587 + b * 114) / 1000;
+  if (themeDark ? lum < 90 : lum > 215) return T.text; // too close to the card color to read
   return tft.color565(r, g, b);
 }
 
@@ -475,7 +506,7 @@ void configModeCallback(WiFiManager *myWiFiManager) {
   // (centered) — text wider than the screen overflows equally off BOTH edges,
   // which is why it looked cut off on your display. Shorter lines, smaller
   // fonts, and one item per line keeps everything on-screen.
-  tft.fillScreen(bgColor); tft.setTextColor(TFT_BLACK); tft.setTextDatum(CC_DATUM);
+  tft.fillScreen(bgColor); tft.setTextColor(T.text); tft.setTextDatum(CC_DATUM);
   tft.drawString("WIFI SETUP", 160, 90, 4);
   tft.drawString("Connect to WiFi:", 160, 150, 2);
   tft.drawString("WeatherStation-Setup", 160, 175, 2);
@@ -975,9 +1006,12 @@ void getOpenWeatherData() {
 // network calls run. Once done, forces a full redraw of the current page.
 void drawUpdatingBadge(bool show) {
   if (show) {
-    tft.fillRoundRect(UPDATE_BADGE_X, UPDATE_BADGE_Y, UPDATE_BADGE_W, UPDATE_BADGE_H, 4, TFT_ORANGE);
-    tft.setTextColor(TFT_BLACK, TFT_ORANGE); tft.setTextDatum(CC_DATUM);
-    tft.drawString("...", UPDATE_BADGE_X + UPDATE_BADGE_W/2, UPDATE_BADGE_Y + UPDATE_BADGE_H/2, 1);
+    // Home page: over the city dots (the corners hold the city arrows).
+    // Other pages: top-right corner.
+    int bx = displayMode == 0 ? 140 : UPDATE_BADGE_X, by = displayMode == 0 ? 37 : UPDATE_BADGE_Y;
+    tft.fillRoundRect(bx, by, UPDATE_BADGE_W, UPDATE_BADGE_H, 6, T.accent);
+    tft.setTextColor(TFT_WHITE, T.accent); tft.setTextDatum(CC_DATUM);
+    tft.drawString("...", bx + UPDATE_BADGE_W / 2, by + UPDATE_BADGE_H / 2, 1);
   }
   // no separate "hide" drawing needed - the subsequent drawPageBackground() call
   // repaints that whole area anyway.
@@ -988,6 +1022,7 @@ void triggerWeatherUpdate() {
   drawUpdatingBadge(true);
   getOpenWeatherData();
   isUpdating = false;
+  applyTheme(); // new sunrise/sunset times (or another city) can change the AUTO theme
   drawPageBackground(displayMode);
   drawnMode = -1;
 }
@@ -1061,6 +1096,11 @@ void handleSettingsPage() {
   html += "Show Home Animation: <input type='checkbox' name='animOn' value='1'" + String(showAnimation ? " checked" : "") + "><br><br>";
   html += "Show Upcoming Rain Preview: <input type='checkbox' name='rainPrevOn' value='1'" + String(showRainPreview ? " checked" : "") + "><br>";
   html += "<span style='font-size:0.85em;color:#777;'>(shares the same spot as the animation above - only one shows at a time)</span><br><br>";
+  html += "Screen theme: <select name='theme'>";
+  html += "<option value='2'" + String(themeMode == THEME_AUTO ? " selected" : "") + ">Auto (dark after sunset)</option>";
+  html += "<option value='0'" + String(themeMode == THEME_LIGHT ? " selected" : "") + ">Light</option>";
+  html += "<option value='1'" + String(themeMode == THEME_DARK ? " selected" : "") + ">Dark</option>";
+  html += "</select><br><br>";
   html += "<input type='submit' value='Update Settings'> <span id='saveMsg'></span>";
   html += "</form>";
 
@@ -1190,6 +1230,10 @@ void handleSave() {
   prefs.putBool("animOn", showAnimation);
   showRainPreview = server.hasArg("rainPrevOn");
   prefs.putBool("rainPrevOn", showRainPreview);
+  if (server.hasArg("theme")) {
+    themeMode = constrain(server.arg("theme").toInt(), 0, 2);
+    prefs.putInt("theme", themeMode); // applied by the triggerWeatherUpdate() below
+  }
 
   prefs.putString("loc1", locs[0]); 
   prefs.putString("loc2", locs[1]); 
@@ -2564,301 +2608,431 @@ void handleHistoryWipe() {
 
 // --- [PAGE RENDERING FUNCTIONS] ---
 
+// --- theme selection
+// True between sunset and sunrise (local time of the city on screen).
+bool isNightNow() {
+  int riseMin = timeStrToMinutes(sunRise), setMin = timeStrToMinutes(sunSet);
+  if (riseMin < 0 || setMin < 0 || timeStatus() == timeNotSet) return false;
+  time_t localT = now() + tzOffsetSec[currentCity];
+  int nowMin = hour(localT) * 60 + minute(localT);
+  return nowMin < riseMin || nowMin >= setMin;
+}
+
+// Picks the colors for the current theme mode (and, for AUTO, the time of
+// day). Returns true if they changed, i.e. the screen needs a full redraw.
+bool applyTheme() {
+  bool dark = themeMode == THEME_DARK || (themeMode == THEME_AUTO && isNightNow());
+  bool changed = dark != themeDark;
+  themeDark = dark;
+  T = dark ? THEME_DARK_COLORS : THEME_LIGHT_COLORS;
+  bgColor = T.bg;
+  return changed;
+}
+
+const char* themeModeName() {
+  return themeMode == THEME_DARK ? "DARK" : (themeMode == THEME_LIGHT ? "LIGHT" : "AUTO");
+}
+
+// --- drawing helpers
+// Draws text in one of TFT_eSPI's FreeFonts (transparent background), then
+// switches back to the built-in fonts - otherwise every later drawString(...,
+// 1) would keep using the FreeFont instead of the small GLCD font.
+void ffText(const String &s, int x, int y, const GFXfont *f, uint8_t datum, uint16_t color) {
+  tft.setFreeFont(f);
+  tft.setTextDatum(datum);
+  tft.setTextColor(color);
+  tft.drawString(s, x, y);
+  tft.setFreeFont(nullptr);
+}
+
+int ffWidth(const String &s, const GFXfont *f) {
+  tft.setFreeFont(f);
+  int w = tft.textWidth(s);
+  tft.setFreeFont(nullptr);
+  return w;
+}
+
+// Rounded card with a 1px anti-aliased border. outside = the color around it.
+void drawCard(int x, int y, int w, int h, int r, uint16_t fill, uint16_t border, uint16_t outside) {
+  tft.fillSmoothRoundRect(x, y, w, h, r, border, outside);
+  tft.fillSmoothRoundRect(x + 1, y + 1, w - 2, h - 2, r - 1, fill, border);
+}
+
+// A degree sign drawn as a small ring (the fonts don't include one).
+void drawDegree(int cx, int cy, int r, uint16_t color, uint16_t bg) {
+  tft.fillSmoothCircle(cx, cy, r, color, bg);
+  tft.fillSmoothCircle(cx, cy, max(1, r - 2), bg, color);
+}
+
+// Value in bold with a small unit after it, vertically centered on yMid.
+// Returns the x where the unit ends.
+int valueWidth(const String &value, const String &unit, bool degree) {
+  return ffWidth(value, &FreeSansBold12pt7b) + (degree ? 12 : 5) + (unit.length() ? tft.textWidth(unit, 2) : 0);
+}
+
+int drawValue(int x, int yMid, const String &value, const String &unit, bool degree, uint16_t bg) {
+  ffText(value, x, yMid, &FreeSansBold12pt7b, ML_DATUM, T.text);
+  int ux = x + ffWidth(value, &FreeSansBold12pt7b) + 5;
+  if (degree) { drawDegree(ux + 1, yMid - 8, 3, T.text, bg); ux += 7; }
+  if (unit.length()) {
+    tft.setTextDatum(ML_DATUM); tft.setTextColor(T.muted);
+    tft.drawString(unit, ux, yMid + 2, 2);
+    ux += tft.textWidth(unit, 2);
+  }
+  return ux;
+}
+
+// --- weather icons, drawn from shapes (no image files), 64x64 design grid
+enum IconKind { ICON_CLEAR, ICON_PARTLY, ICON_CLOUD, ICON_RAIN, ICON_DRIZZLE, ICON_THUNDER, ICON_SNOW, ICON_FOG };
+
+int iconKindFor(String main, String desc) {
+  main.toUpperCase(); desc.toUpperCase();
+  if (main == "CLEAR") return ICON_CLEAR;
+  if (main == "THUNDERSTORM") return ICON_THUNDER;
+  if (main == "RAIN") return ICON_RAIN;
+  if (main == "DRIZZLE") return ICON_DRIZZLE;
+  if (main == "SNOW") return ICON_SNOW;
+  if (main == "MIST" || main == "FOG" || main == "HAZE" || main == "SMOKE" || main == "DUST"
+      || main == "SAND" || main == "ASH" || desc.indexOf("FOG") >= 0) return ICON_FOG;
+  if (desc.indexOf("FEW") >= 0 || desc.indexOf("SCATTERED") >= 0 || desc.indexOf("PARTLY") >= 0
+      || desc.indexOf("MAINLY CLEAR") >= 0) return ICON_PARTLY;
+  return ICON_CLOUD;
+}
+
+void drawWeatherIcon(int kind, int x, int y, int size, bool night, uint16_t bg) {
+  float f = size / 64.0f;
+  auto X = [&](float v) { return x + v * f; };
+  auto Y = [&](float v) { return y + v * f; };
+  auto S = [&](float v) { return v * f; };
+  // Cloud = three circles on a rounded base. The second pass re-fills the
+  // insides without anti-aliasing, hiding the faint seams where the smooth
+  // edges of overlapping shapes were blended against the background.
+  auto cloud = [&](float dx, float dy, uint16_t c) {
+    tft.fillSmoothCircle(X(20 + dx), Y(38 + dy), S(11), c, bg);
+    tft.fillSmoothCircle(X(33 + dx), Y(29 + dy), S(15), c, bg);
+    tft.fillSmoothCircle(X(46 + dx), Y(38 + dy), S(11), c, bg);
+    tft.fillSmoothRoundRect(X(9 + dx), Y(36 + dy), S(48), S(13), S(6), c, bg);
+    tft.fillCircle(X(20 + dx), Y(38 + dy), S(11) - 1, c);
+    tft.fillCircle(X(33 + dx), Y(29 + dy), S(15) - 1, c);
+    tft.fillCircle(X(46 + dx), Y(38 + dy), S(11) - 1, c);
+    tft.fillRect(X(12 + dx), Y(37 + dy), S(42), S(11), c);
+  };
+  auto sun = [&](float cx, float cy, float r, float r1, float r2, float w) {
+    for (int k = 0; k < 8; k++) {
+      float a = k * PI / 4;
+      tft.drawWideLine(X(cx + cos(a) * r1), Y(cy + sin(a) * r1), X(cx + cos(a) * r2), Y(cy + sin(a) * r2), S(w), T.sun, bg);
+    }
+    tft.fillSmoothCircle(X(cx), Y(cy), S(r), T.sun, bg);
+  };
+  auto moon = [&](float cx, float cy, float r) {
+    tft.fillSmoothCircle(X(cx), Y(cy), S(r), T.moon, bg);
+    tft.fillSmoothCircle(X(cx + r * 0.45f), Y(cy - r * 0.35f), S(r * 0.85f), bg, T.moon);
+  };
+
+  switch (kind) {
+    case ICON_CLEAR:
+      if (night) moon(32, 32, 18); else sun(32, 32, 12, 18, 27, 4);
+      break;
+    case ICON_PARTLY:
+      if (night) moon(24, 22, 13); else sun(23, 22, 9, 14, 20, 3.5f);
+      cloud(6, 8, T.icon);
+      break;
+    case ICON_RAIN:
+      cloud(0, -6, T.icon);
+      for (int i = 0; i < 3; i++) tft.drawWideLine(X(23 + 11 * i), Y(47), X(19 + 11 * i), Y(58), S(3.5f), T.rain, bg);
+      break;
+    case ICON_DRIZZLE:
+      cloud(0, -6, T.icon);
+      for (int i = 0; i < 3; i++) {
+        tft.fillSmoothCircle(X(22 + 11 * i), Y(50), S(2.4f), T.rain, bg);
+        tft.fillSmoothCircle(X(27 + 11 * i), Y(58), S(2.4f), T.rain, bg);
+      }
+      break;
+    case ICON_THUNDER:
+      cloud(0, -6, T.icon);
+      tft.fillTriangle(X(36), Y(40), X(25), Y(54), X(33), Y(54), T.sun);
+      tft.fillTriangle(X(30), Y(52), X(39), Y(52), X(27), Y(64), T.sun);
+      break;
+    case ICON_SNOW:
+      cloud(0, -6, T.icon);
+      tft.fillSmoothCircle(X(21), Y(50), S(2.8f), T.lo, bg);
+      tft.fillSmoothCircle(X(33), Y(55), S(2.8f), T.lo, bg);
+      tft.fillSmoothCircle(X(45), Y(50), S(2.8f), T.lo, bg);
+      tft.fillSmoothCircle(X(27), Y(61), S(2.8f), T.lo, bg);
+      tft.fillSmoothCircle(X(39), Y(61), S(2.8f), T.lo, bg);
+      break;
+    case ICON_FOG:
+      for (int i = 0; i < 4; i++) tft.drawWideLine(X(i % 2 ? 14 : 8), Y(20 + 10 * i), X(i % 2 ? 56 : 50), Y(20 + 10 * i), S(5), T.icon, bg);
+      break;
+    default:
+      cloud(0, 0, T.icon);
+  }
+}
+
+// --- page frame
 void drawNavDots(int mode) {
   // Page dots along the bottom - shows which of the 7 pages you're on
   int totalPages = 7, spacing = 16;
   int startXdots = 160 - ((totalPages - 1) * spacing) / 2;
   for (int i = 0; i < totalPages; i++) {
     int cx = startXdots + i * spacing;
-    if (i == mode) tft.fillCircle(cx, NAV_DOT_Y, 4, 0x4228);
-    else tft.drawCircle(cx, NAV_DOT_Y, 4, 0x4228);
+    if (i == mode) tft.fillSmoothCircle(cx, NAV_DOT_Y, 4, T.accent, T.bg);
+    else tft.fillSmoothCircle(cx, NAV_DOT_Y, 3, T.line, T.bg);
   }
-  // City dots under the title - only relevant on the home page (where the
-  // arrows live), so we don't clutter the other pages with them.
+  // City dots under the title - only on the home page, where the arrows live.
   if (mode == 0) {
     int cSpacing = 12;
     int cStartX = 160 - ((NUM_CITIES - 1) * cSpacing) / 2;
     for (int i = 0; i < NUM_CITIES; i++) {
       int cx = cStartX + i * cSpacing;
-      if (i == currentCity) tft.fillCircle(cx, CITY_DOT_Y, 3, 0x4228);
-      else tft.drawCircle(cx, CITY_DOT_Y, 3, 0x4228);
+      tft.fillSmoothCircle(cx, CITY_DOT_Y, 3, i == currentCity ? T.accent : T.line, T.bg);
     }
   }
 }
 
-void drawPageBackground(int mode) {
-  tft.fillScreen(bgColor); tft.setTextDatum(CC_DATUM); tft.setTextColor(TFT_BLACK);
-  if (mode == 0) {
-    tft.drawString(getDisplayCity(locs[currentCity]), 160, 25, 4);
-    // City switch arrows either side of the city name
-    tft.setTextColor(0x4228);
-    tft.drawString("<", HOME_ARROW_LEFT_X, HOME_ARROW_Y, 4);
-    tft.drawString(">", HOME_ARROW_RIGHT_X, HOME_ARROW_Y, 4);
-    tft.setTextColor(0x4228); tft.drawString(weatherDesc, 160, 60, 2);
-    tft.setTextColor(TFT_BLACK);
-    // Center the number AND its unit together - centering only the number
-    // left the whole "14.6 °C" group sitting visibly right of center.
-    String tNum = String(tempnum, 1);
-    int nW = tft.textWidth(tNum, 7);
-    int groupW = nW + 12 + tft.textWidth("C", 4); // number + gap/degree mark + "C"
-    int tx = 160 - groupW / 2;
-    tft.setTextDatum(ML_DATUM);
-    tft.drawString(tNum, tx, 110, 7);
-    tft.setTextDatum(TL_DATUM);
-    tft.drawString("o", tx + nW + 2, 85, 2);
-    tft.drawString("C", tx + nW + 12, 95, 4);
-    tft.setTextDatum(CC_DATUM);
-    tft.drawString("L:" + String(tempMin, 1) + "  H:" + String(tempMax, 1), 160, 145, 2);
-    tft.fillRoundRect(15, 165, 290, 302, 15, TFT_WHITE);
-    tft.drawRoundRect(15, 165, 290, 302, 15, 0x4228);
-  } else {
-    tft.fillRoundRect(15, 70, 290, 397, 15, TFT_WHITE);
-    tft.drawRoundRect(15, 70, 290, 397, 15, 0x4228);
-    String titles[] = {"", "ATMOSPHERIC LOG", "PRECIPITATION", "SOLAR & LUNAR", "SYSTEM INFO", "5-DAY FORECAST", "7-DAY HISTORY"};
-    tft.drawString(titles[mode], 160, 35, 4);
-  }
-  drawNavDots(mode); // NEW: page + city position indicators
+void drawHomeTile(int x, int y, const char *label, const String &value, const String &unit, bool degree) {
+  drawCard(x, y, 146, 48, 10, T.card, T.border, T.bg);
+  tft.setTextDatum(TL_DATUM); tft.setTextColor(T.muted);
+  tft.drawString(label, x + 11, y + 6, 2);
+  drawValue(x + 11, y + 33, value, unit, degree, T.card);
 }
 
-// NEW: small freshness/status dot + age label, drawn inside the home card.
-// Green = last fetch succeeded, Red = last fetch failed (stale data on screen).
+// Everything on the home page that only changes when new weather arrives
+// (or the city/theme changes). The clock, date, rain bars and status dot are
+// drawn by drawPageHome() since they change on their own.
+void drawHomeStatic() {
+  // Header: city name with switch arrows either side
+  String city = getDisplayCity(locs[currentCity]);
+  const GFXfont *cf = ffWidth(city, &FreeSansBold12pt7b) > 240 ? &FreeSansBold9pt7b : &FreeSansBold12pt7b;
+  ffText(city, 160, 24, cf, MC_DATUM, T.text);
+  tft.drawWideLine(24, 15, 16, 24, 3, T.muted, T.bg); tft.drawWideLine(16, 24, 24, 33, 3, T.muted, T.bg);
+  tft.drawWideLine(296, 15, 304, 24, 3, T.muted, T.bg); tft.drawWideLine(304, 24, 296, 33, 3, T.muted, T.bg);
+
+  // Current conditions: icon + temperature
+  drawWeatherIcon(iconKindFor(mainWeather, weatherDesc), 18, 56, 72, isNightNow(), T.bg);
+  String tNum = String(tempnum, 1);
+  int nW = tft.textWidth(tNum, 7);
+  int tx = 104, groupW = nW + 17 + ffWidth("C", &FreeSansBold12pt7b);
+  if (tx + groupW > 308) tx = 308 - groupW; // very wide values like -12.5
+  tft.setTextDatum(TL_DATUM); tft.setTextColor(T.text, T.bg);
+  tft.drawString(tNum, tx, 62, 7);
+  drawDegree(tx + nW + 9, 68, 5, T.text, T.bg);
+  ffText("C", tx + nW + 17, 62, &FreeSansBold12pt7b, TL_DATUM, T.text);
+
+  // Description on the left, today's high/low on the right
+  String hl = "H " + String((int)round(tempMax)) + "   L " + String((int)round(tempMin));
+  int room = 280 - ffWidth(hl, &FreeSans9pt7b) - 12;
+  String desc = weatherDesc;
+  const GFXfont *df = &FreeSansBold9pt7b;
+  if (ffWidth(desc, df) > room) df = &FreeSans9pt7b;
+  if (ffWidth(desc, df) > room) {
+    while (desc.length() > 3 && ffWidth(desc + "..", df) > room) desc.remove(desc.length() - 1);
+    desc.trim(); desc += "..";
+  }
+  ffText(desc, 20, 136, df, ML_DATUM, T.muted);
+  ffText(hl, 300, 136, &FreeSans9pt7b, MR_DATUM, T.muted);
+
+  // Clock card (digits drawn by drawPageHome) and the four detail tiles
+  drawCard(12, 150, 296, 104, 14, T.card, T.border, T.bg);
+  drawHomeTile(12, 262, "FEELS", String(feels_like, 1), "C", true);
+  drawHomeTile(162, 262, "WIND", String((int)round(windSpeedKmH)), "km/h " + windDir, false);
+  drawHomeTile(12, 316, "HUMIDITY", String(huminum), "%", false);
+  drawHomeTile(162, 316, "PRESSURE", String(pressure), "hPa", false);
+
+  // Bottom card: upcoming rain (or the animation, if that's chosen instead)
+  drawCard(12, 370, 296, 92, 12, T.card, T.border, T.bg);
+  if (showRainPreview) {
+    tft.setTextDatum(ML_DATUM); tft.setTextColor(T.muted);
+    tft.drawString("RAIN NEXT 15H", 24, 381, 2);
+  }
+}
+
+void drawPageBackground(int mode) {
+  tft.fillScreen(T.bg);
+  if (mode == 0) {
+    drawHomeStatic();
+  } else {
+    const char *titles[] = {"", "ATMOSPHERE", "PRECIPITATION", "SUN & MOON", "SYSTEM", "5-DAY FORECAST", "7-DAY HISTORY"};
+    ffText(titles[mode], 160, 36, &FreeSansBold12pt7b, MC_DATUM, T.text);
+    drawCard(15, 70, 290, 397, 15, T.card, T.border, T.bg);
+  }
+  drawNavDots(mode); // page + city position indicators
+}
+
+// Freshness dot + age in the top-right of the home page's rain card.
+// Green = last fetch succeeded, red = it failed (data on screen is getting old).
 void drawStatusIndicator(bool forceDraw = false) {
-  // Now that the dot lives in the spacious bottom-right corner of the card
-  // (nothing else is drawn near there), there's room for the "Xm ago" text
-  // again without it fighting the clock digits like it did up top.
   static int lastShownAge = -1;
   static bool lastShownOK = true;
   unsigned long ageMin = lastFetchMillis == 0 ? 0 : (millis() - lastFetchMillis) / 60000;
   if (!forceDraw && (int)ageMin == lastShownAge && lastFetchOK == lastShownOK && drawnMode == 0) return;
   lastShownAge = (int)ageMin; lastShownOK = lastFetchOK;
 
-  uint16_t dotColor = lastFetchOK ? TFT_DARKGREEN : TFT_RED;
-  tft.fillRect(STATUS_DOT_X - 60, STATUS_DOT_Y - 8, 70, 16, TFT_WHITE); // erase previous dot+text
-  tft.fillCircle(STATUS_DOT_X, STATUS_DOT_Y, STATUS_DOT_R, dotColor);
-  tft.setTextColor(TFT_BLACK, TFT_WHITE); tft.setTextDatum(MR_DATUM);
-  String label = lastFetchOK ? (String(ageMin) + "m") : "ERR";
-  tft.drawString(label, STATUS_DOT_X - STATUS_DOT_R - 4, STATUS_DOT_Y, 1);
+  tft.fillRect(STATUS_DOT_X - 62, STATUS_DOT_Y - 8, 68, 17, T.card); // erase previous dot+text
+  tft.fillSmoothCircle(STATUS_DOT_X, STATUS_DOT_Y, STATUS_DOT_R, lastFetchOK ? T.good : T.bad, T.card);
+  tft.setTextDatum(MR_DATUM); tft.setTextColor(lastFetchOK ? T.muted : T.bad, T.card);
+  tft.drawString(lastFetchOK ? (String(ageMin) + "m") : String("ERR"), STATUS_DOT_X - STATUS_DOT_R - 5, STATUS_DOT_Y + 1, 2);
 }
 
-// NEW: compact "upcoming rain" preview for the bottom of the Home card,
-// using the exact same forecast data the full Precipitation page uses (see
-// upcomingRainMm/upcomingRainLabel). A mini line graph - same visual style
-// as the Precipitation page's graph, just smaller - rather than bars, and
-// shows the next 3 x 3-hour steps (~9h ahead) rather than the full ~15h
-// graph, since there's only a little unused space here. Text is drawn
-// transparent (single-arg setTextColor), not opaque - opaque text pre-fills
-// a white background box, which was overlapping the "NEXT RAIN" title
-// above when a bar/point sat close to it (the same issue fixed on the
-// Precipitation page's own graph). Shares its screen area with the home
-// animation (see drawPageHome) - only one of the two is ever drawn.
-// Returns true if this call actually wiped and redrew its area (which also
-// erases the status dot, since it lives inside that area's footprint) -
-// false if it skipped drawing because nothing changed. drawPageHome() uses
-// this to know when the status dot needs to be force-redrawn right after.
-bool drawHomeRainPreview() {
-  static float lastVals[3] = { -1, -1, -1 };
-  int n = min(upcomingRainCount, 3);
+// Upcoming rain on the home page: one bar per 3-hour step (~15h ahead), plus
+// the total. Only redraws when the values change.
+void drawHomeRainPreview() {
+  static float lastVals[RAIN_GRAPH_POINTS];
+  int n = upcomingRainCount;
   bool changed = (drawnMode != 0);
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < RAIN_GRAPH_POINTS; i++) {
     float v = (i < n) ? upcomingRainMm[i] : -1;
     if (v != lastVals[i]) changed = true;
     lastVals[i] = v;
   }
-  if (!changed) return false; // nothing changed since last draw
+  if (!changed) return;
 
-  int areaX = 25, areaY = 386, areaW = 270, areaH = 78;
-  tft.fillRect(areaX, areaY, areaW, areaH, TFT_WHITE); // clear first - label widths vary between redraws
-  tft.setTextDatum(CC_DATUM);
-  tft.setTextColor(0x4228, TFT_WHITE);
-  tft.drawString("NEXT RAIN", 160, areaY + 9, 1);
-
+  tft.fillRect(132, 373, 96, 16, T.card);  // total, next to the title
+  tft.fillRect(18, 392, 284, 66, T.card);  // bars + labels
   if (n == 0) {
-    tft.setTextColor(TFT_BLACK, TFT_WHITE);
-    tft.drawString("NO FORECAST DATA", 160, areaY + 45, 2);
-    return true;
+    tft.setTextDatum(MC_DATUM); tft.setTextColor(T.muted);
+    tft.drawString("NO FORECAST DATA", 160, 422, 2);
+    return;
   }
 
-  int graphLeft = 70, graphRight = 250, baseline = areaY + areaH - 14, maxBarHeight = 34;
-  float maxRain = 0.5; // floor so an all-dry forecast doesn't divide by ~0
-  for (int i = 0; i < n; i++) if (upcomingRainMm[i] > maxRain) maxRain = upcomingRainMm[i];
-  maxRain *= 1.2; // headroom so the highest point stays clear of the title above
+  float total = 0, maxRain = 1.0f; // 1 mm floor so a dry forecast doesn't fill the card
+  for (int i = 0; i < n; i++) { total += upcomingRainMm[i]; if (upcomingRainMm[i] > maxRain) maxRain = upcomingRainMm[i]; }
+  tft.setTextDatum(ML_DATUM); tft.setTextColor(T.text);
+  tft.drawString(String(total, 1) + " mm", 136, 381, 2);
 
-  int stepX = (n > 1) ? (graphRight - graphLeft) / (n - 1) : 0;
-  int px[3], py[3];
+  int baseline = 436, maxH = 36;
   for (int i = 0; i < n; i++) {
-    px[i] = (n > 1) ? (graphLeft + i * stepX) : 160;
-    int h = (int)((upcomingRainMm[i] / maxRain) * maxBarHeight);
-    py[i] = baseline - h;
+    int cx = 44 + i * 58;
+    int h = (int)(upcomingRainMm[i] / maxRain * maxH);
+    if (upcomingRainMm[i] > 0 && h < 3) h = 3;
+    if (h > 0) tft.fillSmoothRoundRect(cx - 15, baseline - h, 30, h, min(4, h / 2), T.rain, T.card);
+    else tft.fillRect(cx - 15, baseline - 2, 30, 2, T.line);
+    tft.setTextDatum(MC_DATUM); tft.setTextColor(T.muted);
+    tft.drawString(upcomingRainLabel[i], cx, baseline + 13, 2);
   }
-
-  tft.drawFastHLine(graphLeft - 10, baseline, (graphRight - graphLeft) + 20, 0x4228); // baseline axis
-
-  uint16_t fillColor = tft.color565(195, 222, 250); // soft blue fill under the line
-  for (int i = 0; i < n - 1; i++) {
-    tft.fillTriangle(px[i], baseline, px[i], py[i], px[i+1], py[i+1], fillColor);
-    tft.fillTriangle(px[i], baseline, px[i+1], py[i+1], px[i+1], baseline, fillColor);
-  }
-  for (int i = 0; i < n - 1; i++) {
-    tft.drawLine(px[i], py[i], px[i+1], py[i+1], TFT_BLUE);
-  }
-  for (int i = 0; i < n; i++) {
-    tft.fillCircle(px[i], py[i], 2, TFT_BLUE);
-    // Transparent text - see comment above the function
-    tft.setTextColor(TFT_BLACK); tft.setTextDatum(CC_DATUM);
-    tft.drawString(String(upcomingRainMm[i], 1), px[i], py[i]-10, 1);
-    tft.setTextColor(0x4228);
-    tft.drawString(upcomingRainLabel[i], px[i], baseline+10, 1);
-  }
-  return true;
 }
 
 void drawPageHome() {
-  static unsigned long lastGridUpdate = 0;
-  if (millis() - lastGridUpdate > 60000 || drawnMode != 0) {
-    clk.createSprite(270, 80); clk.fillSprite(TFT_WHITE); clk.setTextDatum(ML_DATUM); clk.setTextColor(TFT_BLACK);
-    clk.drawFastHLine(0, 0, 270, 0xD6BA);
-    clk.drawString("Feels: " + String(feels_like, 1) + " C", 10, 25, 2);
-    clk.drawString("Humid: " + String(huminum) + " %", 10, 55, 2);
-    clk.drawString("Wind: " + String(windSpeedKmH, 1) + " " + windDir, 140, 25, 2);
-    clk.drawString("Baro: " + String(pressure) + " hPa", 140, 55, 2);
-    clk.pushSprite(25, 300); clk.deleteSprite();
-    lastGridUpdate = millis();
-  }
+  static String lastDate = "";
   if (now() != prevDisplay || drawnMode != 0) {
     time_t localT = now() + tzOffsetSec[currentCity];
-    // NEW: Font 7 (TFT_eSPI's built-in pseudo-7-segment digit font) replaces
-    // the old per-digit JPEG images - it's already linked into the binary
-    // since the temperature display uses it too, so this adds no extra font
-    // flash cost. Hour stays black; minute now tracks the LED's actual live
-    // color (custom-picked or weather-synced, whichever is active).
+    // Font 7 = TFT_eSPI's built-in 7-segment digits. Hours in the theme's
+    // text color, minutes in the chosen text color (see safeTextColor).
     String hourStr = (hour(localT) < 10 ? "0" : "") + String(hour(localT));
     String minStr  = (minute(localT) < 10 ? "0" : "") + String(minute(localT));
-    int ty = 185;
-    int blockW = tft.textWidth("88", 7); // actual rendered width of a 2-digit Font 7 block
-    int gap = 30; // visual gap between the hour block and the minute block
-    int totalW = blockW * 2 + gap;
-    int tx = 160 - totalW / 2; // center on x=160, matching city/temp/date above and below it
+    int ty = 162;
+    int blockW = tft.textWidth("88", 7); // rendered width of a 2-digit Font 7 block
+    int gap = 30;                        // gap between the hour and minute blocks
+    int tx = 160 - (blockW * 2 + gap) / 2;
 
     tft.setTextDatum(TL_DATUM);
-    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.setTextColor(T.text, T.card);
     tft.drawString(hourStr, tx, ty, 7);
-    tft.setTextColor(safeTextColor(textR, textG, textB), TFT_WHITE);
+    tft.setTextColor(safeTextColor(textR, textG, textB), T.card);
     tft.drawString(minStr, tx + blockW + gap, ty, 7);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(T.text, T.card);
+    tft.drawString(":", tx + blockW + gap / 2, ty + 24, 7);
 
-    // NEW: colon separator, centered in the gap between the two blocks -
-    // previously relied on color alone to tell hour/minute apart
-    tft.setTextDatum(CC_DATUM);
-    tft.setTextColor(TFT_BLACK, TFT_WHITE);
-    tft.drawString(":", tx + blockW + gap/2, ty + 24, 7);
-    tft.setTextDatum(TL_DATUM);
-
-    clk.createSprite(250, 40); clk.fillSprite(TFT_WHITE); clk.setTextDatum(CC_DATUM); clk.setTextColor(TFT_BLACK);
-    String d = String(day(localT)) + " / " + String(month(localT)) + " / " + String(year(localT));
-    clk.drawString(d, 125, 20, 4); clk.pushSprite(35, 250); clk.deleteSprite();
+    static const char *DAY_NAMES[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+    static const char *MONTH_NAMES[] = {"January", "February", "March", "April", "May", "June", "July",
+                                        "August", "September", "October", "November", "December"};
+    String d = String(DAY_NAMES[weekday(localT) - 1]) + " " + String(day(localT)) + " " + MONTH_NAMES[month(localT) - 1];
+    if (d != lastDate || drawnMode != 0) {
+      lastDate = d;
+      tft.fillRect(20, 224, 280, 24, T.card);
+      ffText(d, 160, 236, &FreeSansBold9pt7b, MC_DATUM, T.muted);
+    }
     prevDisplay = now();
   }
-  bool rainAreaWiped = false;
+
   if (showRainPreview) {
-    rainAreaWiped = drawHomeRainPreview();
+    drawHomeRainPreview();
   } else if (showAnimation) {
-    int ax = 135, ay = 385;
     if (millis() - AprevTime > 100) {
-      Anim++; if(Anim == 10) Anim = 0;
+      Anim++; if (Anim == 10) Anim = 0;
       AprevTime = millis();
-      // NEW: array lookup instead of a 10-case switch
-      TJpgDec.drawJpg(ax, ay, animFrames[Anim], animSizes[Anim]);
+      TJpgDec.drawJpg(135, 384, animFrames[Anim], animSizes[Anim]);
     }
   }
-
-  drawStatusIndicator(rainAreaWiped); // NEW: drawn last, and forced whenever the rain preview above just wiped this shared area
+  drawStatusIndicator(drawnMode != 0);
 }
 
-void drawPageStats() { 
-  if (drawnMode != 1) { 
-    int sY = 100;
-    tft.setTextDatum(TL_DATUM); 
-    String labels[8] = {"Current City", "Temperature", "Feels Like", "Humidity", "Pressure", "Visibility", "", ""};
-    String vals[8]   = {getDisplayCity(locs[currentCity]), String(tempnum, 1)+" C", String(feels_like, 1)+" C",
-                         String(huminum)+" %", String(pressure)+" hPa", String(visibility)+" km", "", ""};
-    int rowCount = 6;
+void drawPageStats() {
+  if (drawnMode == 1) return;
+  int sY = 80;
+  String labels[8] = {"CITY", "TEMPERATURE", "FEELS LIKE", "HUMIDITY", "PRESSURE", "VISIBILITY", "", ""};
+  String vals[8]   = {getDisplayCity(locs[currentCity]), String(tempnum, 1), String(feels_like, 1),
+                      String(huminum), String(pressure), String(visibility), "", ""};
+  String units[8]  = {"", "C", "C", "%", "hPa", "km", "", ""};
+  bool deg[8]      = {false, true, true, false, false, false, false, false};
+  int rowCount = 6;
 #if USE_BME280
-    // NEW: append local sensor readings if a BME280 was actually detected
-    if (bmeOK) {
-      labels[6] = "Local Temp";     vals[6] = String(localTemp, 1) + " C";
-      labels[7] = "Local Humidity"; vals[7] = String(localHumid, 1) + " %";
-      rowCount = 8;
-    }
+  // Local sensor readings, if a BME280 was detected
+  if (bmeOK) {
+    labels[6] = "INDOOR TEMP";     vals[6] = String(localTemp, 1); units[6] = "C"; deg[6] = true;
+    labels[7] = "INDOOR HUMIDITY"; vals[7] = String(localHumid, 1); units[7] = "%";
+    rowCount = 8;
+  }
 #endif
-    int step = 380 / rowCount;
-    for(int i=0; i<rowCount; i++) { 
-      tft.setTextColor(0x4228, TFT_WHITE); tft.drawString(labels[i], 40, sY + (i*step), 2); 
-      tft.setTextColor(TFT_BLACK, TFT_WHITE);
-      tft.drawString(vals[i], 40, sY + (i*step) + 20, 4); 
-    } 
-  } 
+  // One row per value: label on the left, value right-aligned
+  int step = 368 / rowCount;
+  for (int i = 0; i < rowCount; i++) {
+    int yMid = sY + i * step + step / 2;
+    tft.setTextDatum(ML_DATUM); tft.setTextColor(T.muted);
+    tft.drawString(labels[i], 34, yMid, 2);
+    String v = vals[i];
+    int maxW = 286 - 130; // keep clear of the label column
+    while (v.length() > 3 && valueWidth(v, units[i], deg[i]) > maxW) v.remove(v.length() - 1); // very long city names
+    drawValue(286 - valueWidth(v, units[i], deg[i]), yMid, v, units[i], deg[i], T.card);
+    if (i < rowCount - 1) tft.drawFastHLine(30, sY + (i + 1) * step, 260, T.line);
+  }
 }
 
-void drawPageRain() { 
-  if (drawnMode != 2) { 
-    tft.setTextDatum(CC_DATUM);
-    // NOTE: shrunk from font 6 to font 4 (both are fonts this project already
-    // uses elsewhere) to free up vertical room for the graph below.
-    tft.setTextColor(0x4228, TFT_WHITE); tft.drawString("1H RAINFALL", 160, 95, 2); 
-    tft.setTextColor(TFT_BLACK, TFT_WHITE); tft.drawString(String(rain1h, 2) + " mm", 160, 120, 4); 
-    tft.setTextColor(0x4228, TFT_WHITE);
-    tft.drawString("3H RAINFALL", 160, 160, 2); 
-    tft.setTextColor(TFT_BLACK, TFT_WHITE); tft.drawString(String(rain3h, 2) + " mm", 160, 185, 4); 
+void drawPageRain() {
+  if (drawnMode == 2) return;
+  tft.setTextDatum(MC_DATUM); tft.setTextColor(T.muted);
+  tft.drawString("LAST HOUR", 90, 94, 2);
+  tft.drawString("NEXT 3 HOURS", 230, 94, 2);
+  ffText(String(rain1h, 1) + " mm", 90, 122, &FreeSansBold12pt7b, MC_DATUM, T.text);
+  ffText(String(rain3h, 1) + " mm", 230, 122, &FreeSansBold12pt7b, MC_DATUM, T.text);
+  tft.drawFastVLine(160, 86, 52, T.line);
 
-    // NEW: bar graph of the next few 3-hour forecast slices, so you can see
-    // *when* rain is expected rather than just the current single number.
-    // (The API's forecast data only comes in 3-hour steps, so this is the
-    // finest resolution available - each bar IS a 3-hour window.)
-    tft.setTextColor(0x4228, TFT_WHITE);
-    tft.drawString("UPCOMING RAIN (3H STEPS)", 160, 225, 2);
+  // Graph of the next few 3-hour steps, so you can see *when* rain is expected
+  tft.setTextColor(T.muted);
+  tft.drawString("UPCOMING RAIN (3H STEPS)", 160, 170, 2);
 
-    int graphLeft = 55, graphRight = 265, baseline = 420, maxBarHeight = 130;
-    int n = upcomingRainCount;
-    if (n == 0) {
-      tft.setTextColor(TFT_BLACK, TFT_WHITE);
-      tft.drawString("NO FORECAST DATA", 160, 330, 2);
-    } else {
-      float maxRain = 0.5; // floor so an all-dry forecast doesn't divide by ~0
-      for (int i = 0; i < n; i++) if (upcomingRainMm[i] > maxRain) maxRain = upcomingRainMm[i];
-      maxRain *= 1.15; // headroom so the highest point doesn't touch its label
+  int graphLeft = 55, graphRight = 265, baseline = 420, maxBarHeight = 190;
+  int n = upcomingRainCount;
+  if (n == 0) {
+    tft.drawString("NO FORECAST DATA", 160, 330, 2);
+    return;
+  }
+  float maxRain = 0.5; // floor so an all-dry forecast doesn't divide by ~0
+  for (int i = 0; i < n; i++) if (upcomingRainMm[i] > maxRain) maxRain = upcomingRainMm[i];
+  maxRain *= 1.15; // headroom so the highest point doesn't touch its label
 
-      int stepX = (n > 1) ? (graphRight - graphLeft) / (n - 1) : 0;
-      int px[RAIN_GRAPH_POINTS], py[RAIN_GRAPH_POINTS];
-      for (int i = 0; i < n; i++) {
-        px[i] = graphLeft + i * stepX;
-        int h = (int)((upcomingRainMm[i] / maxRain) * maxBarHeight);
-        py[i] = baseline - h;
-      }
-
-      tft.drawFastHLine(graphLeft - 10, baseline, (graphRight - graphLeft) + 20, 0x4228); // baseline axis
-
-      uint16_t fillColor = tft.color565(195, 222, 250); // soft blue fill under the line
-      for (int i = 0; i < n - 1; i++) {
-        tft.fillTriangle(px[i], baseline, px[i], py[i], px[i+1], py[i+1], fillColor);
-        tft.fillTriangle(px[i], baseline, px[i+1], py[i+1], px[i+1], baseline, fillColor);
-      }
-      for (int i = 0; i < n - 1; i++) {
-        tft.drawLine(px[i], py[i], px[i+1], py[i+1], TFT_BLUE);
-        tft.drawLine(px[i], py[i]-1, px[i+1], py[i+1]-1, TFT_BLUE); // thicken slightly
-      }
-      for (int i = 0; i < n; i++) {
-        tft.fillCircle(px[i], py[i], 3, TFT_BLUE);
-        // Transparent text (single-arg setTextColor) instead of opaque -
-        // opaque text pre-fills a background box, which was carving a
-        // visible white notch out of the rising line/fill whenever a
-        // neighboring point's line passed under a label. Transparent just
-        // draws the digit pixels on top of whatever's already there.
-        tft.setTextColor(TFT_BLACK); tft.setTextDatum(CC_DATUM);
-        tft.drawString(String(upcomingRainMm[i], 1), px[i], py[i]-14, 1);
-        tft.setTextColor(0x4228);
-        tft.drawString(upcomingRainLabel[i], px[i], baseline+14, 1);
-      }
-    }
-  } 
+  int stepX = (n > 1) ? (graphRight - graphLeft) / (n - 1) : 0;
+  int px[RAIN_GRAPH_POINTS], py[RAIN_GRAPH_POINTS];
+  for (int i = 0; i < n; i++) {
+    px[i] = graphLeft + i * stepX;
+    py[i] = baseline - (int)((upcomingRainMm[i] / maxRain) * maxBarHeight);
+  }
+  for (int g = 1; g <= 3; g++) tft.drawFastHLine(graphLeft - 10, baseline - g * maxBarHeight / 3, (graphRight - graphLeft) + 20, T.line);
+  for (int i = 0; i < n - 1; i++) {
+    tft.fillTriangle(px[i], baseline, px[i], py[i], px[i + 1], py[i + 1], T.rainSoft);
+    tft.fillTriangle(px[i], baseline, px[i + 1], py[i + 1], px[i + 1], baseline, T.rainSoft);
+  }
+  tft.drawFastHLine(graphLeft - 10, baseline, (graphRight - graphLeft) + 20, T.muted); // baseline axis
+  for (int i = 0; i < n - 1; i++) tft.drawWideLine(px[i], py[i], px[i + 1], py[i + 1], 3, T.rain, T.rainSoft);
+  for (int i = 0; i < n; i++) {
+    tft.fillSmoothCircle(px[i], py[i], 4, T.rain, T.rainSoft);
+    // Transparent text, so labels never punch holes in the line/fill
+    tft.setTextDatum(MC_DATUM); tft.setTextColor(T.text);
+    tft.drawString(String(upcomingRainMm[i], 1), px[i], py[i] - 14, 2);
+    tft.setTextColor(T.muted);
+    tft.drawString(upcomingRainLabel[i], px[i], baseline + 16, 2);
+  }
 }
 
 // NEW: converts "HH:MM" into minutes-since-midnight.
@@ -2889,70 +3063,48 @@ SunCountdown computeSunCountdown() {
   return c;
 }
 
-// NEW: sunrise/sunset countdown badge - unlike the rest of the Astro page,
-// this ticks live every loop() pass while you're sitting on the page, not
-// just once when you switch to it.
+// Sunrise/sunset countdown badge - ticks live while you're on the page.
 void drawAstroCountdown() {
   static String lastLabel = "";
   SunCountdown c = computeSunCountdown();
   if (c.eventName == "") return; // no data yet
 
-  uint16_t badgeColor, badgeBg;
-  if (c.eventName == "SUNRISE") { badgeColor = tft.color565(230, 150, 30); badgeBg = tft.color565(255, 244, 224); }
-  else { badgeColor = TFT_NAVY; badgeBg = tft.color565(224, 231, 245); }
-
+  bool rise = c.eventName == "SUNRISE";
+  uint16_t fg = rise ? T.sunriseFg : T.sunsetFg, bg = rise ? T.sunriseBg : T.sunsetBg;
   String label = c.eventName + " IN " + String(c.diffMin / 60) + "H " + String(c.diffMin % 60) + "M";
   if (label == lastLabel && drawnMode == 3) return; // nothing changed since last draw
   lastLabel = label;
 
-  int badgeW = 230, badgeH = 30, badgeCY = 460 - 20; // 460 = the moon card's actual bottom edge (moonCardY+moonCardH in drawPageAstro); leaves a clean margin instead of poking through the border
-  int badgeX = 160 - badgeW / 2;
-  tft.fillRoundRect(badgeX, badgeCY - badgeH / 2, badgeW, badgeH, 8, badgeBg);
-  tft.drawRoundRect(badgeX, badgeCY - badgeH / 2, badgeW, badgeH, 8, badgeColor);
-  tft.setTextDatum(CC_DATUM); tft.setTextColor(badgeColor, badgeBg);
+  int badgeW = 230, badgeH = 30, badgeCY = 440; // inside the moon card (ends at y=460)
+  drawCard(160 - badgeW / 2, badgeCY - badgeH / 2, badgeW, badgeH, 8, bg, fg, T.card2);
+  tft.setTextDatum(MC_DATUM); tft.setTextColor(fg, bg);
   tft.drawString(label, 160, badgeCY, 2);
 }
 
 void drawPageAstro() {
   if (drawnMode != 3) {
-    // NEW: full redesign. Sunrise/Sunset get their own tinted mini-cards
-    // side by side (with up/down arrows) instead of floating text over
-    // mostly-empty space, and the moon phase gets a dedicated card below
-    // rather than sitting directly on the page background. Flat TFT_YELLOW
-    // read as garish on white, so sunrise uses a richer warm gold instead.
+    // Sunrise and sunset side by side in tinted cards, moon phase below.
     int cardY = 88, cardW = 130, cardH = 95;
     int sunriseX = 25, sunsetX = 165;
-    uint16_t sunriseColor = tft.color565(230, 150, 30);  // warm gold, not flat yellow
-    uint16_t sunsetColor  = TFT_NAVY;
-    uint16_t sunriseBg = tft.color565(255, 244, 224);    // soft amber tint
-    uint16_t sunsetBg  = tft.color565(224, 231, 245);    // soft blue tint
 
-    // Sunrise card
-    tft.fillRoundRect(sunriseX, cardY, cardW, cardH, 10, sunriseBg);
-    tft.drawRoundRect(sunriseX, cardY, cardW, cardH, 10, sunriseColor);
-    int scx = sunriseX + cardW/2;
-    tft.fillTriangle(scx-8, cardY+35, scx+8, cardY+35, scx, cardY+18, sunriseColor); // up arrow
-    tft.setTextDatum(CC_DATUM); tft.setTextColor(0x4228, sunriseBg);
-    tft.drawString("SUNRISE", scx, cardY+50, 2);
-    tft.setTextColor(sunriseColor, sunriseBg);
-    tft.drawString(sunRise, scx, cardY+76, 4);
+    drawCard(sunriseX, cardY, cardW, cardH, 10, T.sunriseBg, T.sunriseFg, T.card);
+    int scx = sunriseX + cardW / 2;
+    tft.fillTriangle(scx - 8, cardY + 32, scx + 8, cardY + 32, scx, cardY + 17, T.sunriseFg); // up arrow
+    tft.setTextDatum(MC_DATUM); tft.setTextColor(T.muted);
+    tft.drawString("SUNRISE", scx, cardY + 48, 2);
+    ffText(sunRise, scx, cardY + 74, &FreeSansBold12pt7b, MC_DATUM, T.sunriseFg);
 
-    // Sunset card
-    tft.fillRoundRect(sunsetX, cardY, cardW, cardH, 10, sunsetBg);
-    tft.drawRoundRect(sunsetX, cardY, cardW, cardH, 10, sunsetColor);
-    int stx = sunsetX + cardW/2;
-    tft.fillTriangle(stx-8, cardY+18, stx+8, cardY+18, stx, cardY+35, sunsetColor); // down arrow
-    tft.setTextColor(0x4228, sunsetBg);
-    tft.drawString("SUNSET", stx, cardY+50, 2);
-    tft.setTextColor(sunsetColor, sunsetBg);
-    tft.drawString(sunSet, stx, cardY+76, 4);
+    drawCard(sunsetX, cardY, cardW, cardH, 10, T.sunsetBg, T.sunsetFg, T.card);
+    int stx = sunsetX + cardW / 2;
+    tft.fillTriangle(stx - 8, cardY + 17, stx + 8, cardY + 17, stx, cardY + 32, T.sunsetFg); // down arrow
+    tft.setTextDatum(MC_DATUM); tft.setTextColor(T.muted);
+    tft.drawString("SUNSET", stx, cardY + 48, 2);
+    ffText(sunSet, stx, cardY + 74, &FreeSansBold12pt7b, MC_DATUM, T.sunsetFg);
 
-    // Moon phase - its own card below, rather than floating on bare background
-    uint16_t moonBg = tft.color565(245, 246, 250);
+    // Moon phase card
     int moonCardY = cardY + cardH + 15;
     int moonCardH = 470 - moonCardY - 10;
-    tft.fillRoundRect(25, moonCardY, 270, moonCardH, 10, moonBg);
-    tft.drawRoundRect(25, moonCardY, 270, moonCardH, 10, 0x4228);
+    drawCard(25, moonCardY, 270, moonCardH, 10, T.card2, T.border, T.card);
 
     time_t localT = now() + tzOffsetSec[currentCity];
     int pIdx = getMoonPhaseIndex(day(localT), month(localT), year(localT));
@@ -2960,43 +3112,61 @@ void drawPageAstro() {
     uint16_t jw = 0, jh = 0;
     TJpgDec.getJpgSize(&jw, &jh, moonImages[pIdx], moonSizes[pIdx]);
     int imgW = jw > 0 ? jw : 100, imgH = jh > 0 ? jh : 100;
-    int imgX = 160 - (imgW/2);
-    int imgY = moonCardY + 45; // roughly centers image+rings+name within the card
+    int imgX = 160 - (imgW / 2);
+    int imgY = moonCardY + 40;
 
     TJpgDec.drawJpg(imgX, imgY, moonImages[pIdx], moonSizes[pIdx]);
-    tft.drawRoundRect(imgX - 1, imgY - 1, imgW + 2, imgH + 2, 10, 0x4228);
-    for(int i=0; i<6; i++) tft.drawRoundRect(imgX - 3 - i, imgY - 3 - i, imgW + 6 + (i*2), imgH + 6 + (i*2), 12 + i, moonBg);
-    tft.setTextColor(TFT_BLACK, moonBg);
-    tft.drawString(getMoonPhaseName(pIdx), 160, imgY + imgH + 25, 4);
-  } 
-  drawAstroCountdown(); // NEW: ticks live even while already on this page
+    // Rounded frame: the rings in the card color trim the photo's square corners
+    tft.drawRoundRect(imgX - 1, imgY - 1, imgW + 2, imgH + 2, 10, T.border);
+    for (int i = 0; i < 6; i++) tft.drawRoundRect(imgX - 3 - i, imgY - 3 - i, imgW + 6 + (i * 2), imgH + 6 + (i * 2), 12 + i, T.card2);
+    ffText(getMoonPhaseName(pIdx), 160, imgY + imgH + 26, &FreeSansBold9pt7b, MC_DATUM, T.text);
+  }
+  drawAstroCountdown(); // ticks live even while already on this page
 }
 
-void drawPageForecast() { 
-  if (drawnMode != 5) { 
-    int sY = 95, step = 72;
-    for(int i=0; i<5; i++) { 
-      int yPos = sY + (i*step); tft.fillRoundRect(30, yPos, 260, 60, 10, 0xF79E);
-      tft.drawRoundRect(30, yPos, 260, 60, 10, 0x4228); 
-      if (forecast[i].valid) { 
-        tft.setTextColor(0x4228); tft.setTextDatum(ML_DATUM); tft.drawString(forecast[i].dayName, 45, yPos + 30, 4); 
-        tft.setTextColor(TFT_BLACK); tft.setTextDatum(CC_DATUM);
-        tft.drawString(forecast[i].main, 145, yPos + 30, 2); tft.setTextDatum(MR_DATUM); 
-        tft.drawString(String((int)round(forecast[i].low)) + "/" + String((int)round(forecast[i].high)) + " C", 275, yPos + 30, 4);
-      } else { 
-        tft.setTextColor(TFT_BLACK); tft.setTextDatum(CC_DATUM); tft.drawString("NO DATA", 160, yPos + 30, 2); 
-      } 
-    } 
-  } 
+void drawPageForecast() {
+  if (drawnMode == 5) return;
+  // Shared scale for the temperature range bars, so the days compare at a glance
+  float mn = 999, mx = -999;
+  for (int i = 0; i < 5; i++) if (forecast[i].valid) { mn = min(mn, forecast[i].low); mx = max(mx, forecast[i].high); }
+  if (mx - mn < 1) mx = mn + 1;
+
+  for (int i = 0; i < 5; i++) {
+    int y = 90 + i * 74;
+    drawCard(28, y, 264, 64, 12, T.card2, T.border, T.card);
+    if (!forecast[i].valid) {
+      tft.setTextDatum(MC_DATUM); tft.setTextColor(T.muted);
+      tft.drawString("NO DATA", 160, y + 32, 2);
+      continue;
+    }
+    ffText(forecast[i].dayName, 40, y + 32, &FreeSansBold12pt7b, ML_DATUM, T.text);
+    drawWeatherIcon(iconKindFor(forecast[i].main, ""), 102, y + 12, 40, false, T.card2);
+
+    String lo = String((int)round(forecast[i].low)), hi = String((int)round(forecast[i].high));
+    tft.setTextDatum(MR_DATUM); tft.setTextColor(T.muted);
+    tft.drawString(lo, 168, y + 33, 4);
+    drawDegree(172, y + 24, 3, T.muted, T.card2);
+
+    int bx = 182, bw = 50, by = y + 29;
+    tft.fillSmoothRoundRect(bx, by, bw, 7, 3, T.line, T.card2);
+    int a = bx + (int)((forecast[i].low - mn) / (mx - mn) * bw);
+    int b = bx + (int)((forecast[i].high - mn) / (mx - mn) * bw);
+    if (b - a < 7) b = a + 7;
+    tft.fillSmoothRoundRect(a, by, b - a, 7, 3, T.accent, T.line);
+
+    tft.setTextDatum(ML_DATUM); tft.setTextColor(T.text);
+    tft.drawString(hi, 240, y + 33, 4);
+    drawDegree(244 + tft.textWidth(hi, 4), y + 24, 3, T.text, T.card2);
+  }
 }
 
-// NEW: on-device 7-day history for the current city (page 7) - highs/lows
-// as two lines and daily rain as bars, read from the city's SD history log.
-// Drawn once when you switch to the page (the data only changes a few times a day).
+// On-device 7-day history for the current city (page 7) - highs/lows as two
+// lines and daily rain as bars, read from the city's SD history log. Drawn
+// once when you switch to the page (the data only changes a few times a day).
 void drawPageHistory() {
   if (drawnMode == 6) return;
-  tft.setTextDatum(CC_DATUM);
-  tft.setTextColor(0x4228, TFT_WHITE);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(T.muted);
   tft.drawString(getDisplayCity(locs[currentCity]), 160, 86, 2);
 
   String dates[7]; float hi[7], lo[7], rn[7];
@@ -3005,14 +3175,13 @@ void drawPageHistory() {
   n = histReadLastDays(currentCity, dates, hi, lo, rn, 7);
 #endif
   if (n == 0) {
-    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.setTextColor(T.text);
     tft.drawString("NO HISTORY YET", 160, 250, 2);
+    tft.setTextColor(T.muted);
     tft.drawString("(NEEDS THE SD CARD)", 160, 275, 1);
     return;
   }
 
-  uint16_t hiCol = tft.color565(204, 51, 51), loCol = tft.color565(30, 99, 214);
-  uint16_t rainCol = tft.color565(74, 144, 217), gridCol = tft.color565(225, 225, 225);
   int left = 52, right = 268;
   int px[7];
   for (int i = 0; i < n; i++) px[i] = (n > 1) ? left + i * (right - left) / (n - 1) : 160;
@@ -3025,64 +3194,58 @@ void drawPageHistory() {
   int top = 130, bot = 240;
   auto ty = [&](float v) { return (int)(bot - (v - lowB) / (highB - lowB) * (bot - top)); };
 
-  tft.setTextColor(0x4228, TFT_WHITE);
+  tft.setTextColor(T.muted);
   tft.drawString("HIGH / LOW (C)", 160, 106, 1);
-  for (int g = 0; g < 3; g++) tft.drawFastHLine(30, top + g * (bot - top) / 2, 260, gridCol);
+  for (int g = 0; g < 3; g++) tft.drawFastHLine(30, top + g * (bot - top) / 2, 260, T.line);
   for (int i = 0; i < n - 1; i++) {
-    tft.drawLine(px[i], ty(hi[i]), px[i + 1], ty(hi[i + 1]), hiCol);
-    tft.drawLine(px[i], ty(hi[i]) - 1, px[i + 1], ty(hi[i + 1]) - 1, hiCol);
-    tft.drawLine(px[i], ty(lo[i]), px[i + 1], ty(lo[i + 1]), loCol);
-    tft.drawLine(px[i], ty(lo[i]) + 1, px[i + 1], ty(lo[i + 1]) + 1, loCol);
+    tft.drawWideLine(px[i], ty(hi[i]), px[i + 1], ty(hi[i + 1]), 2.5f, T.hi, T.card);
+    tft.drawWideLine(px[i], ty(lo[i]), px[i + 1], ty(lo[i + 1]), 2.5f, T.lo, T.card);
   }
   for (int i = 0; i < n; i++) {
-    tft.fillCircle(px[i], ty(hi[i]), 3, hiCol);
-    tft.fillCircle(px[i], ty(lo[i]), 3, loCol);
-    tft.setTextColor(hiCol); // transparent text, so labels never punch holes in the lines
+    tft.fillSmoothCircle(px[i], ty(hi[i]), 3, T.hi, T.card);
+    tft.fillSmoothCircle(px[i], ty(lo[i]), 3, T.lo, T.card);
+    tft.setTextColor(T.hi); // transparent text, so labels never punch holes in the lines
     tft.drawString(String((int)round(hi[i])), px[i], ty(hi[i]) - 11, 2);
-    tft.setTextColor(loCol);
+    tft.setTextColor(T.lo);
     tft.drawString(String((int)round(lo[i])), px[i], ty(lo[i]) + 12, 2);
-    tft.setTextColor(0x4228, TFT_WHITE);
+    tft.setTextColor(T.muted);
     tft.drawString(getDayName(dayOfWeekFromDateString(dates[i])), px[i], 270, 2);
   }
 
   // --- rain bars
-  tft.setTextColor(0x4228, TFT_WHITE);
+  tft.setTextColor(T.muted);
   tft.drawString("RAIN (MM)", 160, 296, 1);
   int rTop = 318, rBase = 405;
   float rMax = 2.0f, tot = 0, hiSum = 0;
   for (int i = 0; i < n; i++) { if (rn[i] > rMax) rMax = rn[i]; tot += rn[i]; hiSum += hi[i]; }
-  tft.drawFastHLine(30, rBase, 260, 0x4228);
+  tft.drawFastHLine(30, rBase, 260, T.line);
   for (int i = 0; i < n; i++) {
     int h = (int)(rn[i] / rMax * (rBase - rTop));
-    if (h > 0) tft.fillRect(px[i] - 10, rBase - h, 20, h, rainCol);
+    if (h > 0) tft.fillSmoothRoundRect(px[i] - 10, rBase - h, 20, h, min(4, h / 2), T.rain, T.card);
     if (rn[i] >= 0.05f) {
-      tft.setTextColor(TFT_BLACK);
+      tft.setTextColor(T.text);
       tft.drawString(String(rn[i], 1), px[i], rBase - h - 8, 1);
     }
-    tft.setTextColor(0x4228, TFT_WHITE);
+    tft.setTextColor(T.muted);
     tft.drawString(dates[i].substring(8, 10), px[i], rBase + 10, 1);
   }
 
   // --- totals
-  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.setTextColor(T.text);
   tft.drawString(String(n) + "-DAY RAIN " + String(tot, 1) + " MM   AVG HIGH " + String(hiSum / n, 1) + " C", 160, 440, 2);
 }
 
-// NEW: the WiFi/sync/key status block, split out so it can be refreshed on
-// its own while sitting on this page. Only actually redraws (and wipes the
-// region) when something has genuinely changed - SSID, IP, sync age in
-// minutes, sync success/failure, or which API key is active - rather than
-// on a fixed timer, so the text doesn't visibly flash every couple seconds
-// when nothing new has happened. forceDraw=true is used on first entering
-// the page, since the screen was just wiped and needs the info regardless
-// of whether it happens to match the last-cached values from before.
+// The WiFi/sync/key status block, split out so it can be refreshed on its own
+// while sitting on this page. Only redraws (and wipes the region) when
+// something has actually changed, so the text doesn't flash every couple of
+// seconds. forceDraw=true is used on first entering the page.
 void drawSystemDynamicInfo(bool forceDraw = false) {
   static String lastSSID = "";
   static String lastIP = "";
   static int lastAgeMin = -1;
   static bool lastOK = false;
   static String lastKeySource = "";
-  static int lastTextR = -1, lastTextG = -1, lastTextB = -1; // NEW: so the IP-text color preview updates live
+  static int lastTextR = -1, lastTextG = -1, lastTextB = -1; // so the IP-text color preview updates live
   static bool everDrawn = false;
 
   String ssid = WiFi.SSID();
@@ -3099,66 +3262,53 @@ void drawSystemDynamicInfo(bool forceDraw = false) {
   lastSSID = ssid; lastIP = ip; lastAgeMin = ageMin; lastOK = lastFetchOK; lastKeySource = keySource;
   lastTextR = textR; lastTextG = textG; lastTextB = textB;
 
-  // Explicit clear first: the opaque text below only fills the background
-  // behind its OWN new width, so if e.g. the IP address or SSID gets
-  // shorter on refresh, leftover characters from the old, longer string
-  // would otherwise stay on screen. Clearing the whole region up front
-  // avoids that ghosting regardless of how the text length changes.
-  tft.fillRect(20, 83, 280, 122, TFT_WHITE);
+  // Clear first, so a shorter SSID/IP doesn't leave old characters behind
+  tft.fillRect(20, 83, 280, 122, T.card);
 
-  tft.setTextDatum(CC_DATUM);
-  tft.setTextColor(0x4228, TFT_WHITE); tft.drawString("WIFI: " + ssid, 160, 95, 2); 
-  // NEW: the IP address itself doubles as the color preview - colored with
-  // the LED's actual live color (custom-picked or weather-synced) rather
-  // than a separate swatch, using the full width already available here
-  // instead of adding a small dot that risked visual clutter.
-  tft.setTextColor(safeTextColor(textR, textG, textB), TFT_WHITE);
-  tft.drawString(ip, 160, 120, 4); 
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(T.muted, T.card); tft.drawString("WIFI: " + ssid, 160, 95, 2);
+  // The IP address doubles as the preview of the chosen text color
+  tft.setTextColor(safeTextColor(textR, textG, textB), T.card);
+  tft.drawString(ip, 160, 120, 4);
 
-  tft.setTextColor(0x4228, TFT_WHITE); tft.drawString("LAST SYNC", 160, 155, 2);
-  tft.setTextColor(lastFetchOK ? TFT_DARKGREEN : TFT_RED, TFT_WHITE);
+  tft.setTextColor(T.muted, T.card); tft.drawString("LAST SYNC", 160, 155, 2);
+  tft.setTextColor(lastFetchOK ? T.good : T.bad, T.card);
   tft.drawString(lastFetchOK ? (String(ageMin) + " MIN AGO") : "FAILED", 160, 175, 2);
 
   if (apiKeyBackup.length() > 0) {
-    tft.setTextColor(0x4228, TFT_WHITE);
+    tft.setTextColor(T.muted, T.card);
     tft.drawString("API KEY: " + keySource, 160, 196, 1);
   }
 }
 
-// NEW: generic slider track+fill+thumb drawer, reused for screen and LED brightness
+// Generic slider track+fill+thumb, used for screen and LED brightness
 void drawSlider(int cy, int percent, uint16_t fillColor, int trackX = SLIDER_X, int trackW = SLIDER_W, int thumbR = SLIDER_THUMB_R) {
   percent = constrain(percent, 0, 100);
-  // Clear the FULL thumb height first, not just the thin track. The thumb
-  // is taller than the track, so previous thumb positions were leaving
-  // visible arcs above/below the track uncleared - that's what showed up
-  // as a jagged "trail" during a fast drag.
+  // Clear the full thumb height first (the thumb is taller than the track),
+  // otherwise a fast drag leaves a trail of old thumb arcs behind.
   int clearMargin = thumbR + 2;
-  tft.fillRect(trackX - clearMargin, cy - clearMargin, trackW + 2 * clearMargin, 2 * clearMargin, TFT_WHITE);
+  tft.fillRect(trackX - clearMargin, cy - clearMargin, trackW + 2 * clearMargin, 2 * clearMargin, T.card);
 
   int trackY = cy - SLIDER_TRACK_H / 2;
-  tft.fillRoundRect(trackX, trackY, trackW, SLIDER_TRACK_H, SLIDER_TRACK_H / 2, 0xC618); // track background
+  tft.fillSmoothRoundRect(trackX, trackY, trackW, SLIDER_TRACK_H, SLIDER_TRACK_H / 2, T.line, T.card);
   int filledW = map(percent, 0, 100, 0, trackW);
-  if (filledW > 0) tft.fillRoundRect(trackX, trackY, filledW, SLIDER_TRACK_H, SLIDER_TRACK_H / 2, fillColor);
+  if (filledW > SLIDER_TRACK_H) tft.fillSmoothRoundRect(trackX, trackY, filledW, SLIDER_TRACK_H, SLIDER_TRACK_H / 2, fillColor, T.line);
   int thumbX = trackX + filledW;
-  tft.fillCircle(thumbX, cy, thumbR, TFT_WHITE);
-  tft.drawCircle(thumbX, cy, thumbR, fillColor);
-  tft.drawCircle(thumbX, cy, thumbR - 1, fillColor);
+  tft.fillSmoothCircle(thumbX, cy, thumbR, fillColor, T.card);
+  tft.fillSmoothCircle(thumbX, cy, thumbR - 3, T.card, fillColor);
 }
 
-// forceDraw=true is used on page entry (page was just wiped); otherwise
-// this only actually redraws when the visual PERCENT changes, not on every
-// tiny raw brightness change - the brightness range is finer than the
-// slider's 220px width can show anyway, so redrawing for a change that
-// wouldn't move the thumb by even a pixel was just adding needless flicker.
+// forceDraw=true is used on page entry; otherwise this only redraws when the
+// visible PERCENT changes, which avoids needless flicker while dragging.
 void drawScreenBrightnessSlider(bool forceDraw = false) {
   static int lastPct = -1;
   int pct = map(globalBrightness, 10, 255, 0, 100);
   if (!forceDraw && pct == lastPct) return;
   lastPct = pct;
-  tft.fillRect(20, SCREEN_LABEL_Y - 12, 280, 20, TFT_WHITE); // clear label row (percent text width varies)
-  tft.setTextDatum(CC_DATUM); tft.setTextColor(0x4228, TFT_WHITE);
+  tft.fillRect(20, SCREEN_LABEL_Y - 12, 280, 20, T.card); // clear label row (percent text width varies)
+  tft.setTextDatum(MC_DATUM); tft.setTextColor(T.muted, T.card);
   tft.drawString("SCREEN BRIGHTNESS " + String(pct) + "%", 160, SCREEN_LABEL_Y, 2);
-  drawSlider(SCREEN_SLIDER_Y, pct, 0x4228);
+  drawSlider(SCREEN_SLIDER_Y, pct, T.accent);
 }
 
 void drawLedBrightnessSlider(bool forceDraw = false) {
@@ -3166,29 +3316,32 @@ void drawLedBrightnessSlider(bool forceDraw = false) {
   int pct = map(ledBrightness, 0, 255, 0, 100);
   if (!forceDraw && pct == lastPct) return;
   lastPct = pct;
-  tft.fillRect(20, LED_LABEL_Y - 12, 280, 20, TFT_WHITE);
-  tft.setTextDatum(CC_DATUM); tft.setTextColor(0x4228, TFT_WHITE);
+  tft.fillRect(20, LED_LABEL_Y - 12, 280, 20, T.card);
+  tft.setTextDatum(MC_DATUM); tft.setTextColor(T.muted, T.card);
   tft.drawString("LED BRIGHTNESS " + String(pct) + "%", 160, LED_LABEL_Y, 2);
-  drawSlider(LED_SLIDER_Y, pct, 0x4228);
+  drawSlider(LED_SLIDER_Y, pct, T.accent);
 }
 
+void drawButton(int x, int y, int w, int h, const String &label, bool active) {
+  drawCard(x, y, w, h, 8, active ? T.accent : T.card2, active ? T.accent : T.border, T.card);
+  tft.setTextDatum(MC_DATUM); tft.setTextColor(active ? TFT_WHITE : T.text);
+  tft.drawString(label, x + w / 2, y + h / 2 + 1, 2);
+}
+
+// Two buttons side by side: LED color mode (left) and screen theme (right).
 void drawModeToggleButton() {
-  tft.fillRoundRect(50, MODE_BTN_Y, 220, MODE_BTN_H, 8, useCustomColor ? 0x051D : 0x4228);
-  tft.setTextColor(TFT_WHITE); tft.setTextDatum(CC_DATUM);
-  tft.drawString(useCustomColor ? "MODE: CUSTOM COLOR" : "MODE: WEATHER SYNC", 160, MODE_BTN_Y + MODE_BTN_H/2, 2);
+  drawButton(20, MODE_BTN_Y, 136, MODE_BTN_H, useCustomColor ? "LED: CUSTOM" : "LED: WEATHER", useCustomColor);
+  drawButton(164, MODE_BTN_Y, 136, MODE_BTN_H, String("THEME: ") + themeModeName(), false);
 }
 
-// NEW: single hue-picker bar replaces the old 3-slider R/G/B approach - one
-// continuous rainbow strip you drag along, using the full available width.
-// No separate label or preview swatch - the gradient itself makes clear
-// what it does, and the IP-text color preview (drawSystemDynamicInfo)
-// already shows the live result.
+// Hue picker: one continuous rainbow strip you drag along. The IP address
+// above (drawSystemDynamicInfo) shows the live result.
 void drawHuePicker(bool forceDraw = false) {
   static int lastHue = -1;
 
   if (!useCustomColor) {
-    if (lastHue != -1) {
-      tft.fillRect(20, HUE_BAR_Y - 16, 280, HUE_BAR_H + 32, TFT_WHITE);
+    if (lastHue != -1 || forceDraw) {
+      tft.fillRect(20, HUE_BAR_Y - 16, 280, HUE_BAR_H + 32, T.card);
       lastHue = -1;
     }
     return;
@@ -3198,31 +3351,31 @@ void drawHuePicker(bool forceDraw = false) {
   lastHue = customHue;
 
   // Clear just the bar's own footprint (plus thumb overhang) before redrawing
-  tft.fillRect(HUE_BAR_X - 6, HUE_BAR_Y - 6, HUE_BAR_W + 12, HUE_BAR_H + 12, TFT_WHITE);
+  tft.fillRect(HUE_BAR_X - 6, HUE_BAR_Y - 6, HUE_BAR_W + 12, HUE_BAR_H + 12, T.card);
 
-  // Redraw the gradient (250 vertical lines - cheap on SPI) plus border
+  // Gradient (250 vertical lines - cheap on SPI) plus border
   for (int i = 0; i < HUE_BAR_W; i++) {
     int r, g, b;
     HSBtoRGB((i * 360) / HUE_BAR_W, 255, 255, r, g, b);
     tft.drawFastVLine(HUE_BAR_X + i, HUE_BAR_Y, HUE_BAR_H, tft.color565(r, g, b));
   }
-  tft.drawRect(HUE_BAR_X - 1, HUE_BAR_Y - 1, HUE_BAR_W + 2, HUE_BAR_H + 2, TFT_BLACK);
+  tft.drawRect(HUE_BAR_X - 1, HUE_BAR_Y - 1, HUE_BAR_W + 2, HUE_BAR_H + 2, T.border);
 
   // Thumb marker at the current hue's position
   int thumbX = HUE_BAR_X + (customHue * HUE_BAR_W) / 360;
-  tft.drawRect(thumbX - 4, HUE_BAR_Y - 4, 8, HUE_BAR_H + 8, TFT_WHITE);
-  tft.drawRect(thumbX - 5, HUE_BAR_Y - 5, 10, HUE_BAR_H + 10, TFT_BLACK);
+  tft.drawRect(thumbX - 4, HUE_BAR_Y - 4, 8, HUE_BAR_H + 8, T.card);
+  tft.drawRect(thumbX - 5, HUE_BAR_Y - 5, 10, HUE_BAR_H + 10, T.text);
 
-  drawSystemDynamicInfo(); // NEW: refreshes the IP-text color preview live while dragging (change-detection catches the LED color diff)
+  drawSystemDynamicInfo(); // refreshes the IP-text color preview live while dragging
 }
 
 void drawSaveButton(bool confirmed) {
-  tft.fillRoundRect(50, SAVE_BTN_Y, 220, SAVE_BTN_H, 8, confirmed ? TFT_BLUE : 0x4228);
-  tft.setTextColor(TFT_WHITE); tft.setTextDatum(CC_DATUM);
-  tft.drawString(confirmed ? "SAVED!" : "SAVE CUSTOM AS DEFAULT", 160, SAVE_BTN_Y + SAVE_BTN_H/2, 2);
+  drawCard(50, SAVE_BTN_Y, 220, SAVE_BTN_H, 8, confirmed ? T.good : T.accent, confirmed ? T.good : T.accent, T.card);
+  tft.setTextColor(TFT_WHITE); tft.setTextDatum(MC_DATUM);
+  tft.drawString(confirmed ? "SAVED!" : "SAVE CUSTOM AS DEFAULT", 160, SAVE_BTN_Y + SAVE_BTN_H / 2 + 1, 2);
 }
 
-void drawSystemUI() { 
+void drawSystemUI() {
   drawSystemDynamicInfo(true); // force: the page was just wiped, draw regardless of cached state
 
   drawScreenBrightnessSlider(true);
@@ -3318,12 +3471,14 @@ void setup() {
   applyTextColor();
   showAnimation = prefs.getBool("animOn", true); // NEW
   showRainPreview = prefs.getBool("rainPrevOn", true); // NEW
+  themeMode = constrain(prefs.getInt("theme", THEME_AUTO), 0, 2);
+  applyTheme(); // AUTO can't know about sunset yet - re-checked after the first weather fetch
   updateBacklight(); 
 
   // NEW: try reconnecting with saved WiFi credentials first, with a few retries,
   // before dropping into the AP config portal. Avoids a brief router hiccup
   // forcing you to redo WiFi setup on a wall-mounted device.
-  tft.fillScreen(bgColor); tft.setTextColor(TFT_BLACK); tft.setTextDatum(CC_DATUM);
+  tft.fillScreen(bgColor); tft.setTextColor(T.text); tft.setTextDatum(CC_DATUM);
   tft.drawString("CONNECTING WIFI...", 160, 240, 2);
   WiFi.mode(WIFI_STA);
   WiFi.begin(); // ESP32 will use the last-saved credentials stored in NVS
@@ -3403,7 +3558,7 @@ void setup() {
 #endif
   server.begin();
 
-  tft.fillScreen(bgColor); tft.setTextColor(TFT_BLACK); tft.setTextDatum(CC_DATUM);
+  tft.fillScreen(bgColor); tft.setTextColor(T.text); tft.setTextDatum(CC_DATUM);
   tft.drawString("SYNCING TIME...", 160, 240, 2);
 
   Udp.begin(localPort); 
@@ -3411,6 +3566,7 @@ void setup() {
 
   tft.fillScreen(bgColor); tft.drawString("FETCHING WEATHER...", 160, 240, 2);
   getOpenWeatherData();
+  applyTheme();
 
   drawPageBackground(displayMode);
   drawnMode = -1;
@@ -3453,6 +3609,13 @@ void loop() {
 #if USE_SD_HISTORY
   historyLoop(); // NEW: background per-city history sync (one city at a time, every 6h)
 #endif
+
+  // AUTO theme: switch between light and dark at sunrise/sunset
+  static unsigned long lastThemeCheck = 0;
+  if (millis() - lastThemeCheck > 30000) {
+    lastThemeCheck = millis();
+    if (applyTheme()) { drawPageBackground(displayMode); drawnMode = -1; }
+  }
 
   // UPDATE 4: Force display redraw on 10-minute auto update (now via the
   // non-blocking-feeling wrapper, so the screen doesn't flash blank)
@@ -3576,7 +3739,14 @@ void loop() {
     // button doesn't also fire a second, unintended action.
     if (!touchHandled && displayMode == 4 && dur < 600) {
       int tx = startX, ty = startY;
-      if (ty > MODE_BTN_Y && ty < MODE_BTN_Y + MODE_BTN_H) {
+      if (ty > MODE_BTN_Y && ty < MODE_BTN_Y + MODE_BTN_H && tx >= 160) {
+        // Theme button: AUTO -> LIGHT -> DARK -> AUTO
+        themeMode = (themeMode == THEME_AUTO) ? THEME_LIGHT : (themeMode == THEME_LIGHT ? THEME_DARK : THEME_AUTO);
+        prefs.putInt("theme", themeMode);
+        applyTheme();
+        drawPageBackground(displayMode); drawnMode = -1; // full redraw in the new colors
+        touchHandled = true;
+      } else if (ty > MODE_BTN_Y && ty < MODE_BTN_Y + MODE_BTN_H) {
         useCustomColor = !useCustomColor; setWeatherLED(mainWeather); prefs.putBool("useC", useCustomColor);
         drawModeToggleButton();
         drawHuePicker(true); // force: show/hide as mode changes
