@@ -1434,7 +1434,7 @@ void handleDashboardPage() {
   html += ".cityRow button{border:none;background:none;font-size:1.4em;color:#4a5a7a;cursor:pointer;padding:0 8px;}";
   html += ".clock{margin:14px 0 6px;min-height:70px;} .clock svg{display:block;margin:0 auto;max-width:100%;}";
   html += ".temp{font-size:2.2em;}";
-  html += ".grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;text-align:left;margin-top:15px;font-size:0.95em;}";
+  html += ".grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;text-align:center;margin-top:15px;font-size:0.95em;}";
   html += ".swatchRow{display:flex;justify-content:center;gap:20px;margin-top:12px;}";
   html += ".swatch{width:36px;height:36px;border-radius:8px;border:2px solid #333;display:inline-block;vertical-align:middle;}";
   html += ".dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:5px;}";
