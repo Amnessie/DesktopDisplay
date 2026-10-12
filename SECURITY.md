@@ -5,9 +5,10 @@ DesktopDisplay is meant to run on a trusted home network. Please keep the follow
 ## Things to know
 
 - **The web interface has no password.** Anyone on the same WiFi network can open the device's IP address, change settings and start or wipe the history.
+- **Protection against other websites.** Every endpoint that changes something requires the request header `X-Requested-With: DesktopDisplay`. The device's own pages send it automatically. A web page you happen to visit can't add that header to a request aimed at the device, so it can't change settings or wipe history through your browser (cross-site request forgery). Scripts of your own just need to send the header.
 - **API keys are shown in plain text** on the settings page, so anyone on your network can read them.
 - **Don't expose the device to the internet.** Don't port-forward it on your router or put it on a public or guest network you don't control.
-- The OpenWeatherMap requests use plain HTTP, so the API key travels unencrypted inside your network and to OpenWeatherMap. Open-Meteo requests use HTTPS.
+- The OpenWeatherMap requests use plain HTTP, so the API key travels unencrypted inside your network and to OpenWeatherMap. Open-Meteo requests use HTTPS, but the device doesn't verify the server's certificate, so this protects against casual snooping, not a determined attacker on your network.
 
 ## Keeping your API key safe
 

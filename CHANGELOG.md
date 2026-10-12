@@ -2,6 +2,28 @@
 
 All notable changes to this project are listed here.
 
+## [Unreleased]
+
+### Fixed
+- A failed weather refresh no longer blanks the screen (0.0 °C) until the next attempt; the last good data stays up, with the status dot turning red
+- Open-Meteo (KNMI) no longer shows made-up "0/0 C CLEAR" forecast days: it now uses KNMI's seamless model (2 km Netherlands model, topped up with ECMWF), and any day a model doesn't cover shows "NO DATA"
+- The Debug page no longer breaks ("connection lost") after a history sync error; text in the JSON endpoints is now escaped properly
+- The Open-Meteo rain graph now shows real 3-hour totals instead of one hour out of every three
+- Open-Meteo air pressure is now the sea-level value, matching OpenWeatherMap and the history
+- City names with an apostrophe (e.g. Val-d'Or) no longer break the settings form
+- The saved custom LED color now also keeps its saturation and lightness
+- The OpenWeatherMap forecast could run out of memory part-way through with ArduinoJson 6, losing the last forecast days; only the needed fields are parsed now
+- Half-hour time zones (e.g. India) now show the correct time
+- Screen and LED brightness are now remembered across restarts
+- City names with `&`, `#` or accented letters are now looked up correctly
+
+### Security
+- Endpoints that change settings or history now require the `X-Requested-With: DesktopDisplay` header, so other websites can't change them through your browser
+
+### Changed
+- Raw API responses are no longer printed to the serial port
+- Settings, dashboard and debug pages now scale properly on phones
+
 ## [1.0.0] – 2026-10-12
 
 First public release.

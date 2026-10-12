@@ -20,10 +20,10 @@ A touch-screen weather station for the 3.5-inch **E32R35T / E32N35T** ESP32 disp
 **Weather sources** (selectable per city)
 - OpenWeatherMap
 - Open-Meteo
-- Open-Meteo with the KNMI model
+- Open-Meteo with the KNMI model (KNMI's 2 km Netherlands model, topped up with ECMWF beyond its ~2.5-day range)
 
 **Web interface** (open the device's IP address in a browser)
-- Settings: cities, weather source per city, API keys (with an optional backup key), screen and LED brightness, colors
+- Settings: cities, weather source per city, API keys (with an optional backup key), screen and LED brightness (remembered across restarts), colors
 - Live dashboard that mirrors what's on the display
 - History page with charts per city: temperature, rain, sunshine, wind, humidity, pressure, monthly averages and a summary table
 - CSV export and import of the history, plus backfilling up to 10 years from Open-Meteo's archive
@@ -126,7 +126,11 @@ LED weather colors: orange = clear, white = clouds, blue = rain, purple = thunde
 | `/history` | History charts, export, import, backfill |
 | `/debug` | Debug console |
 
-There are also JSON endpoints (`/api/status`, `/api/history`, `/api/local` and others) used by these pages, which you can use for your own scripts.
+There are also JSON endpoints (`/api/status`, `/api/history`, `/api/local` and others) used by these pages, which you can use for your own scripts. Reading them needs nothing special. Endpoints that change something (`/save`, `/live`, `/saveColor`, `/saveTextColor` and the history wipe/backfill/import endpoints) only accept requests carrying the header `X-Requested-With: DesktopDisplay` (see [SECURITY.md](SECURITY.md)), for example:
+
+```
+curl -H "X-Requested-With: DesktopDisplay" "http://<device-ip>/live?action=city&value=1"
+```
 
 ## Configuration switches
 
@@ -157,7 +161,6 @@ Check the API key on the settings page and that the city is written as `City,Cou
 
 ## Known limitations
 
-- Time zones are handled in whole hours, so places with a half-hour offset (for example India) show the time 30 minutes off.
 - The web interface has no password. See [SECURITY.md](SECURITY.md).
 
 ## Credits
