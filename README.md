@@ -25,8 +25,10 @@ A touch-screen weather station for the 3.5-inch **E32R35T / E32N35T** ESP32 disp
 - Open-Meteo with the KNMI model (KNMI's 2 km Netherlands model, topped up with ECMWF beyond its ~2.5-day range)
 
 **Web interface** (open the device's IP address in a browser; it starts on the live dashboard)
+- Works on desktop and phone, in light or dark (the theme button in the top bar switches between Auto, Light and Dark; Auto follows your phone/PC setting)
+- Uses your chosen text color as the accent color, just like the display
 - Settings: cities, weather source per city, API keys (with an optional backup key), screen and LED brightness (remembered across restarts), colors
-- Live dashboard that mirrors what's on the display
+- Live dashboard: current weather with icon, 7-segment clock, wind/humidity/pressure/visibility, rain for the next 15 hours, sun position and moon phase, 5-day forecast with temperature ranges, indoor sensor and device status
 - History page with charts per city: temperature, rain, sunshine, wind, humidity, pressure, monthly averages and a summary table
 - CSV export and import of the history, plus backfilling up to 10 years from Open-Meteo's archive
 - Debug console with live touch and system info
@@ -128,7 +130,7 @@ LED weather colors: orange = clear, white = clouds, blue = rain, purple = thunde
 | `/history` | History charts, export, import, backfill |
 | `/debug` | Debug console |
 
-There are also JSON endpoints (`/api/status`, `/api/history`, `/api/local` and others, plus `/api/history/raw?city=N` for a city's raw history CSV) used by these pages, which you can use for your own scripts. Reading them needs nothing special. Endpoints that change something (`/save`, `/live`, `/saveColor`, `/saveTextColor` and the history wipe/backfill/import endpoints) only accept requests carrying the header `X-Requested-With: DesktopDisplay` (see [SECURITY.md](SECURITY.md)), for example:
+There are also JSON endpoints (`/api/status`, `/api/settings`, `/api/history`, `/api/local` and others, plus `/api/history/raw?city=N` for a city's raw history CSV) used by these pages, which you can use for your own scripts. Reading them needs nothing special. Endpoints that change something (`/save`, `/live`, `/saveColor`, `/saveTextColor` and the history wipe/backfill/import endpoints) only accept requests carrying the header `X-Requested-With: DesktopDisplay` (see [SECURITY.md](SECURITY.md)), for example:
 
 ```
 curl -H "X-Requested-With: DesktopDisplay" "http://<device-ip>/live?action=city&value=1"

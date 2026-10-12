@@ -42,7 +42,11 @@
 SPIClass sdSPI(HSPI); // dedicated bus for the SD card only - genuinely separate hardware peripheral from the display/touch's VSPI
 bool sdOK = false;
 void handleHistoryPage(); // defined at the very end of the sketch (see [HISTORY WEB PAGE])
-extern const char SEG_CLOCK_JS[]; // dashboard 7-segment clock script, also at the end of the sketch
+// Web UI assets (HTML/CSS/JS), defined at the very end of the sketch (see [WEB UI ASSETS])
+extern const char APP_CSS[], APP_JS[], DASHBOARD_BODY[], SETTINGS_BODY[], DEBUG_BODY[];
+void sendPage(const char *title, const char *current, bool cityTabs, const char *body, const char *body2 = nullptr);
+String pageStart(const char *title, const char *current, bool cityTabs);
+String pageEnd(const char *current);
 // NOTE: history is now stored per city (/hist_c0.csv, /hist_c1.csv,
 // /hist_c2.csv) - see the [PER-CITY HISTORY] section further down.
 
@@ -188,7 +192,7 @@ const Theme THEME_LIGHT_COLORS = {
   RGB565(0xE0, 0xE7, 0xF5)
 };
 const Theme THEME_DARK_COLORS = {
-  RGB565(0x0B, 0x12, 0x20), RGB565(0x14, 0x1E, 0x30), RGB565(0x1A, 0x27, 0x40), RGB565(0x22, 0x30, 0x4A),
+  RGB565(0x0B, 0x12, 0x20), RGB565(0x14, 0x1E, 0x30), RGB565(0x18, 0x23, 0x3A), RGB565(0x1F, 0x2B, 0x42),
   RGB565(0xE7, 0xED, 0xF7), RGB565(0x85, 0x96, 0xAD), RGB565(0x2B, 0x3A, 0x55), RGB565(0xFF, 0x9F, 0x43),
   RGB565(0x7F, 0x93, 0xB0), RGB565(0x4C, 0x95, 0xFF), RGB565(0x1E, 0x3A, 0x66), RGB565(0x34, 0xD3, 0x99),
   RGB565(0xF8, 0x71, 0x71), RGB565(0xF8, 0x71, 0x71), RGB565(0x60, 0xA5, 0xFA), RGB565(0xFB, 0xBF, 0x24),
@@ -199,6 +203,8 @@ enum ThemeMode { THEME_LIGHT = 0, THEME_DARK = 1, THEME_AUTO = 2 };
 int themeMode = THEME_AUTO; // saved as "theme"; set on the System page or the web Settings page
 bool themeDark = false;
 Theme T = THEME_LIGHT_COLORS;
+bool accentDirty = false;          // text color changed -> redraw the page (see loop())
+unsigned long accentChangedAt = 0;
 uint16_t bgColor = RGB565(0xE9, 0xEE, 0xF5); // = T.bg (used by the boot/setup screens)
 int globalBrightness = 255, ledBrightness = 255;
 bool useCustomColor = false;
@@ -427,11 +433,33 @@ int customVal = 255;
 int textR = 0, textG = 0, textB = 0;
 int textHue = 0, textSat = 0, textVal = 0;
 
+// Highlights (page dots, sliders, buttons, the web accent) use the chosen
+// text color when it's an actual color that reads well on this theme, so the
+// UI matches the clock minutes. Grey/black/white or unreadable picks fall
+// back to the theme's own orange. Data colors (rain, temperatures, sunrise/
+// sunset, status) never change. Returns true if the accent changed.
+bool refreshAccent() {
+  int lum = (textR * 299 + textG * 587 + textB * 114) / 1000;
+  bool readable = themeDark ? lum >= 90 : lum <= 215;
+  uint16_t base = themeDark ? THEME_DARK_COLORS.accent : THEME_LIGHT_COLORS.accent;
+  uint16_t a = (textSat >= 60 && textVal >= 60 && readable) ? tft.color565(textR, textG, textB) : base;
+  bool changed = a != T.accent;
+  T.accent = a;
+  return changed;
+}
+
+// White or dark label, whichever reads better on the accent color.
+uint16_t onAccentText() {
+  int r = (T.accent >> 11) << 3, g = ((T.accent >> 5) & 0x3F) << 2, b = (T.accent & 0x1F) << 3;
+  return (r * 299 + g * 587 + b * 114) / 1000 > 170 ? RGB565(0x16, 0x20, 0x2F) : TFT_WHITE;
+}
+
 // NEW: recomputes textR/G/B from the text color's own hue/saturation/value.
 // Deliberately separate from applyCustomColor()/the LED for the reason
 // above - this only affects the clock's minute digits and the IP text.
 void applyTextColor() {
   HSBtoRGB(textHue, textSat, textVal, textR, textG, textB);
+  if (refreshAccent()) { accentDirty = true; accentChangedAt = millis(); } // loop() redraws the page shortly
 }
 
 void setWeatherLED(String weather) {
@@ -513,6 +541,10 @@ void configModeCallback(WiFiManager *myWiFiManager) {
   tft.drawString("Then open:", 160, 220, 2);
   tft.drawString("192.168.4.1", 160, 250, 4);
 }
+
+const char *const DAY_NAMES[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+const char *const MONTH_NAMES[] = {"January", "February", "March", "April", "May", "June", "July",
+                                   "August", "September", "October", "November", "December"};
 
 String getDayName(int dow) {
   switch(dow) {
@@ -1010,7 +1042,7 @@ void drawUpdatingBadge(bool show) {
     // Other pages: top-right corner.
     int bx = displayMode == 0 ? 140 : UPDATE_BADGE_X, by = displayMode == 0 ? 37 : UPDATE_BADGE_Y;
     tft.fillRoundRect(bx, by, UPDATE_BADGE_W, UPDATE_BADGE_H, 6, T.accent);
-    tft.setTextColor(TFT_WHITE, T.accent); tft.setTextDatum(CC_DATUM);
+    tft.setTextColor(onAccentText(), T.accent); tft.setTextDatum(CC_DATUM);
     tft.drawString("...", bx + UPDATE_BADGE_W / 2, by + UPDATE_BADGE_H / 2, 1);
   }
   // no separate "hide" drawing needed - the subsequent drawPageBackground() call
@@ -1057,155 +1089,28 @@ String buildProviderSelect(String fieldName, int currentProvider) {
   return html;
 }
 
-// --- [SMARTER WEB PORTAL FUNCTIONS] ---
-// Settings page (served at /settings - the dashboard is the start page at /)
+// Settings page (/settings). The page itself is static (SETTINGS_BODY); it
+// fills its fields from /api/settings, and saves through /save and /live.
 void handleSettingsPage() {
-  // NEW: current values, converted to the 0-100% scale the sliders use
-  int screenPct = map(globalBrightness, 10, 255, 0, 100);
-  int ledPct    = map(ledBrightness, 0, 255, 0, 100);
-  int satPct    = map(customSat, 0, 255, 0, 100);
-  int valPct    = map(customVal, 0, 255, 0, 100);
-  int textHuePct  = textHue; // hue stays 0-360, no conversion needed
-  int textSatPct  = map(textSat, 0, 255, 0, 100);
-  int textValPct  = map(textVal, 0, 255, 0, 100);
+  sendPage("Settings", "settings", false, SETTINGS_BODY);
+}
 
-  String html = "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><style>";
-  html += "body{font-family:sans-serif;text-align:center;max-width:480px;margin:0 auto;padding:10px;}";
-  html += "h1{font-size:1.4em;} h2{font-size:1.1em;margin-top:30px;border-top:1px solid #ccc;padding-top:15px;}";
-  html += "input[type=range]{width:90%;height:22px;-webkit-appearance:none;border-radius:11px;margin:8px 0;}";
-  html += "input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;border-radius:50%;background:#fff;border:2px solid #333;cursor:pointer;}";
-  html += "input[type=range]::-moz-range-thumb{width:22px;height:22px;border-radius:50%;background:#fff;border:2px solid #333;cursor:pointer;}";
-  html += "#colorSection{display:" + String(useCustomColor ? "block" : "none") + ";}";
-  html += "#swatch,#textSwatch{width:80px;height:80px;border-radius:10px;border:2px solid #333;margin:10px auto;}";
-  html += ".row{margin:14px 0;}";
-  html += "</style></head><body>";
-
-  html += "<h1>Weather Station Portal</h1>";
-  html += navBar("settings");
-
-  // Submitted from JavaScript (saveSettings below) so the request can carry the
-  // X-Requested-With header that /save requires - see requireAppHeader().
-  html += "<form id='settingsForm' onsubmit='return saveSettings(this)'>";
-  html += "City 1: <input type='text' name='c1' value='" + htmlEsc(locs[0]) + "'> " + buildProviderSelect("provider1", cityProvider[0]) + "<br><br>";
-  html += "City 2: <input type='text' name='c2' value='" + htmlEsc(locs[1]) + "'> " + buildProviderSelect("provider2", cityProvider[1]) + "<br><br>";
-  html += "City 3: <input type='text' name='c3' value='" + htmlEsc(locs[2]) + "'> " + buildProviderSelect("provider3", cityProvider[2]) + "<br><br>";
-  html += "<p style='font-size:0.9em;color:#555;'>OpenWeatherMap uses the API key below. The Open-Meteo weather itself needs no key (the key is still used to look up the city's coordinates). The KNMI option uses KNMI's 2km Netherlands model, topped up with ECMWF beyond its ~2.5-day range.</p>";
-  html += "<p style='font-size:0.85em;color:#777;'>Renaming a city starts a fresh history for it (the old log is kept on the SD card).</p>";
-  html += "API Key: <input type='text' name='api' style='width:300px;' value='" + htmlEsc(apiKey) + "'><br><br>";
-  html += "Backup API Key (optional): <input type='text' name='apiBackup' style='width:300px;' value='" + htmlEsc(apiKeyBackup) + "'><br><br>";
-  html += "Show Home Animation: <input type='checkbox' name='animOn' value='1'" + String(showAnimation ? " checked" : "") + "><br><br>";
-  html += "Show Upcoming Rain Preview: <input type='checkbox' name='rainPrevOn' value='1'" + String(showRainPreview ? " checked" : "") + "><br>";
-  html += "<span style='font-size:0.85em;color:#777;'>(shares the same spot as the animation above - only one shows at a time)</span><br><br>";
-  html += "Screen theme: <select name='theme'>";
-  html += "<option value='2'" + String(themeMode == THEME_AUTO ? " selected" : "") + ">Auto (dark after sunset)</option>";
-  html += "<option value='0'" + String(themeMode == THEME_LIGHT ? " selected" : "") + ">Light</option>";
-  html += "<option value='1'" + String(themeMode == THEME_DARK ? " selected" : "") + ">Dark</option>";
-  html += "</select><br><br>";
-  html += "<input type='submit' value='Update Settings'> <span id='saveMsg'></span>";
-  html += "</form>";
-
-  // NEW: Display controls - mirrors the touchscreen's System Info page, but
-  // live: every slider here applies immediately over WiFi as you drag it,
-  // the same way dragging it on the physical screen would.
-  html += "<h2>Display Brightness (live)</h2>";
-
-  html += "<div class='row'>Screen Brightness: <span id='screenVal'>" + String(screenPct) + "</span>%<br>";
-  html += "<input type='range' id='screenSlider' min='0' max='100' value='" + String(screenPct) + "' style='background:linear-gradient(to right,#333,#fff);'></div>";
-
-  html += "<div class='row'>LED Brightness: <span id='ledVal'>" + String(ledPct) + "</span>%<br>";
-  html += "<input type='range' id='ledSlider' min='0' max='100' value='" + String(ledPct) + "' style='background:linear-gradient(to right,#333,#fff);'></div>";
-
-  // NEW: LED color - nothing here is written to flash except the mode
-  // toggle (matching the touchscreen's own behavior) - use "Save Color as
-  // Default" to make a custom color survive a reboot.
-  html += "<h2>LED Color (live)</h2>";
-  html += "<div class='row'>";
-  html += "<label><input type='radio' name='mode' value='0'" + String(!useCustomColor ? " checked" : "") + " onclick='setMode(0)'> Weather Sync</label> &nbsp; ";
-  html += "<label><input type='radio' name='mode' value='1'" + String(useCustomColor ? " checked" : "") + " onclick='setMode(1)'> Custom Color</label>";
-  html += "</div>";
-
-  html += "<div id='colorSection'>";
-  html += "<div id='swatch'></div>";
-  html += "<div class='row'>Hue: <span id='hueVal'>" + String(customHue) + "</span><br>";
-  html += "<input type='range' id='hueSlider' min='0' max='360' value='" + String(customHue) + "'></div>";
-  html += "<div class='row'>Saturation: <span id='satVal'>" + String(satPct) + "</span>%<br>";
-  html += "<input type='range' id='satSlider' min='0' max='100' value='" + String(satPct) + "'></div>";
-  html += "<div class='row'>Lightness: <span id='valVal'>" + String(valPct) + "</span>%<br>";
-  html += "<input type='range' id='valSlider' min='0' max='100' value='" + String(valPct) + "'></div>";
-  html += "<button onclick='saveColor()' type='button'>Save Color as Default</button>";
-  html += "</div>";
-
-  // NEW: independent text color (clock minutes + IP address) - deliberately
-  // has no "mode" toggle and never syncs with the LED above; it's always
-  // just whatever these three sliders say.
-  html += "<h2>Text Color - Time &amp; IP (live)</h2>";
-  html += "<div id='textSwatch'></div>";
-  html += "<div class='row'>Hue: <span id='textHueVal'>" + String(textHuePct) + "</span><br>";
-  html += "<input type='range' id='textHueSlider' min='0' max='360' value='" + String(textHuePct) + "'></div>";
-  html += "<div class='row'>Saturation: <span id='textSatVal'>" + String(textSatPct) + "</span>%<br>";
-  html += "<input type='range' id='textSatSlider' min='0' max='100' value='" + String(textSatPct) + "'></div>";
-  html += "<div class='row'>Lightness: <span id='textValVal'>" + String(textValPct) + "</span>%<br>";
-  html += "<input type='range' id='textValSlider' min='0' max='100' value='" + String(textValPct) + "'></div>";
-  html += "<button onclick='saveTextColor()' type='button'>Save Text Color as Default</button>";
-
-  // NEW: throttled live updates - 'oninput' fires continuously while
-  // dragging (throttled to ~1 request/60ms so the ESP32's single-threaded
-  // web server isn't flooded), 'onchange' fires once on release and always
-  // sends, guaranteeing the final value is never dropped by the throttle.
-  // Saturation/Lightness/swatch gradients are recomputed in JS as CSS's
-  // native color model (HSL) - a close visual approximation of the HSV math
-  // the ESP32 actually uses, so the on-screen preview may differ very
-  // slightly from the physical LED, which is always exact.
-  html += "<script>";
-  html += "var screenSlider=document.getElementById('screenSlider'),ledSlider=document.getElementById('ledSlider');";
-  html += "var hueSlider=document.getElementById('hueSlider'),satSlider=document.getElementById('satSlider'),valSlider=document.getElementById('valSlider');";
-  html += "var textHueSlider=document.getElementById('textHueSlider'),textSatSlider=document.getElementById('textSatSlider'),textValSlider=document.getElementById('textValSlider');";
-  html += "var lastSent=0,H={'X-Requested-With':'DesktopDisplay'};";
-  html += "function api(u,o){o=o||{};o.headers=Object.assign({},o.headers||{},H);return fetch(u,o);}";
-  html += "function saveSettings(f){var m=document.getElementById('saveMsg');m.innerText='Saving...';";
-  html += "api('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(new FormData(f))})";
-  html += ".then(r=>r.text().then(t=>{m.innerText=r.ok?'Saved - refreshing weather...':t;})).catch(e=>{m.innerText='Save failed: '+e;});return false;}";
-  html += "function liveSend(action,value,force){var now=Date.now();if(!force&&now-lastSent<60)return;lastSent=now;api('/live?action='+action+'&value='+value);}";
-  html += "function setMode(m){api('/live?action=mode&value='+m);document.getElementById('colorSection').style.display=(m==1?'block':'none');}";
-  html += "function saveColor(){api('/saveColor');}";
-  html += "function saveTextColor(){api('/saveTextColor');}";
-  html += "function updateGradients(){";
-  html += "var h=hueSlider.value,s=satSlider.value,v=valSlider.value;";
-  html += "satSlider.style.background='linear-gradient(to right, hsl('+h+',0%,'+Math.round(v/2)+'%), hsl('+h+',100%,50%))';";
-  html += "valSlider.style.background='linear-gradient(to right, black, hsl('+h+','+s+'%,50%))';";
-  html += "var lApprox=Math.round(v*(200-s)/200);";
-  html += "document.getElementById('swatch').style.background='hsl('+h+','+s+'%,'+lApprox+'%)';";
-  html += "}";
-  html += "function updateTextGradients(){";
-  html += "var h=textHueSlider.value,s=textSatSlider.value,v=textValSlider.value;";
-  html += "textSatSlider.style.background='linear-gradient(to right, hsl('+h+',0%,'+Math.round(v/2)+'%), hsl('+h+',100%,50%))';";
-  html += "textValSlider.style.background='linear-gradient(to right, black, hsl('+h+','+s+'%,50%))';";
-  html += "var lApprox=Math.round(v*(200-s)/200);";
-  html += "document.getElementById('textSwatch').style.background='hsl('+h+','+s+'%,'+lApprox+'%)';";
-  html += "}";
-  html += "hueSlider.style.background='linear-gradient(to right, hsl(0,100%,50%), hsl(60,100%,50%), hsl(120,100%,50%), hsl(180,100%,50%), hsl(240,100%,50%), hsl(300,100%,50%), hsl(360,100%,50%))';";
-  html += "textHueSlider.style.background=hueSlider.style.background;";
-  html += "hueSlider.oninput=function(){document.getElementById('hueVal').innerText=this.value;updateGradients();liveSend('hue',this.value,false);};";
-  html += "hueSlider.onchange=function(){liveSend('hue',this.value,true);};";
-  html += "satSlider.oninput=function(){document.getElementById('satVal').innerText=this.value;updateGradients();liveSend('sat',this.value,false);};";
-  html += "satSlider.onchange=function(){liveSend('sat',this.value,true);};";
-  html += "valSlider.oninput=function(){document.getElementById('valVal').innerText=this.value;updateGradients();liveSend('val',this.value,false);};";
-  html += "valSlider.onchange=function(){liveSend('val',this.value,true);};";
-  html += "textHueSlider.oninput=function(){document.getElementById('textHueVal').innerText=this.value;updateTextGradients();liveSend('textHue',this.value,false);};";
-  html += "textHueSlider.onchange=function(){liveSend('textHue',this.value,true);};";
-  html += "textSatSlider.oninput=function(){document.getElementById('textSatVal').innerText=this.value;updateTextGradients();liveSend('textSat',this.value,false);};";
-  html += "textSatSlider.onchange=function(){liveSend('textSat',this.value,true);};";
-  html += "textValSlider.oninput=function(){document.getElementById('textValVal').innerText=this.value;updateTextGradients();liveSend('textVal',this.value,false);};";
-  html += "textValSlider.onchange=function(){liveSend('textVal',this.value,true);};";
-  html += "screenSlider.oninput=function(){document.getElementById('screenVal').innerText=this.value;liveSend('screenBright',this.value,false);};";
-  html += "screenSlider.onchange=function(){liveSend('screenBright',this.value,true);};";
-  html += "ledSlider.oninput=function(){document.getElementById('ledVal').innerText=this.value;liveSend('ledBright',this.value,false);};";
-  html += "ledSlider.onchange=function(){liveSend('ledBright',this.value,true);};";
-  html += "updateGradients();updateTextGradients();";
-  html += "</script>";
-
-  html += "</body></html>";
-  server.send(200, "text/html; charset=utf-8", html);
+// GET /api/settings - current settings for the Settings page
+void handleApiSettings() {
+  String j = "{\"cities\":[";
+  for (int i = 0; i < NUM_CITIES; i++) j += String(i ? "," : "") + "\"" + jsonEsc(locs[i]) + "\"";
+  j += "],\"providers\":[";
+  for (int i = 0; i < NUM_CITIES; i++) j += String(i ? "," : "") + String(cityProvider[i]);
+  j += "],\"api\":\"" + jsonEsc(apiKey) + "\",\"apiBackup\":\"" + jsonEsc(apiKeyBackup) + "\"";
+  j += ",\"theme\":" + String(themeMode);
+  j += ",\"animOn\":" + String(showAnimation ? "true" : "false") + ",\"rainPrevOn\":" + String(showRainPreview ? "true" : "false");
+  j += ",\"screenPct\":" + String(map(globalBrightness, 10, 255, 0, 100)) + ",\"ledPct\":" + String(map(ledBrightness, 0, 255, 0, 100));
+  j += ",\"useCustom\":" + String(useCustomColor ? "true" : "false");
+  j += ",\"hue\":" + String(customHue) + ",\"satPct\":" + String(map(customSat, 0, 255, 0, 100)) + ",\"valPct\":" + String(map(customVal, 0, 255, 0, 100));
+  j += ",\"textHue\":" + String(textHue) + ",\"textSatPct\":" + String(map(textSat, 0, 255, 0, 100)) + ",\"textValPct\":" + String(map(textVal, 0, 255, 0, 100));
+  j += "}";
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", j);
 }
 
 void handleSave() {
@@ -1321,15 +1226,76 @@ void handleSaveColor() {
   server.send(200, "text/plain", "OK");
 }
 
-// NEW: small nav bar shared by all the web pages, so they feel like one site
-String navBar(String current) {
-  String html = "<div style='text-align:center;margin-bottom:15px;font-size:0.95em;'>";
-  html += "<a href='/' style='margin:0 10px;" + String(current == "dashboard" ? "font-weight:bold;text-decoration:underline;" : "") + "'>Live Dashboard</a>";
-  html += "<a href='/settings' style='margin:0 10px;" + String(current == "settings" ? "font-weight:bold;text-decoration:underline;" : "") + "'>Settings</a>";
-  html += "<a href='/history' style='margin:0 10px;" + String(current == "history" ? "font-weight:bold;text-decoration:underline;" : "") + "'>History</a>";
-  html += "<a href='/debug' style='margin:0 10px;" + String(current == "debug" ? "font-weight:bold;text-decoration:underline;" : "") + "'>Debug</a>";
-  html += "</div>";
-  return html;
+// --- shared page frame for every web page: top bar (desktop), tab bar (phone),
+// theme button, and the shared stylesheet/script. The asset URLs carry a
+// build hash, so browsers cache them until a new sketch is uploaded.
+String assetVersion() {
+  static String v;
+  if (!v.length()) {
+    uint32_t h = 2166136261u;
+    for (const char *p = __DATE__ " " __TIME__; *p; p++) h = (h ^ (uint8_t)*p) * 16777619u;
+    v = String(h, HEX);
+  }
+  return v;
+}
+
+String pageStart(const char *title, const char *current, bool cityTabs) {
+  struct { const char *id, *href, *label; } links[] = {
+    {"dashboard", "/", "Dashboard"},
+#if USE_SD_HISTORY
+    {"history", "/history", "History"},
+#endif
+    {"settings", "/settings", "Settings"}, {"debug", "/debug", "Debug"}};
+  String h = "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+             "<meta name='viewport' content='width=device-width,initial-scale=1,viewport-fit=cover'>"
+             "<meta name='theme-color' content='#0b1220'>";
+  h += "<title>" + String(title) + " - Weather Station</title>";
+  h += "<link rel='stylesheet' href='/app.css?v=" + assetVersion() + "'>";
+  h += "<script>window._txt=[" + String(textR) + "," + String(textG) + "," + String(textB) + "];</script>";
+  h += "<script src='/app.js?v=" + assetVersion() + "'></script></head><body>";
+  h += "<header class='top'><a class='brand' href='/'><i id='brandDot'" + String(lastFetchOK ? "" : " class='bad'") + "></i>Weather Station</a>";
+  if (cityTabs) h += "<div class='tabs' id='cityTabs'></div>";
+  h += "<nav>";
+  for (auto &l : links) h += "<a href='" + String(l.href) + "'" + (strcmp(l.id, current) == 0 ? " class='on'" : "") + ">" + l.label + "</a>";
+  h += "</nav><button class='iconbtn' id='themeBtn' onclick='cycleTheme()' aria-label='Theme'></button></header>";
+  return h;
+}
+
+String pageEnd(const char *current) {
+  struct { const char *id, *href, *label, *icon; } tabs[] = {
+    {"dashboard", "/", "Dashboard", "<path d='M3 11l9-7 9 7v9H5v-9'/>"},
+#if USE_SD_HISTORY
+    {"history", "/history", "History", "<path d='M4 19V9M10 19V5M16 19v-7M22 19H2'/>"},
+#endif
+    {"settings", "/settings", "Settings", "<circle cx='12' cy='12' r='3'/><path d='M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M5 19l2-2M17 7l2-2'/>"},
+    {"debug", "/debug", "Debug", "<path d='M4 17l6-6-6-6M12 19h8'/>"}};
+  String h = "<nav class='bottom'>";
+  for (auto &t : tabs)
+    h += "<a href='" + String(t.href) + "'" + (strcmp(t.id, current) == 0 ? " class='on'" : "") +
+         "><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>" + t.icon + "</svg>" + t.label + "</a>";
+  h += "</nav><script>applyThemePref();</script></body></html>";
+  return h;
+}
+
+// Sends a page in chunks: shared header + body (from flash) + shared footer.
+void sendPage(const char *title, const char *current, bool cityTabs, const char *body, const char *body2) {
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html; charset=utf-8", "");
+  server.sendContent(pageStart(title, current, cityTabs));
+  server.sendContent_P(body);
+  if (body2) server.sendContent_P(body2);
+  server.sendContent(pageEnd(current));
+  server.sendContent("");
+}
+
+void handleAppCss() {
+  server.sendHeader("Cache-Control", "public, max-age=31536000");
+  server.send_P(200, "text/css", APP_CSS);
+}
+
+void handleAppJs() {
+  server.sendHeader("Cache-Control", "public, max-age=31536000");
+  server.send_P(200, "application/javascript", APP_JS);
 }
 
 // NEW: JSON snapshot of live touch/system diagnostics for the /debug console.
@@ -1356,55 +1322,10 @@ void handleApiDebug() {
   server.send(200, "application/json", json);
 }
 
-// NEW: live debug console - shows exactly what the touch controller is
-// reporting in real time, plus a scrolling event log, without needing a
-// Serial Monitor connection (which the README notes can itself trigger a
-// hardware reset on this board). Polls every 400ms.
+// Live debug console: what the touch controller reports, plus the event log,
+// without needing a Serial Monitor connection. Polls /api/debug every 400ms.
 void handleDebugPage() {
-  String html = "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><style>";
-  html += "body{font-family:'Courier New',monospace;max-width:600px;margin:0 auto;padding:10px;background:#111;color:#0f0;}";
-  html += "h1{font-size:1.2em;text-align:center;color:#fff;font-family:sans-serif;}";
-  html += ".card{background:#000;border:1px solid #333;border-radius:8px;padding:12px;margin-top:12px;}";
-  html += ".row{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #222;font-size:0.9em;}";
-  html += ".hot{color:#ff0;} .bad{color:#f55;} .ok{color:#5f5;}";
-  html += "#log{height:300px;overflow-y:auto;font-size:0.85em;white-space:pre-wrap;}";
-  html += "</style></head><body>";
-  html += "<h1>Weather Station - Debug Console</h1>";
-  html += "<div style='text-align:center;font-family:sans-serif;'>" + navBar("debug") + "</div>";
-
-  html += "<div class='card'>";
-  html += "<div class='row'><span>Touch pressed (raw)</span><span id='pressed'>--</span></div>";
-  html += "<div class='row'><span>Raw X / Y</span><span id='xy'>--</span></div>";
-  html += "<div class='row'><span>isTouched (internal)</span><span id='isTouched'>--</span></div>";
-  html += "<div class='row'><span>Held for</span><span id='held'>--</span></div>";
-  html += "<div class='row'><span>Stuck-touch auto-resets</span><span id='stuck'>--</span></div>";
-  html += "<div class='row'><span>Display mode (page)</span><span id='mode'>--</span></div>";
-  html += "<div class='row'><span>Uptime</span><span id='uptime'>--</span></div>";
-  html += "<div class='row'><span>Free heap</span><span id='heap'>--</span></div>";
-  html += "<div class='row'><span>WiFi</span><span id='wifi'>--</span></div>";
-  html += "</div>";
-
-  html += "<div class='card'><div id='log'>Loading...</div></div>";
-
-  html += "<script>";
-  html += "async function refresh(){";
-  html += "try{var r=await fetch('/api/debug');var d=await r.json();";
-  html += "var p=document.getElementById('pressed');p.innerText=d.pressed;p.className=d.pressed?'hot':'ok';";
-  html += "document.getElementById('xy').innerText=d.rawX+', '+d.rawY;";
-  html += "var it=document.getElementById('isTouched');it.innerText=d.isTouched;it.className=d.isTouched?'hot':'ok';";
-  html += "document.getElementById('held').innerText=d.isTouched?(d.msHeld+'ms'):'-';";
-  html += "var sr=document.getElementById('stuck');sr.innerText=d.stuckResets;sr.className=d.stuckResets>0?'bad':'ok';";
-  html += "document.getElementById('mode').innerText=d.displayMode;";
-  html += "document.getElementById('uptime').innerText=Math.floor(d.uptimeSec/60)+'m '+(d.uptimeSec%60)+'s';";
-  html += "document.getElementById('heap').innerText=(d.freeHeap/1024).toFixed(1)+' KB';";
-  html += "var w=document.getElementById('wifi');w.innerText=d.wifiConnected?'connected':'DISCONNECTED';w.className=d.wifiConnected?'ok':'bad';";
-  html += "document.getElementById('log').innerText=d.log.join('\\n');";
-  html += "}catch(e){document.getElementById('log').innerText='connection lost: '+e;}";
-  html += "}";
-  html += "refresh();setInterval(refresh,400);";
-  html += "</script></body></html>";
-
-  server.send(200, "text/html; charset=utf-8", html);
+  sendPage("Debug", "debug", false, DEBUG_BODY);
 }
 
 void handleApiStatus() {
@@ -1418,6 +1339,12 @@ void handleApiStatus() {
   json += "\"cityNames\":[\"" + jsonEsc(getDisplayCity(locs[0])) + "\",\"" + jsonEsc(getDisplayCity(locs[1])) + "\",\"" + jsonEsc(getDisplayCity(locs[2])) + "\"],";
   json += "\"city\":\"" + jsonEsc(getDisplayCity(locs[currentCity])) + "\",";
   json += "\"weatherDesc\":\"" + jsonEsc(weatherDesc) + "\",";
+  json += "\"main\":\"" + jsonEsc(mainWeather) + "\",";
+  json += "\"visibility\":" + String(visibility) + ",\"clouds\":" + String(clouds) + ",";
+  json += "\"night\":" + String(isNightNow() ? "true" : "false") + ",\"deviceDark\":" + String(themeDark ? "true" : "false") + ",";
+  static const char *PROVIDER_NAMES[] = {"OpenWeatherMap", "Open-Meteo", "Open-Meteo KNMI"};
+  json += "\"provider\":\"" + String(PROVIDER_NAMES[constrain(cityProvider[currentCity], 0, 2)]) + "\",";
+  json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
   json += "\"temp\":" + String(tempnum, 1) + ",";
   json += "\"feelsLike\":" + String(feels_like, 1) + ",";
   json += "\"tempMin\":" + String(tempMin, 1) + ",";
@@ -1434,6 +1361,7 @@ void handleApiStatus() {
   json += "\"hour\":" + String(hour(localT)) + ",";
   json += "\"minute\":" + String(minute(localT)) + ",";
   json += "\"dateStr\":\"" + String(day(localT)) + "/" + String(month(localT)) + "/" + String(year(localT)) + "\",";
+  json += "\"dateLong\":\"" + String(DAY_NAMES[weekday(localT) - 1]) + " " + String(day(localT)) + " " + MONTH_NAMES[month(localT) - 1] + " " + String(year(localT)) + "\",";
   json += "\"ledR\":" + String(currentLedR) + ",\"ledG\":" + String(currentLedG) + ",\"ledB\":" + String(currentLedB) + ",";
   json += "\"textR\":" + String(textR) + ",\"textG\":" + String(textG) + ",\"textB\":" + String(textB) + ",";
   json += "\"lastFetchOK\":" + String(lastFetchOK ? "true" : "false") + ",";
@@ -1442,6 +1370,7 @@ void handleApiStatus() {
   json += "\"bmeOK\":" + String(bmeOK ? "true" : "false") + ",";
   json += "\"localTemp\":" + String(localTemp, 1) + ",";
   json += "\"localHumid\":" + String(localHumid, 1) + ",";
+  json += "\"localPressure\":" + String(localPressure, 1) + ",";
 #else
   json += "\"bmeOK\":false,";
 #endif
@@ -1456,8 +1385,7 @@ void handleApiStatus() {
   }
   json += "],";
   json += "\"rain\":[";
-  int n = min(upcomingRainCount, 3);
-  for (int i = 0; i < n; i++) {
+  for (int i = 0; i < upcomingRainCount; i++) {
     if (i > 0) json += ",";
     json += "{\"mm\":" + String(upcomingRainMm[i], 1) + ",\"label\":\"" + jsonEsc(upcomingRainLabel[i]) + "\"}";
   }
@@ -1465,135 +1393,9 @@ void handleApiStatus() {
   server.send(200, "application/json", json);
 }
 
-// NEW: live-mirroring dashboard - polls /api/status every few seconds and
-// re-renders, styled to echo the physical device's Home page (digital
-// clock, weather card, LED/text color swatches, feels/wind/humid/baro grid,
-// mini rain preview) without needing to walk over and look at the screen.
+// Live dashboard (the start page): polls /api/status every 7 seconds.
 void handleDashboardPage() {
-  String html = "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><style>";
-  html += "body{font-family:sans-serif;text-align:center;max-width:480px;margin:0 auto;padding:10px;background:#eef1f5;}";
-  html += "h1{font-size:1.4em;} h3{font-size:1em;color:#4a5a7a;margin:0 0 8px 0;}";
-  html += ".card{background:#fff;border-radius:15px;border:2px solid #4a5a7a;padding:20px 10px;margin-top:15px;}";
-  html += ".cityRow{display:flex;align-items:center;justify-content:center;gap:14px;}";
-  html += ".cityRow button{border:none;background:none;font-size:1.4em;color:#4a5a7a;cursor:pointer;padding:0 8px;}";
-  html += ".clock{margin:14px 0 6px;min-height:70px;} .clock svg{display:block;margin:0 auto;max-width:100%;}";
-  html += ".temp{font-size:2.2em;}";
-  html += ".grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;text-align:center;margin-top:15px;font-size:0.95em;}";
-  html += ".swatchRow{display:flex;justify-content:center;gap:20px;margin-top:12px;}";
-  html += ".swatch{width:36px;height:36px;border-radius:8px;border:2px solid #333;display:inline-block;vertical-align:middle;}";
-  html += ".dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:5px;}";
-  html += "canvas{max-width:100%;margin-top:10px;}";
-  html += ".fcRow{display:flex;justify-content:space-between;padding:6px 4px;border-bottom:1px solid #eee;font-size:0.9em;}";
-  html += ".fcRow:last-child{border-bottom:none;}";
-  html += ".sunBadge{display:inline-block;padding:8px 16px;border-radius:8px;font-weight:bold;margin-top:6px;}";
-  html += "</style></head><body>";
-
-  html += "<h1>Weather Station</h1>";
-  html += navBar("dashboard");
-
-  html += "<div class='card'>";
-  html += "<div class='cityRow'><button onclick='cityNav(-1)'>&#10094;</button>";
-  html += "<div id='city' style='font-size:1.3em;font-weight:bold;'>--</div>";
-  html += "<button onclick='cityNav(1)'>&#10095;</button></div>";
-  html += "<div id='desc' style='color:#4a5a7a;'>--</div>";
-  html += "<div class='temp' id='temp'>--</div>";
-  html += "<div id='minmax' style='color:#555;'>L:-- H:--</div>";
-  html += "<div class='clock' id='clock'>--:--</div>";
-  html += "<div id='date' style='color:#555;'>--</div>";
-  html += "<div class='grid'>";
-  html += "<div>Feels: <span id='feels'>--</span> C</div><div>Wind: <span id='wind'>--</span></div>";
-  html += "<div>Humid: <span id='humid'>--</span> %</div><div>Baro: <span id='baro'>--</span> hPa</div>";
-  html += "</div>";
-  html += "<div id='localRow' class='grid' style='display:none;'>";
-  html += "<div>Local Temp: <span id='localTemp'>--</span> C</div><div>Local Humid: <span id='localHumid'>--</span> %</div>";
-  html += "</div>";
-  html += "<canvas id='rainChart' width='400' height='110'></canvas>";
-  html += "<div class='swatchRow'>";
-  html += "<div>LED<br><div class='swatch' id='ledSwatch'></div></div>";
-  html += "<div>Text<br><div class='swatch' id='textSwatch2'></div></div>";
-  html += "</div>";
-  html += "<div style='margin-top:12px;font-size:0.85em;color:#777;'><span class='dot' id='statusDot'></span><span id='statusText'>--</span></div>";
-  html += "</div>";
-
-  html += "<div class='card'>";
-  html += "<h3>SUN &amp; MOON</h3>";
-  html += "<div>Sunrise: <b id='sunRise'>--</b> &nbsp;&nbsp; Sunset: <b id='sunSet'>--</b></div>";
-  html += "<div class='sunBadge' id='sunBadge'>--</div>";
-  html += "<div style='margin-top:8px;color:#555;' id='moonPhase'>--</div>";
-  html += "</div>";
-
-  html += "<div class='card'>";
-  html += "<h3>5-DAY FORECAST</h3>";
-  html += "<div id='forecastList'></div>";
-  html += "</div>";
-
-  html += "<script>";
-  html += FPSTR(SEG_CLOCK_JS); // segClock(): 7-segment digits like the device's clock
-  html += "var ctx=document.getElementById('rainChart').getContext('2d');";
-  html += "var curData=null;";
-  html += "function cityNav(delta){";
-  html += "if(!curData)return;var n=curData.cityIndex+delta;if(n<0)n=curData.cityNames.length-1;if(n>=curData.cityNames.length)n=0;";
-  html += "fetch('/live?action=city&value='+n,{headers:{'X-Requested-With':'DesktopDisplay'}}).then(refresh);";
-  html += "}";
-  html += "function drawRain(rain){";
-  html += "ctx.clearRect(0,0,400,110);";
-  html += "ctx.font='11px sans-serif';ctx.fillStyle='#4a5a7a';ctx.textAlign='center';ctx.fillText('NEXT RAIN',200,14);";
-  html += "if(!rain||rain.length==0){ctx.fillText('No forecast data',200,60);return;}";
-  html += "var maxV=0.5;rain.forEach(p=>{if(p.mm>maxV)maxV=p.mm;});maxV*=1.2;";
-  html += "var left=60,right=340,base=90,maxH=55;";
-  html += "var step=rain.length>1?(right-left)/(rain.length-1):0;";
-  html += "var pts=rain.map((p,i)=>({x:rain.length>1?left+i*step:200,y:base-(p.mm/maxV)*maxH,mm:p.mm,label:p.label}));";
-  html += "ctx.strokeStyle='#4a5a7a';ctx.beginPath();ctx.moveTo(left-10,base);ctx.lineTo(right+10,base);ctx.stroke();";
-  html += "ctx.fillStyle='rgba(90,150,230,0.25)';ctx.beginPath();ctx.moveTo(pts[0].x,base);";
-  html += "pts.forEach(p=>ctx.lineTo(p.x,p.y));ctx.lineTo(pts[pts.length-1].x,base);ctx.closePath();ctx.fill();";
-  html += "ctx.strokeStyle='#1e63d6';ctx.lineWidth=2;ctx.beginPath();";
-  html += "pts.forEach((p,i)=>i==0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y));ctx.stroke();";
-  html += "pts.forEach(p=>{ctx.fillStyle='#1e63d6';ctx.beginPath();ctx.arc(p.x,p.y,3,0,7);ctx.fill();";
-  html += "ctx.fillStyle='#000';ctx.font='10px sans-serif';ctx.fillText(p.mm.toFixed(1),p.x,p.y-8);";
-  html += "ctx.fillStyle='#4a5a7a';ctx.fillText(p.label,p.x,base+16);});";
-  html += "}";
-  html += "async function refresh(){";
-  html += "try{var r=await fetch('/api/status');var d=await r.json();curData=d;";
-  html += "document.getElementById('city').innerText=d.city;";
-  html += "document.getElementById('desc').innerText=d.weatherDesc;";
-  html += "document.getElementById('temp').innerText=d.temp.toFixed(1)+'\\u00B0C';";
-  html += "document.getElementById('minmax').innerText='L:'+d.tempMin.toFixed(1)+'  H:'+d.tempMax.toFixed(1);";
-  // Hour black, minutes in the text color - same as the device (incl. its
-  // near-white -> black fallback, since the card behind it is white).
-  html += "var minCol=(d.textR>235&&d.textG>235&&d.textB>235)?'#000':'rgb('+d.textR+','+d.textG+','+d.textB+')';";
-  html += "document.getElementById('clock').innerHTML=segClock(d.hour,d.minute,minCol);";
-  html += "document.getElementById('date').innerText=d.dateStr;";
-  html += "document.getElementById('feels').innerText=d.feelsLike.toFixed(1);";
-  html += "document.getElementById('wind').innerText=d.windSpeed.toFixed(1)+' '+d.windDir;";
-  html += "document.getElementById('humid').innerText=d.humid;";
-  html += "document.getElementById('baro').innerText=d.pressure;";
-  html += "if(d.bmeOK){document.getElementById('localRow').style.display='grid';";
-  html += "document.getElementById('localTemp').innerText=d.localTemp.toFixed(1);";
-  html += "document.getElementById('localHumid').innerText=d.localHumid.toFixed(1);}";
-  html += "document.getElementById('ledSwatch').style.background='rgb('+d.ledR+','+d.ledG+','+d.ledB+')';";
-  html += "document.getElementById('textSwatch2').style.background='rgb('+d.textR+','+d.textG+','+d.textB+')';";
-  html += "document.getElementById('statusDot').style.background=d.lastFetchOK?'#2e8b57':'#cc3333';";
-  html += "document.getElementById('statusText').innerText=d.lastFetchOK?(d.ageMin+'m ago'):'fetch failed';";
-  html += "drawRain(d.rain);";
-  html += "document.getElementById('sunRise').innerText=d.sunRise;";
-  html += "document.getElementById('sunSet').innerText=d.sunSet;";
-  html += "var h=Math.floor(d.sunDiffMin/60),m=d.sunDiffMin%60;";
-  html += "var badge=document.getElementById('sunBadge');";
-  html += "badge.innerText=d.sunEvent+' IN '+h+'H '+m+'M';";
-  html += "badge.style.background=d.sunEvent=='SUNRISE'?'#fff4e0':'#e0e7f5';";
-  html += "badge.style.color=d.sunEvent=='SUNRISE'?'#e6961e':'#1a2a5e';";
-  html += "document.getElementById('moonPhase').innerText='Moon: '+d.moonPhase;";
-  html += "var fc=document.getElementById('forecastList');fc.innerHTML='';";
-  html += "d.forecast.forEach(f=>{if(!f.day)return;";
-  html += "var row=document.createElement('div');row.className='fcRow';";
-  html += "row.innerHTML='<b>'+f.day+'</b><span>'+f.main+'</span><span>'+f.low.toFixed(0)+'/'+f.high.toFixed(0)+'\\u00B0C</span>';";
-  html += "fc.appendChild(row);});";
-  html += "}catch(e){document.getElementById('statusText').innerText='connection lost';}";
-  html += "}";
-  html += "refresh();setInterval(refresh,7000);";
-  html += "</script></body></html>";
-
-  server.send(200, "text/html; charset=utf-8", html);
+  sendPage("Dashboard", "dashboard", true, DASHBOARD_BODY);
 }
 
 // --- [PER-CITY HISTORY (SD CARD)] ---
@@ -2626,6 +2428,7 @@ bool applyTheme() {
   themeDark = dark;
   T = dark ? THEME_DARK_COLORS : THEME_LIGHT_COLORS;
   bgColor = T.bg;
+  refreshAccent();
   return changed;
 }
 
@@ -2934,9 +2737,6 @@ void drawPageHome() {
     tft.setTextColor(T.text, T.card);
     tft.drawString(":", tx + blockW + gap / 2, ty + 24, 7);
 
-    static const char *DAY_NAMES[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
-    static const char *MONTH_NAMES[] = {"January", "February", "March", "April", "May", "June", "July",
-                                        "August", "September", "October", "November", "December"};
     String d = String(DAY_NAMES[weekday(localT) - 1]) + " " + String(day(localT)) + " " + MONTH_NAMES[month(localT) - 1];
     if (d != lastDate || drawnMode != 0) {
       lastDate = d;
@@ -3116,9 +2916,13 @@ void drawPageAstro() {
     int imgY = moonCardY + 40;
 
     TJpgDec.drawJpg(imgX, imgY, moonImages[pIdx], moonSizes[pIdx]);
-    // Rounded frame: the rings in the card color trim the photo's square corners
-    tft.drawRoundRect(imgX - 1, imgY - 1, imgW + 2, imgH + 2, 10, T.border);
-    for (int i = 0; i < 6; i++) tft.drawRoundRect(imgX - 3 - i, imgY - 3 - i, imgW + 6 + (i * 2), imgH + 6 + (i * 2), 12 + i, T.card2);
+    // Crop the square photo to a smooth circle: an anti-aliased ring in the
+    // card color covers the corners. Its inner edge blends into the photo's
+    // black sky; a second ring cleans up the outer edge against the card.
+    int mcx = imgX + imgW / 2, mcy = imgY + imgH / 2;
+    int rIn = min(imgW, imgH) / 2 - 1, rOut = (max(imgW, imgH) * 72) / 100 + 2;
+    tft.drawArc(mcx, mcy, rOut, rIn, 0, 360, T.card2, TFT_BLACK, true);
+    tft.drawArc(mcx, mcy, rOut + 2, rOut - 2, 0, 360, T.card2, T.card2, true);
     ffText(getMoonPhaseName(pIdx), 160, imgY + imgH + 26, &FreeSansBold9pt7b, MC_DATUM, T.text);
   }
   drawAstroCountdown(); // ticks live even while already on this page
@@ -3324,7 +3128,7 @@ void drawLedBrightnessSlider(bool forceDraw = false) {
 
 void drawButton(int x, int y, int w, int h, const String &label, bool active) {
   drawCard(x, y, w, h, 8, active ? T.accent : T.card2, active ? T.accent : T.border, T.card);
-  tft.setTextDatum(MC_DATUM); tft.setTextColor(active ? TFT_WHITE : T.text);
+  tft.setTextDatum(MC_DATUM); tft.setTextColor(active ? onAccentText() : T.text);
   tft.drawString(label, x + w / 2, y + h / 2 + 1, 2);
 }
 
@@ -3371,7 +3175,7 @@ void drawHuePicker(bool forceDraw = false) {
 
 void drawSaveButton(bool confirmed) {
   drawCard(50, SAVE_BTN_Y, 220, SAVE_BTN_H, 8, confirmed ? T.good : T.accent, confirmed ? T.good : T.accent, T.card);
-  tft.setTextColor(TFT_WHITE); tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(confirmed ? TFT_WHITE : onAccentText()); tft.setTextDatum(MC_DATUM);
   tft.drawString(confirmed ? "SAVED!" : "SAVE CUSTOM AS DEFAULT", 160, SAVE_BTN_Y + SAVE_BTN_H / 2 + 1, 2);
 }
 
@@ -3536,6 +3340,9 @@ void setup() {
   server.on("/", handleDashboardPage);         // the live dashboard is the start page
   server.on("/settings", handleSettingsPage);
   server.on("/save", HTTP_POST, handleSave);
+  server.on("/api/settings", handleApiSettings); // NEW: current settings for the Settings page
+  server.on("/app.css", handleAppCss);           // NEW: shared stylesheet (cached by the browser)
+  server.on("/app.js", handleAppJs);             // NEW: shared script: theme, icons, 7-segment clock
   server.on("/live", handleLive);           // NEW: live slider updates (color, brightness, mode)
   server.on("/saveColor", handleSaveColor); // NEW: persists the current custom color as the boot default
   server.on("/saveTextColor", handleSaveTextColor); // NEW: persists the current text color as the boot default
@@ -3609,6 +3416,12 @@ void loop() {
 #if USE_SD_HISTORY
   historyLoop(); // NEW: background per-city history sync (one city at a time, every 6h)
 #endif
+
+  // Text color changed (web sliders) -> redraw once it has settled
+  if (accentDirty && millis() - accentChangedAt > 400) {
+    accentDirty = false;
+    drawPageBackground(displayMode); drawnMode = -1;
+  }
 
   // AUTO theme: switch between light and dark at sunrise/sunset
   static unsigned long lastThemeCheck = 0;
@@ -3812,57 +3625,58 @@ void loop() {
 // lots of quote characters, which confuse the Arduino IDE's automatic
 // prototype generator for any C++ that comes after it.
 #if USE_SD_HISTORY
-const char HISTORY_PAGE_TOP[] PROGMEM = R"rawliteral(<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><style>
-body{font-family:sans-serif;text-align:center;max-width:900px;margin:0 auto;padding:10px;color:#222;}
-h1{font-size:1.4em;} h2{font-size:1.05em;margin:24px 0 4px;} h2.sec{margin-top:40px;padding-top:16px;border-top:1px solid #ddd;}
-.btnRow{margin:8px 0;}
-.btnRow button{padding:6px 14px;margin:3px;border-radius:6px;border:1px solid #4a5a7a;background:#fff;cursor:pointer;font-size:0.95em;}
-.btnRow button.active{background:#4a5a7a;color:#fff;}
-#modeRow button,#cityRow button{font-weight:bold;}
-.split{display:inline-block;width:14px;}
-canvas{width:100%;max-width:840px;border:1px solid #ddd;border-radius:8px;}
-#tooltip{position:fixed;background:#222;color:#fff;padding:6px 10px;border-radius:6px;font-size:0.85em;pointer-events:none;display:none;text-align:left;z-index:9;}
-#noData{color:#777;margin-top:40px;}
-#storageBox{margin:12px auto;max-width:520px;font-size:0.9em;color:#444;}
-#storageBar{height:10px;background:#e3e7ee;border-radius:5px;overflow:hidden;margin-top:6px;}
-#storageFill{height:100%;width:0;background:#4a90d9;}
-.legend{display:flex;justify-content:center;gap:16px;flex-wrap:wrap;font-size:0.88em;margin:2px 0 6px;color:#444;}
-.legend span{display:inline-flex;align-items:center;gap:6px;}
-.sw{width:16px;height:4px;border-radius:2px;display:inline-block;vertical-align:middle;}
-.tw{overflow-x:auto;}
-table{border-collapse:collapse;margin:8px auto;font-size:0.88em;}
-th,td{padding:5px 9px;border-bottom:1px solid #e6e6e6;white-space:nowrap;}
-th{color:#4a5a7a;font-weight:600;}
-tr.sel td{background:#eef2f8;font-weight:600;}
-.note{font-size:0.8em;color:#888;margin-top:8px;}
-label.chk{font-size:0.9em;color:#444;cursor:pointer;}
-details{margin:34px auto 20px;max-width:680px;text-align:left;border:1px solid #ddd;border-radius:8px;padding:10px 16px;}
-summary{cursor:pointer;font-weight:bold;color:#4a5a7a;}
-.mg{margin:18px 0;} .mg h3{font-size:0.95em;margin:0 0 6px;color:#4a5a7a;}
-.mg button,.mg select{margin:3px 6px 3px 0;padding:5px 10px;border-radius:6px;border:1px solid #4a5a7a;background:#fff;cursor:pointer;}
-.mg button.danger{border-color:#cc3333;color:#a00;background:#fff4f4;}
-.mg button:disabled{opacity:0.5;cursor:default;}
-#bfStatus div{margin:2px 0;}
-.bar{display:inline-block;width:120px;height:8px;background:#e3e7ee;border-radius:4px;overflow:hidden;vertical-align:middle;margin:0 6px;}
-.bar i{display:block;height:100%;background:#4a90d9;}
-#msg{font-size:0.9em;margin-top:8px;}
-</style></head><body>
-<h1>Weather History</h1>
+const char HISTORY_PAGE_TOP[] PROGMEM = R"rawliteral(<style>
+.hist{max-width:980px}
+.hist .btnRow{margin:6px 0;display:flex;gap:8px;flex-wrap:wrap;justify-content:center;align-items:center}
+#modeRow,#cityRow,#metricRow,#rangeRow,#groupRow,#lRangeRow{display:inline-flex;gap:3px;background:var(--card2);padding:4px;border-radius:11px;border:1px solid var(--line);flex-wrap:wrap;justify-content:center}
+.btnRow button{border:0;background:none;color:var(--muted);padding:6px 12px;border-radius:8px;font:inherit;font-weight:600;cursor:pointer}
+.btnRow button.active{background:var(--card);color:var(--text);box-shadow:var(--shadow)}
+.split{display:inline-block;width:6px}
+.ctl{text-align:center}
+label.chk{font-size:.9em;color:var(--muted);cursor:pointer;display:inline-flex;gap:6px;align-items:center;margin-top:6px}
+.hist h2{font-size:1rem;margin:22px 0 4px;text-align:center} .hist h2:first-child{margin-top:4px}
+.hist h2.sec{margin-top:4px}
+canvas{width:100%;max-width:100%;display:block;margin:0 auto;border-radius:10px}
+#tooltip{position:fixed;background:#16202f;color:#fff;padding:6px 10px;border-radius:8px;font-size:.85em;pointer-events:none;display:none;text-align:left;z-index:30;box-shadow:0 6px 20px rgba(0,0,0,.3)}
+#noData{color:var(--muted);text-align:center}
+#storageBox{margin:12px auto 0;max-width:520px;font-size:.9em;color:var(--muted)}
+#storageBar{height:8px;background:var(--line);border-radius:4px;overflow:hidden;margin-top:6px}
+#storageFill{height:100%;width:0;background:var(--blue)}
+.legend{display:flex;justify-content:center;gap:16px;flex-wrap:wrap;font-size:.86em;margin:2px 0 6px;color:var(--muted)}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.legend .sw,.tw .sw{width:16px;height:4px;border-radius:2px;display:inline-block;vertical-align:middle}
+.tw{overflow-x:auto}
+tr.sel td{background:var(--card2);font-weight:600}
+.hist .note{text-align:center}
+details#manage{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:14px 20px;box-shadow:var(--shadow)}
+details#manage .note{text-align:left}
+summary{cursor:pointer;font-weight:700;color:var(--text)}
+.mg{margin:18px 0}.mg h3{font-size:.76em;letter-spacing:.08em;text-transform:uppercase;margin:0 0 8px;color:var(--muted)}
+.mg button,.mg select,.mg input[type=file]{margin:3px 6px 3px 0;padding:7px 12px;border-radius:9px;border:1px solid var(--line);background:var(--card2);color:var(--text);font:inherit;cursor:pointer}
+.mg select{width:auto}
+.mg button.danger{border-color:color-mix(in srgb,var(--bad) 40%,var(--line));color:var(--bad)}
+.mg button:disabled{opacity:.5;cursor:default}
+#bfStatus div{margin:2px 0}
+.bar{display:inline-block;width:120px;height:8px;background:var(--line);border-radius:4px;overflow:hidden;vertical-align:middle;margin:0 6px}
+.bar i{display:block;height:100%;background:var(--blue)}
+#msg{font-size:.9em;margin-top:8px}
+</style>
+<main class='page hist'><h1>Weather history</h1>
 )rawliteral";
 
 const char HISTORY_PAGE_BOTTOM[] PROGMEM = R"rawliteral(
-<div class='btnRow' id='modeRow'><button data-m='single'>Single city</button><button data-m='compare'>Compare cities</button></div>
+<section class='card ctl'><div class='btnRow'><span id='modeRow'><button data-m='single'>Single city</button><button data-m='compare'>Compare cities</button></span></div>
 <div id='singleCtl'>
-<div class='btnRow' id='cityRow'></div>
+<div class='btnRow'><span id='cityRow'></span></div>
 <label class='chk'><input type='checkbox' id='sameScale'> Same scale for all cities</label>
 </div>
 <div id='compareCtl' style='display:none;'>
-<div class='btnRow' id='metricRow'><button data-k='tMax'>Highs</button><button data-k='tMin'>Lows</button><button data-k='mean'>Average</button></div>
+<div class='btnRow'><span id='metricRow'><button data-k='tMax'>Highs</button><button data-k='tMin'>Lows</button><button data-k='mean'>Average</button></span></div>
 </div>
 <div class='btnRow'><span id='rangeRow'><button data-d='7'>7D</button><button data-d='30'>30D</button><button data-d='90'>90D</button><button data-d='365'>1Y</button><button data-d='0'>All</button></span><span class='split'></span><span id='groupRow'><button data-g='day'>Daily</button><button data-g='month'>Monthly</button></span></div>
-<div id='storageBox'><div id='storage'>Loading...</div><div id='storageBar'><div id='storageFill'></div></div></div>
-<div id='noData' style='display:none;'></div>
-<div id='content' style='display:none;'>
+<div id='storageBox'><div id='storage'>Loading...</div><div id='storageBar'><div id='storageFill'></div></div></div></section>
+<div id='noData' class='card' style='display:none;'></div>
+<div id='content' class='card' style='display:none;'>
 <h2 id='t_temp'></h2><div class='legend' id='l_temp'></div><canvas id='c_temp' width='840' height='280'></canvas>
 <h2 id='t_rain'></h2><div class='legend' id='l_rain'></div><canvas id='c_rain' width='840' height='200'></canvas>
 <h2 id='t_sun'></h2><div class='legend' id='l_sun'></div><canvas id='c_sun' width='840' height='180'></canvas>
@@ -3876,9 +3690,9 @@ const char HISTORY_PAGE_BOTTOM[] PROGMEM = R"rawliteral(
 <div class='note'>Daily values from Open-Meteo for every city, whichever city the device is showing. The light point/bar at the end is today's forecast and isn't counted in summaries or records. Pressure is the sea-level value, so cities at different heights compare fairly. In the monthly view the current month is "so far".</div>
 </div>
 
-<div id='localSec' style='display:none;'>
+<div id='localSec' class='card' style='display:none;'>
 <h2 class='sec'>Local sensor (BME280)</h2>
-<div class='btnRow' id='lRangeRow'><button data-h='24'>24H</button><button data-h='168'>7D</button><button data-h='720'>30D</button><button data-h='8760'>1Y</button><button data-h='0'>All</button></div>
+<div class='btnRow'><span id='lRangeRow'><button data-h='24'>24H</button><button data-h='168'>7D</button><button data-h='720'>30D</button><button data-h='8760'>1Y</button><button data-h='0'>All</button></span></div>
 <div class='legend' id='lStats'></div>
 <h2>Temperature (&deg;C)</h2><canvas id='c_lsT' width='840' height='170'></canvas>
 <h2>Humidity (%)</h2><canvas id='c_lsH' width='840' height='150'></canvas>
@@ -3917,8 +3731,8 @@ try{var sv=JSON.parse(localStorage.getItem('histView')||'{}');['mode','metric','
 var $=function(id){return document.getElementById(id);}
 var CH={};['temp','rain','sun','hum','pres','wind','lsT','lsH','lsP'].forEach(k=>{var c=$('c_'+k);CH[k]={cv:c,ctx:c.getContext('2d')};});
 var tip=$('tooltip'),PAD={l:46,r:14,t:12,b:26},view=null,lview=null;
-var PRES_HINT='<span style="color:#888;">high = settled weather &middot; low or falling = unsettled, rain/wind likely</span>';
-var SAME_NOTE='<span style="color:#888;">same scale as the other cities</span>';
+var PRES_HINT='<span style="color:var(--muted);">high = settled weather &middot; low or falling = unsettled, rain/wind likely</span>';
+var SAME_NOTE='<span style="color:var(--muted);">same scale as the other cities</span>';
 var NO_EXTRA='No wind/sunshine data here yet - it is added by the next sync or a backfill';
 $('sameScale').checked=S.same;
 
@@ -4017,29 +3831,29 @@ var frame=function(C,sc){
   var Y=v=>PAD.t+(1-(v-sc.lo)/(sc.hi-sc.lo))*(h-PAD.t-PAD.b),dc=decs(sc.st),steps=Math.round((sc.hi-sc.lo)/sc.st);
   ctx.font='10px sans-serif';ctx.textAlign='right';ctx.lineWidth=1;
   for(var k=0;k<=steps;k++){var v=sc.lo+k*sc.st,y=Y(v);
-    ctx.strokeStyle=(Math.abs(v)<1e-9&&sc.lo<0)?'#9a9a9a':'#e4e4e4';
+    ctx.strokeStyle=(Math.abs(v)<1e-9&&sc.lo<0)?cssVar('--faint'):cssVar('--line');
     ctx.beginPath();ctx.moveTo(PAD.l,y);ctx.lineTo(w-PAD.r,y);ctx.stroke();
-    var s=v.toFixed(dc);if(parseFloat(s)===0)s=(0).toFixed(dc);ctx.fillStyle='#888';ctx.fillText(s,PAD.l-6,y+3);}
+    var s=v.toFixed(dc);if(parseFloat(s)===0)s=(0).toFixed(dc);ctx.fillStyle=cssVar('--muted');ctx.fillText(s,PAD.l-6,y+3);}
   return Y;
 }
 var xs=function(cv,n){var bw=(cv.width-PAD.l-PAD.r)/n;return{bw:bw,X:i=>PAD.l+(i+0.5)*bw};}
-var dateLabels=function(C,dates,X){var ctx=C.ctx,n=dates.length,every=Math.max(1,Math.ceil(n/10));ctx.fillStyle='#555';ctx.textAlign='center';ctx.font='10px sans-serif';
+var dateLabels=function(C,dates,X){var ctx=C.ctx,n=dates.length,every=Math.max(1,Math.ceil(n/10));ctx.fillStyle=cssVar('--muted');ctx.textAlign='center';ctx.font='10px sans-serif';
   dates.forEach((d,i)=>{if(i%every==0)ctx.fillText(lbl(d,n),X(i),C.cv.height-8);});}
 var polyline=function(ctx,pts,color,w){ctx.strokeStyle=color;ctx.lineWidth=w||1.8;ctx.beginPath();var pen=false;
   pts.forEach(p=>{if(p==null){pen=false;return;}if(!pen){ctx.moveTo(p.x,p.y);pen=true;}else ctx.lineTo(p.x,p.y);});ctx.stroke();}
 var dot=function(ctx,x,y,c){ctx.fillStyle=c;ctx.beginPath();ctx.arc(x,y,3,0,7);ctx.fill();}
-var emptyChart=function(C,t){var ctx=C.ctx,cv=C.cv;ctx.clearRect(0,0,cv.width,cv.height);ctx.fillStyle='#999';ctx.font='13px sans-serif';ctx.textAlign='center';ctx.fillText(t,cv.width/2,cv.height/2);}
+var emptyChart=function(C,t){var ctx=C.ctx,cv=C.cv;ctx.clearRect(0,0,cv.width,cv.height);ctx.fillStyle=cssVar('--muted');ctx.font='13px sans-serif';ctx.textAlign='center';ctx.fillText(t,cv.width/2,cv.height/2);}
 var emptyAll=function(t){['temp','rain','sun','hum','pres','wind'].forEach((k,i)=>emptyChart(CH[k],i?'':t));}
 // lines: series=[{c,v:[value|null],w}]
 var drawSeries=function(C,dates,series,sc,o){
   o=o||{};var ctx=C.ctx,Y=frame(C,sc),g=xs(C.cv,dates.length);
-  if(o.ref!=null&&o.ref>sc.lo&&o.ref<sc.hi){var ry=Y(o.ref);ctx.save();ctx.setLineDash([4,4]);ctx.strokeStyle='#bbb';ctx.beginPath();ctx.moveTo(PAD.l,ry);ctx.lineTo(C.cv.width-PAD.r,ry);ctx.stroke();ctx.restore();
-    ctx.fillStyle='#aaa';ctx.textAlign='left';ctx.font='10px sans-serif';ctx.fillText(o.refLabel,PAD.l+4,ry-3);}
+  if(o.ref!=null&&o.ref>sc.lo&&o.ref<sc.hi){var ry=Y(o.ref);ctx.save();ctx.setLineDash([4,4]);ctx.strokeStyle=cssVar('--faint');ctx.beginPath();ctx.moveTo(PAD.l,ry);ctx.lineTo(C.cv.width-PAD.r,ry);ctx.stroke();ctx.restore();
+    ctx.fillStyle=cssVar('--muted');ctx.textAlign='left';ctx.font='10px sans-serif';ctx.fillText(o.refLabel,PAD.l+4,ry-3);}
   if(o.fill){var seg=[],base=Y(sc.lo);ctx.fillStyle=o.fill;
     var flush=()=>{if(seg.length){ctx.beginPath();ctx.moveTo(seg[0].x,base);seg.forEach(p=>ctx.lineTo(p.x,p.y));ctx.lineTo(seg[seg.length-1].x,base);ctx.closePath();ctx.fill();}seg=[];};
     series[0].v.forEach((v,i)=>{if(v==null)flush();else seg.push({x:g.X(i),y:Y(v)});});flush();}
   series.forEach(s=>polyline(ctx,s.v.map((v,i)=>v==null?null:{x:g.X(i),y:Y(v)}),s.c,s.w||1.8));
-  if(o.partialLast){var v0=series[0].v,L=v0.length-1;if(v0[L]!=null)dot(ctx,g.X(L),Y(v0[L]),'#999');}
+  if(o.partialLast){var v0=series[0].v,L=v0.length-1;if(v0[L]!=null)dot(ctx,g.X(L),Y(v0[L]),cssVar('--faint'));}
   dateLabels(C,dates,g.X);
 }
 // bars, side by side when there are several series: series=[{c,lc,v,light:[bool]}]
@@ -4079,7 +3893,7 @@ var drawSingle=function(){
   tx.closePath();tx.fill();
   polyline(tx,d.map((p,i)=>({x:g.X(i),y:Y(p.tMax)})),'#cc3333');
   polyline(tx,d.map((p,i)=>({x:g.X(i),y:Y(p.tMin)})),'#1e63d6');
-  if(part){dot(tx,g.X(L),Y(d[L].tMax),'#999');dot(tx,g.X(L),Y(d[L].tMin),'#999');}
+  if(part){dot(tx,g.X(L),Y(d[L].tMax),cssVar('--faint'));dot(tx,g.X(L),Y(d[L].tMin),cssVar('--faint'));}
   dateLabels(T,dates,g.X);
 
   drawBars(CH.rain,dates,[{c:'#4a90d9',lc:'#a9c8ec',v:d.map(p=>p.rain),light:light}],nice(0,Math.max(2,...pool.map(x=>x.rain)),4,true));
@@ -4173,7 +3987,7 @@ var drawSummary=function(){
     var hi=d.reduce((a,p)=>p.tMax>a.tMax?p:a),lo=d.reduce((a,p)=>p.tMin<a.tMin?p:a);
     var tot=d.reduce((a,p)=>a+p.rain,0),rd=d.filter(p=>p.rain>=1).length;
     var ah=avgOf(d.map(p=>nz(p.humid))),ap=avgOf(d.map(p=>nz(p.pressure))),sun=sumOf(d.map(p=>p.sun)),gu=maxOf(d.map(p=>p.gust));
-    var dt=x=>'<small style="color:#888;">'+(longR?x.date:x.date.slice(5))+'</small>';
+    var dt=x=>'<small style="color:var(--muted);">'+(longR?x.date:x.date.slice(5))+'</small>';
     return '<tr'+cls+'>'+nameCell+'<td>'+d.length+'</td><td>'+avg('tMax').toFixed(1)+'&deg;</td><td>'+avg('tMin').toFixed(1)+'&deg;</td>'
       +'<td>'+hi.tMax+'&deg; '+dt(hi)+'</td><td>'+lo.tMin+'&deg; '+dt(lo)+'</td><td>'+tot.toFixed(1)+' mm</td><td>'+rd+'</td>'
       +'<td>'+(sun==null?'-':sun.toFixed(0)+' h')+'</td><td>'+(gu==null?'-':Math.round(gu)+' km/h')+'</td>'
@@ -4198,7 +4012,7 @@ var drawRecords=function(){
   var defs=[['Hottest day','hot',deg],['Warmest night','warmN',deg],['Coldest day','coldD',deg],['Coldest night','coldN',deg],
     ['Wettest day','wet',v=>(+v).toFixed(1)+' mm'],['Sunniest day','sun',v=>(+v).toFixed(1)+' h'],['Strongest gust','gust',v=>Math.round(v)+' km/h'],
     ['Highest pressure','pHi',hpa],['Lowest pressure','pLo',hpa]];
-  var sm=t=>' <small style="color:#888;">'+t+'</small>';
+  var sm=t=>' <small style="color:var(--muted);">'+t+'</small>';
   var h='<tr><th></th>'+S.cities.map((c,i)=>'<th><i class="sw" style="background:'+COLORS[i]+';"></i> '+c.name+'</th>').join('')+'</tr>';
   h+='<tr><td style="text-align:left;">Logged since</td>'+rs.map(R=>'<td>'+(R?R.first+sm(R.n+' days'):'-')+'</td>').join('')+'</tr>';
   defs.forEach(r=>{h+='<tr><td style="text-align:left;">'+r[0]+'</td>'+rs.map(R=>{var b=R&&R[r[1]];return '<td>'+(b?r[2](b.v)+sm(b.p.date):'-')+'</td>';}).join('')+'</tr>';});
@@ -4224,7 +4038,7 @@ var hover=function(C,key){
 var loadLocal=async function(){try{S.local=await (await fetch('/api/local?hours='+S.lrange)).json();drawLocal();}catch(e){}}
 var tX=function(cv,e,e0,e1){return PAD.l+(e-e0)/(e1-e0)*(cv.width-PAD.l-PAD.r);}
 var timeLabels=function(C,e0,e1){
-  var ctx=C.ctx,span=e1-e0,n=6;ctx.fillStyle='#555';ctx.font='10px sans-serif';
+  var ctx=C.ctx,span=e1-e0,n=6;ctx.fillStyle=cssVar('--muted');ctx.font='10px sans-serif';
   for(var k=0;k<=n;k++){var e=e0+span*k/n,d=new Date(e*1000),s;
     if(span<=2*86400)s=String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
     else if(span<=60*86400)s=d.getDate()+' '+MONTHS[d.getMonth()]+(span<=8*86400?' '+String(d.getHours()).padStart(2,'0')+'h':'');
@@ -4265,7 +4079,7 @@ document.querySelectorAll('#lRangeRow button').forEach(b=>b.onclick=()=>{S.lrang
 $('sameScale').onchange=e=>{S.same=e.target.checked;render();};
 
 // ---------- manage data
-var msg=function(t,bad){var m=$('msg');m.innerText=t;m.style.color=bad?'#a00':'#2e6b2e';}
+var msg=function(t,bad){var m=$('msg');m.innerText=t;m.style.color=bad?'var(--bad)':'var(--good)';}
 var post=async function(u,body){try{var r=await fetch(u,{method:'POST',body:body,headers:{'X-Requested-With':'DesktopDisplay'}});return await r.json();}catch(e){return{ok:false,msg:'Request failed: '+e};}}
 var doImport=async function(){
   var f=$('impFile').files[0];if(!f){msg('Choose a CSV file first.',true);return;}
@@ -4308,35 +4122,413 @@ var pollBF=async function(){
     bfWas=act;
   }catch(e){bfTimer=setTimeout(pollBF,10000);}
 }
+document.addEventListener('themechange',()=>{if(S.loaded){render();drawLocal();}});
 loadAll().then(()=>{loadLocal();pollBF();});
-</script></body></html>)rawliteral";
+</script>
+</main>)rawliteral";
 
 void handleHistoryPage() {
-  String html = FPSTR(HISTORY_PAGE_TOP);
-  html += navBar("history");
-  html += FPSTR(HISTORY_PAGE_BOTTOM);
-  server.send(200, "text/html; charset=utf-8", html);
+  sendPage("History", "history", false, HISTORY_PAGE_TOP, HISTORY_PAGE_BOTTOM);
 }
 
 #endif // USE_SD_HISTORY
 
-// --- [DASHBOARD 7-SEGMENT CLOCK] ---
-// Draws the time as SVG 7-segment digits, styled after TFT_eSPI's Font 7 that
-// the device's own clock uses (bevelled segments with small gaps). Kept down
-// here with the history page for the same reason: quote-heavy JavaScript
-// confuses the Arduino IDE's prototype generator for any C++ after it.
-const char SEG_CLOCK_JS[] PROGMEM = R"rawliteral(
-var SEG=(function(){var T=11,h=T/2,G=1.3,W=70,L=h,R=W-h,TP=h,M=50,B=100-h;
-function H(y,a,b){a+=G;b-=G;return [[a,y],[a+h,y-h],[b-h,y-h],[b,y],[b-h,y+h],[a+h,y+h]];}
-function V(x,a,b){a+=G;b-=G;return [[x,a],[x+h,a+h],[x+h,b-h],[x,b],[x-h,b-h],[x-h,a+h]];}
-return {a:H(TP,L,R),g:H(M,L,R),d:H(B,L,R),f:V(L,TP,M),b:V(R,TP,M),e:V(L,M,B),c:V(R,M,B)};})();
-var DIG=['abcdef','bc','abdeg','abcdg','bcfg','acdfg','acdefg','abc','abcdefg','abcdfg'];
-function segDigit(d,x,col){return DIG[d].split('').map(s=>'<polygon fill="'+col+'" points="'+SEG[s].map(p=>(p[0]+x)+','+p[1]).join(' ')+'"/>').join('');}
-function segClock(hh,mm,minCol){
-  var hs=String(hh).padStart(2,'0'),ms=String(mm).padStart(2,'0'),blk='#000',o='',x=0;
-  o+=segDigit(+hs[0],x,blk);x+=82;o+=segDigit(+hs[1],x,blk);x+=70+24;
-  o+='<rect x="'+x+'" y="25" width="12" height="12" rx="2" fill="'+blk+'"/><rect x="'+x+'" y="63" width="12" height="12" rx="2" fill="'+blk+'"/>';x+=12+24;
-  o+=segDigit(+ms[0],x,minCol);x+=82;o+=segDigit(+ms[1],x,minCol);x+=70;
-  return '<svg viewBox="-2 -2 '+(x+4)+' 104" height="70" role="img" aria-label="'+hs+':'+ms+'">'+o+'</svg>';
+// --- [WEB UI ASSETS] ---
+// The web pages' shared stylesheet and script, and the page bodies. Kept down
+// here for the same reason as the history page: quote-heavy text confuses the
+// Arduino IDE's prototype generator for any C++ that comes after it.
+const char APP_CSS[] PROGMEM = R"rawliteral(
+:root,[data-theme=light]{--bg:#eef2f7;--card:#fff;--card2:#f5f7fb;--text:#16202f;--muted:#64748b;--faint:#94a3b8;--line:#e2e8f0;--accent:#f08c2e;--onaccent:#fff;--blue:#2f6fdf;--rain:#3b82f6;--good:#22a06b;--bad:#dc2626;--hi:#d64545;--lo:#2f6fdf;--sun:#f5b400;--shadow:0 1px 2px rgba(16,24,40,.06),0 4px 16px rgba(16,24,40,.06);--hero:linear-gradient(135deg,#dfe8f5 0%,#f7f9fc 60%);color-scheme:light}
+[data-theme=dark]{--bg:#0b1220;--card:#121b2b;--card2:#18233a;--text:#e7edf7;--muted:#8fa0b8;--faint:#5d6e88;--line:#22304a;--accent:#ff9f43;--onaccent:#16202f;--blue:#5b9bff;--rain:#5aa2ff;--good:#34d399;--bad:#f87171;--hi:#f87171;--lo:#60a5fa;--sun:#fbbf24;--shadow:0 1px 2px rgba(0,0,0,.4);--hero:linear-gradient(135deg,#17253f 0%,#121b2b 70%);color-scheme:dark}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:var(--blue)}
+.top{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:14px;padding:10px 22px;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+.brand{font-weight:700;display:flex;align-items:center;gap:9px;white-space:nowrap;color:var(--text);text-decoration:none}
+.brand i{width:10px;height:10px;border-radius:50%;background:var(--good);box-shadow:0 0 0 3px color-mix(in srgb,var(--good) 25%,transparent)}
+.brand i.bad{background:var(--bad);box-shadow:0 0 0 3px color-mix(in srgb,var(--bad) 25%,transparent)}
+.tabs{display:flex;gap:3px;background:var(--card2);padding:4px;border-radius:12px;border:1px solid var(--line);min-width:0;overflow-x:auto}
+.tabs button{border:0;background:none;color:var(--muted);padding:7px 14px;border-radius:9px;font:inherit;font-weight:600;cursor:pointer;white-space:nowrap}
+.tabs button.on{background:var(--card);color:var(--text);box-shadow:var(--shadow)}
+.top nav{margin-left:auto;display:flex;gap:2px}
+.top nav a{color:var(--muted);text-decoration:none;padding:7px 12px;border-radius:9px;font-weight:600;font-size:.95em}
+.top nav a:hover{color:var(--text)}
+.top nav a.on{color:var(--text);background:var(--card2)}
+.iconbtn{border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:10px;width:38px;height:38px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;flex:none;padding:0}
+.iconbtn svg{width:18px;height:18px}
+.bottom{display:none}
+.page{max-width:900px;margin:0 auto;padding:20px 22px 40px;display:grid;gap:16px}
+.page>h1{margin:4px 0 0;font-size:1.5em}
+.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px 20px;box-shadow:var(--shadow);min-width:0}
+.card h3,.label{margin:0 0 12px;font-size:.76em;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:700}
+.card h3{display:flex;justify-content:space-between;gap:10px;align-items:baseline}
+.card h3 span{text-transform:none;letter-spacing:0;font-weight:600}
+.muted{color:var(--muted)} .small{font-size:.86em} .note{font-size:.85em;color:var(--muted);margin:8px 0 0}
+.tile{background:var(--card2);border-radius:12px;padding:12px 14px;display:flex;flex-direction:column;gap:3px;min-width:0}
+.tile .k{font-size:.78em;color:var(--muted);font-weight:600}
+.tile .v{font-size:1.35em;font-weight:650}
+.tile .v small{font-size:.6em;color:var(--muted);font-weight:500}
+.bar{height:6px;border-radius:3px;background:var(--line);overflow:hidden;margin-top:4px}.bar i{display:block;height:100%;background:var(--blue);border-radius:3px}
+/* forms */
+.field{display:grid;gap:6px;margin:0 0 14px}
+.field>span{font-size:.85em;font-weight:600;color:var(--muted)}
+input[type=text],input[type=password],select{width:100%;font:inherit;color:var(--text);background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:9px 12px;outline:none}
+input[type=text]:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 22%,transparent)}
+.row2{display:grid;grid-template-columns:1fr 210px;gap:10px}
+.switch{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-top:1px solid var(--line);cursor:pointer}
+.switch:first-of-type{border-top:0}
+.switch input{appearance:none;-webkit-appearance:none;width:44px;height:26px;border-radius:13px;background:var(--line);position:relative;cursor:pointer;flex:none;transition:background .15s;margin:0}
+.switch input::after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.3);transition:left .15s}
+.switch input:checked{background:var(--accent)} .switch input:checked::after{left:21px}
+.switch small{display:block;color:var(--muted);font-size:.84em}
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:10px;border-radius:5px;background:var(--line);margin:10px 0;outline:none}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;border-radius:50%;background:var(--card);border:3px solid var(--accent);cursor:pointer}
+input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:var(--card);border:3px solid var(--accent);cursor:pointer}
+.slider{display:grid;grid-template-columns:110px 1fr 48px;align-items:center;gap:12px}
+.slider span{font-size:.88em;color:var(--muted);font-weight:600}.slider b{text-align:right;font-size:.9em}
+.btn{font:inherit;font-weight:600;border-radius:10px;padding:9px 16px;border:1px solid var(--line);background:var(--card2);color:var(--text);cursor:pointer}
+.btn:hover{border-color:var(--faint)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--onaccent)}
+.btn.danger{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 40%,var(--line))}
+.btn:disabled{opacity:.5;cursor:default}
+.seg{display:inline-flex;gap:3px;background:var(--card2);padding:4px;border-radius:11px;border:1px solid var(--line);flex-wrap:wrap}
+.seg button{border:0;background:none;color:var(--muted);padding:6px 12px;border-radius:8px;font:inherit;font-weight:600;cursor:pointer}
+.seg button.on,.seg button.active{background:var(--card);color:var(--text);box-shadow:var(--shadow)}
+.swatch{width:44px;height:44px;border-radius:12px;border:1px solid var(--line);flex:none}
+.savebar{position:sticky;bottom:12px;display:flex;align-items:center;gap:12px;justify-content:flex-end;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px 12px;box-shadow:var(--shadow)}
+.savebar span{margin-right:auto;color:var(--muted);font-size:.9em}
+table{border-collapse:collapse;width:100%;font-size:.88em}
+th,td{padding:7px 9px;border-bottom:1px solid var(--line);white-space:nowrap;text-align:left}
+th{color:var(--muted);font-weight:600}
+@media (max-width:900px){
+  .top{flex-wrap:wrap;padding:9px 14px;gap:10px}
+  .top nav{display:none}
+  .top .iconbtn{margin-left:auto}
+  .tabs{order:3;width:100%}.tabs button{flex:1}
+  .page{padding:14px 14px 96px;gap:12px}
+  .card{padding:16px}
+  .row2{grid-template-columns:1fr}
+  .slider{grid-template-columns:86px 1fr 42px}
+  .savebar{bottom:76px}
+  .bottom{display:flex;position:fixed;left:0;right:0;bottom:0;z-index:20;justify-content:space-around;background:var(--card);border-top:1px solid var(--line);padding:7px 0 calc(9px + env(safe-area-inset-bottom))}
+  .bottom a{display:flex;flex-direction:column;align-items:center;gap:3px;color:var(--muted);text-decoration:none;font-size:.72em;font-weight:600;min-width:64px}
+  .bottom a.on{color:var(--accent)}
+  .bottom svg{width:22px;height:22px}
 }
+)rawliteral";
+
+const char APP_JS[] PROGMEM = R"rawliteral(
+// Shared by every page: theme toggle, accent color, API helper, icons, 7-segment clock.
+var H={'X-Requested-With':'DesktopDisplay'};
+function api(u,o){o=o||{};o.headers=Object.assign({},o.headers||{},H);return fetch(u,o);}
+var $=function(id){return document.getElementById(id);};
+
+// ---- theme: auto (follows the phone/PC setting) -> light -> dark
+var THEME_ICONS={auto:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor"/></svg>',
+ light:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>',
+ dark:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>'};
+function themePref(){try{return localStorage.getItem('wsTheme')||'auto';}catch(e){return 'auto';}}
+function applyThemePref(){var p=themePref(),dark=p=='dark'||(p=='auto'&&matchMedia('(prefers-color-scheme: dark)').matches);
+ document.documentElement.dataset.theme=dark?'dark':'light';var b=$('themeBtn');if(b){b.innerHTML=THEME_ICONS[p];b.title='Theme: '+p;}
+ setAccentFromText(window._txt);document.dispatchEvent(new Event('themechange'));}
+function cycleTheme(){var p=themePref(),n=p=='auto'?'light':(p=='light'?'dark':'auto');try{localStorage.setItem('wsTheme',n);}catch(e){}applyThemePref();}
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change',applyThemePref);
+
+// ---- accent = the device's text color when it is a real, readable color (same rule as the display)
+function setAccentFromText(t){window._txt=t;var st=document.documentElement.style;
+ if(!t){st.removeProperty('--accent');st.removeProperty('--onaccent');return;}
+ var r=t[0],g=t[1],b=t[2],mx=Math.max(r,g,b),mn=Math.min(r,g,b),sat=mx?(mx-mn)/mx:0,lum=(r*299+g*587+b*114)/1000;
+ var dark=document.documentElement.dataset.theme=='dark',ok=sat>=.24&&mx>=60&&(dark?lum>=90:lum<=215);
+ if(!ok){st.removeProperty('--accent');st.removeProperty('--onaccent');return;}
+ st.setProperty('--accent','rgb('+r+','+g+','+b+')');st.setProperty('--onaccent',lum>170?'#16202f':'#fff');}
+function cssVar(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim();}
+
+// ---- weather icons (inline SVG, nothing loaded from the internet)
+function iconKind(main,desc){main=(main||'').toUpperCase();desc=(desc||'').toUpperCase();
+ if(main=='CLEAR')return 'clear';if(main=='THUNDERSTORM')return 'thunder';if(main=='RAIN')return 'rain';if(main=='DRIZZLE')return 'drizzle';if(main=='SNOW')return 'snow';
+ if(/MIST|FOG|HAZE|SMOKE|DUST|SAND|ASH/.test(main)||desc.indexOf('FOG')>=0)return 'fog';
+ if(/FEW|SCATTERED|PARTLY|MAINLY CLEAR/.test(desc))return 'partly';return 'cloud';}
+function iconSvg(kind,night){
+ var cl=function(dy,c){return '<path d="M18 '+(48+dy)+'h28a11 11 0 0 0 0-22 15 15 0 0 0-29-2A10 10 0 0 0 18 '+(48+dy)+'z" fill="'+(c||'#9fb0c8')+'"/>';};
+ var sun='<circle cx="32" cy="32" r="12" fill="#fbbf24"/><g stroke="#fbbf24" stroke-width="4" stroke-linecap="round"><path d="M32 6v6M32 52v6M6 32h6M52 32h6M13.6 13.6l4.2 4.2M46.2 46.2l4.2 4.2M13.6 50.4l4.2-4.2M46.2 17.8l4.2-4.2"/></g>';
+ var moon=function(x,y,r){return '<path d="M'+x+' '+(y-r)+'a'+r+' '+r+' 0 1 0 '+(r*.9)+' '+(r*1.55)+' '+(r*.85)+' '+(r*.85)+' 0 0 1 '+(-r*.9)+' '+(-r*1.55)+'z" fill="#e8d9a8"/>';};
+ var s='';
+ if(kind=='clear')s=night?moon(30,32,18):sun;
+ else if(kind=='partly')s=(night?moon(22,22,12):'<circle cx="24" cy="24" r="10" fill="#fbbf24"/><g stroke="#fbbf24" stroke-width="3.5" stroke-linecap="round"><path d="M24 4v5M4 24h5M9.9 9.9l3.5 3.5M38.1 9.9l-3.5 3.5"/></g>')+'<path d="M22 52h26a10 10 0 0 0 0-20 14 14 0 0 0-27-2A9 9 0 0 0 22 52z" fill="#c3cfdf"/>';
+ else if(kind=='rain')s=cl(-8,'#8aa0bd')+'<g stroke="#3b82f6" stroke-width="3.5" stroke-linecap="round"><path d="M22 46l-3 8M33 46l-3 8M44 46l-3 8"/></g>';
+ else if(kind=='drizzle')s=cl(-8,'#8aa0bd')+'<g fill="#3b82f6"><circle cx="22" cy="48" r="2.4"/><circle cx="33" cy="48" r="2.4"/><circle cx="44" cy="48" r="2.4"/><circle cx="27" cy="56" r="2.4"/><circle cx="38" cy="56" r="2.4"/></g>';
+ else if(kind=='thunder')s=cl(-8,'#8aa0bd')+'<path d="M35 40l-9 13h7l-4 11 11-15h-7l4-9z" fill="#fbbf24"/>';
+ else if(kind=='snow')s=cl(-8,'#9fb0c8')+'<g fill="#60a5fa"><circle cx="21" cy="48" r="2.8"/><circle cx="33" cy="53" r="2.8"/><circle cx="45" cy="48" r="2.8"/><circle cx="27" cy="59" r="2.8"/><circle cx="39" cy="59" r="2.8"/></g>';
+ else if(kind=='fog')s='<g stroke="#9fb0c8" stroke-width="5" stroke-linecap="round"><path d="M10 20h40M16 30h40M10 40h40M16 50h40"/></g>';
+ else s=cl(0);
+ return '<svg viewBox="0 0 64 64" aria-hidden="true">'+s+'</svg>';}
+
+// ---- 7-segment digits, styled after the device's TFT_eSPI Font 7
+var SEG=(function(){var T=11,h=T/2,G=1.3,W=70,L=h,R=W-h,TP=h,M=50,B=100-h;
+function Hs(y,a,b){a+=G;b-=G;return [[a,y],[a+h,y-h],[b-h,y-h],[b,y],[b-h,y+h],[a+h,y+h]];}
+function Vs(x,a,b){a+=G;b-=G;return [[x,a],[x+h,a+h],[x+h,b-h],[x,b],[x-h,b-h],[x-h,a+h]];}
+return {a:Hs(TP,L,R),g:Hs(M,L,R),d:Hs(B,L,R),f:Vs(L,TP,M),b:Vs(R,TP,M),e:Vs(L,M,B),c:Vs(R,M,B)};})();
+var DIG=['abcdef','bc','abdeg','abcdg','bcfg','acdfg','acdefg','abc','abcdefg','abcdfg'];
+function segDigit(d,x,col){return DIG[d].split('').map(function(s){return '<polygon fill="'+col+'" points="'+SEG[s].map(function(p){return (p[0]+x)+','+p[1];}).join(' ')+'"/>';}).join('');}
+function segClock(hh,mm,hCol,minCol){var hs=String(hh).padStart(2,'0'),ms=String(mm).padStart(2,'0'),o='',x=0;
+ o+=segDigit(+hs[0],x,hCol);x+=82;o+=segDigit(+hs[1],x,hCol);x+=70+24;
+ o+='<rect x="'+x+'" y="25" width="12" height="12" rx="2" fill="'+hCol+'"/><rect x="'+x+'" y="63" width="12" height="12" rx="2" fill="'+hCol+'"/>';x+=12+24;
+ o+=segDigit(+ms[0],x,minCol);x+=82;o+=segDigit(+ms[1],x,minCol);x+=70;
+ return '<svg viewBox="-2 -2 '+(x+4)+' 104" role="img" aria-label="'+hs+':'+ms+'">'+o+'</svg>';}
+
+applyThemePref();
+)rawliteral";
+
+const char DASHBOARD_BODY[] PROGMEM = R"rawliteral(
+<style>
+.dash{max-width:1280px;margin:0 auto;padding:20px 22px 40px;display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:16px}
+.hero{grid-column:span 8;background:var(--hero);display:grid;grid-template-columns:1.1fr 1fr;gap:12px;align-items:center;padding:24px 28px}
+.now{display:flex;align-items:center;gap:18px}
+.now .ic svg{width:96px;height:96px;display:block}
+.temp{font-size:72px;font-weight:300;line-height:1;letter-spacing:-2px;white-space:nowrap}
+.temp sup{font-size:28px;font-weight:400;vertical-align:top;margin-left:2px;letter-spacing:0}
+.desc{font-weight:600;margin-top:6px;text-transform:capitalize}
+.hl{color:var(--muted);margin-top:4px;font-size:.95em}
+.clockbox{text-align:center}
+.clockbox svg{width:100%;max-width:300px;height:auto}
+.date{color:var(--muted);margin-top:8px;font-weight:500}
+.details{grid-column:span 4;display:grid;grid-template-columns:1fr 1fr;gap:10px;align-content:start}
+.details h3{grid-column:1/-1}
+.compass{display:flex;align-items:center;gap:10px}
+.rain{grid-column:span 8}.sun{grid-column:span 4}.fc{grid-column:span 8}.side{grid-column:span 4;display:grid;gap:16px;align-content:start}
+.fcrow{display:grid;grid-template-columns:64px 40px minmax(0,1fr) 44px minmax(60px,1.4fr) 44px;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line)}
+.fcrow:last-child{border:0}
+.fcrow b{font-weight:650}.fcrow svg{width:34px;height:34px;display:block}
+.fcrow .lo{color:var(--muted);text-align:right}.fcrow .hi{font-weight:650}
+.fcrow .what{color:var(--muted);font-size:.9em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.range{height:8px;border-radius:4px;background:var(--line);position:relative}
+.range i{position:absolute;top:0;bottom:0;border-radius:4px;background:linear-gradient(90deg,#60a5fa,#fbbf24,#f97316)}
+.sunarc{width:100%;height:auto;display:block}
+.sunrow{display:flex;justify-content:space-between;margin-top:6px;font-size:.92em}
+.sunrow b{display:block;font-size:1.2em}
+.moon{display:flex;align-items:center;gap:14px;margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}
+.indoor{display:flex;gap:18px;align-items:baseline;flex-wrap:wrap}.indoor .big{font-size:2.2em;font-weight:300}
+.sw{display:inline-flex;align-items:center;gap:8px;margin-right:16px;color:var(--muted);font-size:.9em}
+.sw i{width:18px;height:18px;border-radius:6px;border:1px solid var(--line)}
+.status{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:.9em;margin-top:10px}
+.status i{width:9px;height:9px;border-radius:50%;background:var(--good);flex:none}
+.empty{color:var(--muted);text-align:center;padding:30px 0}
+@media (max-width:900px){
+ .dash{grid-template-columns:minmax(0,1fr);padding:14px 14px 96px;gap:12px}
+ .hero,.details,.rain,.sun,.fc,.side{grid-column:1/-1}
+ .hero{grid-template-columns:1fr;padding:20px}
+ .now .ic svg{width:72px;height:72px}.temp{font-size:60px}
+ .clockbox svg{max-width:240px}
+ .fcrow{grid-template-columns:48px 32px 38px minmax(0,1fr) 38px}.fcrow .what{display:none}
+}
+</style>
+<main class="dash">
+ <section class="card hero">
+  <div class="now"><div class="ic" id="heroIcon"></div>
+   <div><div class="temp" id="temp">--</div><div class="desc" id="desc">Loading...</div><div class="hl" id="hl"></div></div></div>
+  <div class="clockbox"><div id="clock"></div><div class="date" id="date"></div></div>
+ </section>
+ <section class="card details"><h3>Right now</h3>
+  <div class="tile"><span class="k">Wind</span><div class="compass"><svg width="30" height="30" viewBox="0 0 30 30"><circle cx="15" cy="15" r="13" fill="none" stroke="var(--line)" stroke-width="2"/><path id="windArrow" d="M15 6 L19 18 L15 15.5 L11 18 Z" fill="var(--blue)"/></svg><span class="v" id="wind">--</span></div></div>
+  <div class="tile"><span class="k">Humidity</span><span class="v" id="humid">--</span><div class="bar"><i id="humidBar" style="width:0"></i></div></div>
+  <div class="tile"><span class="k">Pressure</span><span class="v" id="baro">--</span><span class="k">sea level</span></div>
+  <div class="tile"><span class="k">Visibility</span><span class="v" id="vis">--</span><span class="k" id="clouds"></span></div>
+ </section>
+ <section class="card rain"><h3>Rain &middot; next 15 hours <span id="rainTotal"></span></h3><div id="rainChart"></div></section>
+ <section class="card sun"><h3>Sun &amp; Moon</h3>
+  <svg class="sunarc" viewBox="0 0 300 120" id="sunArc"></svg>
+  <div class="sunrow"><div><span class="muted">Sunrise</span><b id="sunRise">--</b></div><div style="text-align:center"><span class="muted" id="sunEvent">--</span><b id="sunIn" style="color:var(--accent)">--</b></div><div style="text-align:right"><span class="muted">Sunset</span><b id="sunSet">--</b></div></div>
+  <div class="moon"><svg width="44" height="44" viewBox="0 0 44 44" id="moonIcon"></svg><div><b id="moonName">--</b><div class="muted small" id="moonNext"></div></div></div>
+ </section>
+ <section class="card fc"><h3>5-day forecast</h3><div id="fc"></div></section>
+ <div class="side">
+  <section class="card" id="indoorCard" style="display:none"><h3>Indoor <span>BME280</span></h3>
+   <div class="indoor"><span class="big" id="inTemp">--</span><span id="inHum"></span><span class="muted" id="inPres"></span></div></section>
+  <section class="card"><h3>Device</h3>
+   <div><span class="sw"><i id="ledSw"></i>LED</span><span class="sw"><i id="txtSw"></i>Text &amp; accent</span></div>
+   <div class="status"><i id="stDot"></i><span id="stText">--</span></div></section>
+ </div>
+</main>
+<script>
+var cur=null,DIRS={N:0,NE:45,E:90,SE:135,S:180,SW:225,W:270,NW:315};
+var WORDS={CLEAR:'Clear',CLOUDS:'Cloudy',RAIN:'Rain',DRIZZLE:'Drizzle',THUNDERSTORM:'Thunderstorms',SNOW:'Snow',MIST:'Mist',FOG:'Fog',HAZE:'Haze'};
+var DAYS={SUN:'Sun',MON:'Mon',TUE:'Tue',WED:'Wed',THU:'Thu',FRI:'Fri',SAT:'Sat'};
+function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function cityTabs(d){var t=$('cityTabs');if(!t)return;var h='';d.cityNames.forEach(function(n,i){h+='<button class="'+(i==d.cityIndex?'on':'')+'" onclick="setCity('+i+')">'+esc(n)+'</button>';});t.innerHTML=h;}
+function setCity(i){if(cur&&i==cur.cityIndex)return;$('desc').innerText='Loading...';api('/live?action=city&value='+i).then(refresh);}
+function rainChart(d){
+ var pts=d.rain||[],tot=0;pts.forEach(function(p){tot+=p.mm;});$('rainTotal').innerText=pts.length?tot.toFixed(1)+' mm total':'';
+ if(!pts.length){$('rainChart').innerHTML='<div class="empty">No forecast data</div>';return;}
+ var W=Math.max(300,Math.round($('rainChart').clientWidth||760)),Hh=W<500?190:230,l=40,r=10,t=16,b=30,max=Math.max(1,Math.max.apply(null,pts.map(function(p){return p.mm;}))),bw=(W-l-r)/pts.length,o='';
+ var st=max<=2?0.5:(max<=5?1:(max<=10?2:5));max=Math.ceil(max/st)*st;
+ for(var v=0;v<=max+1e-9;v+=st){var y=Hh-b-(Hh-t-b)*v/max;o+='<line x1="'+l+'" x2="'+(W-r)+'" y1="'+y+'" y2="'+y+'" stroke="var(--line)"/><text x="'+(l-8)+'" y="'+(y+4)+'" font-size="12" fill="var(--muted)" text-anchor="end">'+(+v.toFixed(1))+'</text>';}
+ pts.forEach(function(p,i){var x=l+i*bw+bw*.2,w=bw*.6,hh=(Hh-t-b)*p.mm/max,y=Hh-b-hh;
+  if(p.mm>0)o+='<rect x="'+x+'" y="'+y+'" width="'+w+'" height="'+Math.max(hh,3)+'" rx="6" fill="var(--rain)"/><text x="'+(x+w/2)+'" y="'+(y-6)+'" font-size="12" font-weight="600" fill="var(--text)" text-anchor="middle">'+p.mm.toFixed(1)+'</text>';
+  else o+='<rect x="'+x+'" y="'+(Hh-b-3)+'" width="'+w+'" height="3" rx="1.5" fill="var(--line)"/>';
+  o+='<text x="'+(x+w/2)+'" y="'+(Hh-9)+'" font-size="12" fill="var(--muted)" text-anchor="middle">'+esc(p.label)+'</text>';});
+ o+='<text x="'+l+'" y="11" font-size="11" fill="var(--muted)">mm per 3 h</text>';
+ $('rainChart').innerHTML='<svg viewBox="0 0 '+W+' '+Hh+'" style="width:100%;height:auto;display:block">'+o+'</svg>';}
+function toMin(s){return s&&s.length>=5?(+s.slice(0,2))*60+(+s.slice(3,5)):-1;}
+function sunArc(d){var rise=toMin(d.sunRise),set=toMin(d.sunSet),now=d.hour*60+d.minute,cx=150,cy=108,R=92;
+ var o='<path d="M'+(cx-R)+' '+cy+' A'+R+' '+R+' 0 0 1 '+(cx+R)+' '+cy+'" fill="none" stroke="var(--line)" stroke-width="3" stroke-dasharray="4 6"/><line x1="20" x2="280" y1="'+cy+'" y2="'+cy+'" stroke="var(--line)"/>';
+ if(rise>=0&&set>rise&&now>=rise&&now<=set){var f=(now-rise)/(set-rise),a=Math.PI*(1-f),sx=cx+R*Math.cos(a),sy=cy-R*Math.sin(a);
+  o+='<path d="M'+(cx-R)+' '+cy+' A'+R+' '+R+' 0 0 1 '+sx.toFixed(1)+' '+sy.toFixed(1)+'" fill="none" stroke="var(--accent)" stroke-width="3"/><circle cx="'+sx+'" cy="'+sy+'" r="16" fill="#fbbf24" opacity=".25"/><circle cx="'+sx+'" cy="'+sy+'" r="10" fill="#fbbf24"/>';}
+ else o+='<circle cx="'+cx+'" cy="'+(cy-50)+'" r="12" fill="#e8d9a8"/><circle cx="'+(cx+6)+'" cy="'+(cy-54)+'" r="10" fill="var(--card)"/>';
+ $('sunArc').innerHTML=o;}
+// Moon age from a known new moon (6 Jan 2000 18:14 UTC); drawn as a lit fraction
+function moonSvg(f){var r=18,c=22,k=Math.cos(2*Math.PI*f)*r,wax=f<.5,o='<circle cx="22" cy="22" r="20" fill="var(--card2)" stroke="var(--line)"/>';
+ // outer edge: right half while waxing, left half while waning; inner edge: an ellipse (terminator) whose width follows cos(phase)
+ o+='<path d="M'+c+' '+(c-r)+' A'+r+' '+r+' 0 0 '+(wax?1:0)+' '+c+' '+(c+r)+' A'+Math.abs(k).toFixed(2)+' '+r+' 0 0 '+((k>0)==wax?0:1)+' '+c+' '+(c-r)+'Z" fill="#e8d9a8"/>';
+ return o;}
+function moon(){var syn=29.530588853,age=((Date.now()/864e5-10962.7597)%syn+syn)%syn,f=age/syn;
+ $('moonIcon').innerHTML=moonSvg(f);var toFull=f<.5?(.5-f)*syn:(1.5-f)*syn,toNew=(1-f)*syn;
+ $('moonNext').innerText=toFull<toNew?'Full moon in '+Math.round(toFull)+' day'+(Math.round(toFull)==1?'':'s'):'New moon in '+Math.round(toNew)+' day'+(Math.round(toNew)==1?'':'s');}
+function forecast(d){var v=d.forecast.filter(function(x){return x.day;});if(!v.length){$('fc').innerHTML='<div class="empty">No forecast data</div>';return;}
+ var mn=Math.min.apply(null,v.map(function(x){return x.low;})),mx=Math.max.apply(null,v.map(function(x){return x.high;}));if(mx-mn<1)mx=mn+1;var o='';
+ d.forecast.forEach(function(x,i){if(!x.day){o+='<div class="fcrow"><b class="muted">&ndash;</b><span></span><span class="what">No data</span></div>';return;}
+  var a=(x.low-mn)/(mx-mn)*100,b=(x.high-mn)/(mx-mn)*100;
+  o+='<div class="fcrow"><b>'+(i==0?'Today':(DAYS[x.day]||x.day))+'</b>'+iconSvg(iconKind(x.main,''),false)+'<span class="what">'+(WORDS[x.main]||esc(x.main))+'</span><span class="lo">'+Math.round(x.low)+'&deg;</span><div class="range"><i style="left:'+a+'%;right:'+(100-b)+'%"></i></div><span class="hi">'+Math.round(x.high)+'&deg;</span></div>';});
+ $('fc').innerHTML=o;}
+async function refresh(){
+ try{var d=await (await fetch('/api/status')).json();cur=d;cityTabs(d);
+  setAccentFromText([d.textR,d.textG,d.textB]);
+  $('heroIcon').innerHTML=iconSvg(iconKind(d.main,d.weatherDesc),d.night);
+  $('temp').innerHTML=d.temp.toFixed(1)+'<sup>&deg;C</sup>';
+  $('desc').innerText=(d.weatherDesc||'').toLowerCase();
+  $('hl').innerHTML='H '+d.tempMax.toFixed(1)+'&deg; &middot; L '+d.tempMin.toFixed(1)+'&deg; &middot; Feels '+d.feelsLike.toFixed(1)+'&deg;';
+  var txt=document.documentElement.style.getPropertyValue('--accent')?'var(--accent)':'rgb('+d.textR+','+d.textG+','+d.textB+')';
+  $('clock').innerHTML=segClock(d.hour,d.minute,'var(--text)',(d.textR>235&&d.textG>235&&d.textB>235)||(d.textR+d.textG+d.textB<40)?'var(--text)':txt);
+  $('date').innerText=d.dateLong;
+  $('wind').innerHTML=Math.round(d.windSpeed)+' <small>km/h '+esc(d.windDir)+'</small>';
+  $('windArrow').setAttribute('transform','rotate('+(((DIRS[d.windDir]||0)+180)%360)+' 15 15)');
+  $('humid').innerHTML=d.humid+' <small>%</small>';$('humidBar').style.width=Math.min(100,d.humid)+'%';
+  $('baro').innerHTML=d.pressure+' <small>hPa</small>';
+  $('vis').innerHTML=d.visibility+' <small>km</small>';$('clouds').innerText='Clouds '+d.clouds+'%';
+  rainChart(d);sunArc(d);moon();forecast(d);
+  $('sunRise').innerText=d.sunRise||'--';$('sunSet').innerText=d.sunSet||'--';
+  $('sunEvent').innerText=d.sunEvent=='SUNRISE'?'Sunrise in':'Sunset in';$('sunIn').innerText=d.sunDiffMin>=0?Math.floor(d.sunDiffMin/60)+'h '+(d.sunDiffMin%60)+'m':'--';
+  $('moonName').innerText=(d.moonPhase||'').toLowerCase().replace(/^./,function(c){return c.toUpperCase();});
+  if(d.bmeOK){$('indoorCard').style.display='';$('inTemp').innerHTML=d.localTemp.toFixed(1)+'&deg;';$('inHum').innerText=Math.round(d.localHumid)+'% humidity';$('inPres').innerText=Math.round(d.localPressure)+' hPa';}
+  $('ledSw').style.background='rgb('+d.ledR+','+d.ledG+','+d.ledB+')';$('txtSw').style.background='rgb('+d.textR+','+d.textG+','+d.textB+')';
+  $('stDot').style.background=d.lastFetchOK?'var(--good)':'var(--bad)';$('brandDot').className=d.lastFetchOK?'':'bad';
+  $('stText').innerText=(d.lastFetchOK?'Updated '+d.ageMin+' min ago':'Last update failed')+' · '+d.provider+' · Wi-Fi '+d.rssi+' dBm';
+ }catch(e){$('stText').innerText='Connection lost - retrying';$('stDot').style.background='var(--bad)';}
+}
+document.addEventListener('themechange',function(){if(cur){refresh();}});
+var rz;window.addEventListener('resize',function(){clearTimeout(rz);rz=setTimeout(function(){if(cur)rainChart(cur);},150);});
+refresh();setInterval(refresh,7000);
+</script>
+)rawliteral";
+
+const char SETTINGS_BODY[] PROGMEM = R"rawliteral(
+<form class="page" id="settingsForm" onsubmit="return saveSettings(this)" autocomplete="off">
+<h1>Settings</h1>
+<section class="card"><h3>Cities &amp; weather source</h3>
+ <div class="field"><span>City 1</span><div class="row2"><input type="text" name="c1" id="c1" placeholder="City,CountryCode"><select name="provider1" id="provider1"></select></div></div>
+ <div class="field"><span>City 2</span><div class="row2"><input type="text" name="c2" id="c2" placeholder="City,CountryCode"><select name="provider2" id="provider2"></select></div></div>
+ <div class="field"><span>City 3</span><div class="row2"><input type="text" name="c3" id="c3" placeholder="City,CountryCode"><select name="provider3" id="provider3"></select></div></div>
+ <p class="note">Write cities as <b>City,CountryCode</b>, e.g. Amsterdam,NL. Open-Meteo needs no key for the weather itself; the API key below is still used to look up the city's coordinates. The KNMI option uses KNMI's 2&nbsp;km Netherlands model, topped up with ECMWF. Renaming a city starts a fresh history for it (the old log is kept on the SD card).</p>
+</section>
+<section class="card"><h3>OpenWeatherMap API keys</h3>
+ <div class="field"><span>API key</span><input type="text" name="api" id="api" spellcheck="false"></div>
+ <div class="field" style="margin:0"><span>Backup API key (optional, used if the main key is rejected or rate-limited)</span><input type="text" name="apiBackup" id="apiBackup" spellcheck="false"></div>
+</section>
+<section class="card"><h3>Display</h3>
+ <div class="field"><span>Screen theme</span><select name="theme" id="theme"><option value="2">Auto &ndash; dark from sunset to sunrise</option><option value="0">Light</option><option value="1">Dark</option></select></div>
+ <label class="switch"><div>Upcoming rain on the home screen<small>Bars for the next 15 hours</small></div><input type="checkbox" name="rainPrevOn" id="rainPrevOn" value="1"></label>
+ <label class="switch"><div>Home screen animation<small>Shown instead of the rain bars when those are off</small></div><input type="checkbox" name="animOn" id="animOn" value="1"></label>
+ <div class="label" style="margin-top:14px">Brightness <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">&middot; applies right away, saved automatically</span></div>
+ <div class="slider"><span>Screen</span><input type="range" id="screenSlider" min="0" max="100"><b id="screenVal"></b></div>
+ <div class="slider"><span>LED</span><input type="range" id="ledSlider" min="0" max="100"><b id="ledVal"></b></div>
+</section>
+<section class="card"><h3>LED color <span>applies right away</span></h3>
+ <div class="seg" id="modeSeg"><button type="button" data-m="0">Weather sync</button><button type="button" data-m="1">Custom color</button></div>
+ <div id="colorSection" style="margin-top:14px">
+  <div style="display:flex;gap:14px;align-items:center"><div class="swatch" id="swatch"></div><div class="note" style="margin:0">Orange = clear, white = clouds, blue = rain, purple = thunder, cyan = snow in weather sync mode.</div></div>
+  <div class="slider"><span>Hue</span><input type="range" id="hueSlider" min="0" max="360"><b id="hueVal"></b></div>
+  <div class="slider"><span>Saturation</span><input type="range" id="satSlider" min="0" max="100"><b id="satVal"></b></div>
+  <div class="slider"><span>Lightness</span><input type="range" id="valSlider" min="0" max="100"><b id="valVal"></b></div>
+  <button type="button" class="btn" onclick="saveColor(this)">Save as default</button>
+ </div>
+</section>
+<section class="card"><h3>Text &amp; accent color <span>applies right away</span></h3>
+ <div style="display:flex;gap:14px;align-items:center"><div class="swatch" id="textSwatch"></div><div class="note" style="margin:0">Colors the clock minutes and IP address on the display. When it's a clear color it's also used as the accent for highlights (page dots, sliders, buttons) on the display and here.</div></div>
+ <div class="slider"><span>Hue</span><input type="range" id="textHueSlider" min="0" max="360"><b id="textHueVal"></b></div>
+ <div class="slider"><span>Saturation</span><input type="range" id="textSatSlider" min="0" max="100"><b id="textSatVal"></b></div>
+ <div class="slider"><span>Lightness</span><input type="range" id="textValSlider" min="0" max="100"><b id="textValVal"></b></div>
+ <button type="button" class="btn" onclick="saveTextColor(this)">Save as default</button>
+</section>
+<div class="savebar"><span id="saveMsg">Cities, keys and display options are saved with this button.</span><button class="btn primary" type="submit">Save settings</button></div>
+</form>
+<script>
+var PROV=['OpenWeatherMap','Open-Meteo','Open-Meteo KNMI (NL)'],lastSent=0;
+function hsv(h,s,v){s/=100;v/=100;var f=function(n){var k=(n+h/60)%6;return v-v*s*Math.max(0,Math.min(k,4-k,1));};return [Math.round(f(5)*255),Math.round(f(3)*255),Math.round(f(1)*255)];}
+function liveSend(a,v,force){var n=Date.now();if(!force&&n-lastSent<60)return;lastSent=n;api('/live?action='+a+'&value='+v);}
+function flash(b,t){var o=b.innerText;b.innerText=t;setTimeout(function(){b.innerText=o;},1400);}
+function saveColor(b){api('/saveColor').then(function(){flash(b,'Saved');});}
+function saveTextColor(b){api('/saveTextColor').then(function(){flash(b,'Saved');});}
+function saveSettings(f){var m=$('saveMsg');m.innerText='Saving...';
+ api('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(new FormData(f))})
+ .then(function(r){return r.text().then(function(t){m.innerText=r.ok?'Saved - the display is fetching fresh weather.':t;});}).catch(function(e){m.innerText='Save failed: '+e;});return false;}
+function setMode(m,send){document.querySelectorAll('#modeSeg button').forEach(function(b){b.classList.toggle('on',b.dataset.m==m);});$('colorSection').style.display=m==1?'':'none';if(send)api('/live?action=mode&value='+m);}
+function paint(){var c=hsv(+$('hueSlider').value,+$('satSlider').value,+$('valSlider').value);$('swatch').style.background='rgb('+c+')';
+ var t=hsv(+$('textHueSlider').value,+$('textSatSlider').value,+$('textValSlider').value);$('textSwatch').style.background='rgb('+t+')';setAccentFromText(t);
+ var rb='linear-gradient(to right,'+[0,60,120,180,240,300,360].map(function(h){return 'hsl('+h+',100%,50%)';}).join(',')+')';$('hueSlider').style.background=rb;$('textHueSlider').style.background=rb;}
+function bind(id,action,valId,suffix){var s=$(id);s.oninput=function(){$(valId).innerText=s.value+(suffix||'');paint();liveSend(action,s.value,false);};s.onchange=function(){liveSend(action,s.value,true);};}
+fetch('/api/settings').then(function(r){return r.json();}).then(function(d){
+ for(var i=1;i<=3;i++){$('c'+i).value=d.cities[i-1];var sel=$('provider'+i);sel.innerHTML=PROV.map(function(p,k){return '<option value="'+k+'">'+p+'</option>';}).join('');sel.value=d.providers[i-1];}
+ $('api').value=d.api;$('apiBackup').value=d.apiBackup;$('theme').value=d.theme;$('animOn').checked=d.animOn;$('rainPrevOn').checked=d.rainPrevOn;
+ var set=function(id,v,suffix){$(id+'Slider').value=v;$(id+'Val').innerText=v+(suffix||'');};
+ set('screen',d.screenPct,'%');set('led',d.ledPct,'%');set('hue',d.hue);set('sat',d.satPct,'%');set('val',d.valPct,'%');
+ set('textHue',d.textHue);set('textSat',d.textSatPct,'%');set('textVal',d.textValPct,'%');
+ setMode(d.useCustom?1:0,false);paint();
+});
+bind('screenSlider','screenBright','screenVal','%');bind('ledSlider','ledBright','ledVal','%');
+bind('hueSlider','hue','hueVal');bind('satSlider','sat','satVal','%');bind('valSlider','val','valVal','%');
+bind('textHueSlider','textHue','textHueVal');bind('textSatSlider','textSat','textSatVal','%');bind('textValSlider','textVal','textValVal','%');
+document.querySelectorAll('#modeSeg button').forEach(function(b){b.onclick=function(){setMode(b.dataset.m,true);};});
+</script>
+)rawliteral";
+
+const char DEBUG_BODY[] PROGMEM = R"rawliteral(
+<style>
+.con{background:#0b0f14;color:#7ee787;font-family:ui-monospace,Menlo,Consolas,'Courier New',monospace;border-radius:12px;padding:12px 14px;border:1px solid var(--line)}
+.drow{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid var(--line);font-size:.93em}
+.drow:last-child{border:0}.drow span:last-child{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:600}
+.hot{color:#d29922}.bad{color:var(--bad)}.ok{color:var(--good)}
+#log{height:340px;overflow-y:auto;font-size:.84em;white-space:pre-wrap}
+</style>
+<main class="page"><h1>Debug</h1>
+<section class="card"><h3>Touch &amp; system <span>live</span></h3>
+ <div class="drow"><span>Touch pressed (raw)</span><span id="pressed">--</span></div>
+ <div class="drow"><span>Raw X / Y</span><span id="xy">--</span></div>
+ <div class="drow"><span>isTouched (internal)</span><span id="isTouched">--</span></div>
+ <div class="drow"><span>Held for</span><span id="held">--</span></div>
+ <div class="drow"><span>Stuck-touch auto-resets</span><span id="stuck">--</span></div>
+ <div class="drow"><span>Display page</span><span id="mode">--</span></div>
+ <div class="drow"><span>Uptime</span><span id="uptime">--</span></div>
+ <div class="drow"><span>Free heap</span><span id="heap">--</span></div>
+ <div class="drow"><span>WiFi</span><span id="wifi">--</span></div>
+</section>
+<section class="card"><h3>Event log <span>newest first</span></h3><div class="con" id="log">Loading...</div></section>
+</main>
+<script>
+var PAGES=['Home','Atmosphere','Precipitation','Sun & Moon','System','Forecast','History'];
+async function refresh(){
+ try{var d=await (await fetch('/api/debug')).json();
+  var p=$('pressed');p.innerText=d.pressed;p.className=d.pressed?'hot':'ok';
+  $('xy').innerText=d.rawX+', '+d.rawY;
+  var it=$('isTouched');it.innerText=d.isTouched;it.className=d.isTouched?'hot':'ok';
+  $('held').innerText=d.isTouched?(d.msHeld+' ms'):'-';
+  var sr=$('stuck');sr.innerText=d.stuckResets;sr.className=d.stuckResets>0?'bad':'ok';
+  $('mode').innerText=d.displayMode+' ('+(PAGES[d.displayMode]||'?')+')';
+  var u=d.uptimeSec;$('uptime').innerText=(u>=86400?Math.floor(u/86400)+'d ':'')+Math.floor(u%86400/3600)+'h '+Math.floor(u%3600/60)+'m '+(u%60)+'s';
+  $('heap').innerText=(d.freeHeap/1024).toFixed(1)+' KB';
+  var w=$('wifi');w.innerText=d.wifiConnected?'connected':'DISCONNECTED';w.className=d.wifiConnected?'ok':'bad';
+  $('log').innerText=d.log.join('\n');
+ }catch(e){$('log').innerText='connection lost: '+e;}
+}
+refresh();setInterval(refresh,400);
+</script>
 )rawliteral";

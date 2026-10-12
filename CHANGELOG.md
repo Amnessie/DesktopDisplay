@@ -7,6 +7,8 @@ All notable changes to this project are listed here.
 ### Added
 - Display themes: Light, Dark and Auto (dark between sunset and sunrise for the city on screen). Switch with the THEME button on the System page or on the web Settings page
 - Redesigned display: weather icons, a new home screen with a clock card, detail tiles and upcoming-rain bars, bold text, and anti-aliased cards on every page
+- Your text color is used as the accent for highlights (page dots, sliders, buttons) on the display and the web pages, when it is a clear, readable color
+- Redesigned web interface for desktop and phone, with light/dark/auto themes: a new dashboard (weather icons, rain chart, sun arc, moon phase, forecast range bars, indoor sensor and device status), card-based Settings, and History and Debug in the same style. Shared stylesheet/script are cached by the browser
 
 ### Fixed
 - A failed weather refresh no longer blanks the screen (0.0 °C) until the next attempt; the last good data stays up, with the status dot turning red
@@ -25,6 +27,8 @@ All notable changes to this project are listed here.
 - Endpoints that change settings or history now require the `X-Requested-With: DesktopDisplay` header, so other websites can't change them through your browser
 
 ### Changed
+- The moon photo on the Sun & Moon page is cropped to a smooth circle; the dark theme's inner cards are slightly darker
+- The Settings page loads its values from the new `/api/settings` endpoint
 - Requires TFT_eSPI 2.5 or newer (anti-aliased drawing functions)
 - Atmosphere page shows label and value on one line; forecast rows show an icon and a temperature range bar
 - Opening the device's address now shows the Live Dashboard; Settings moved to `/settings`
