@@ -121,8 +121,8 @@ LED weather colors: orange = clear, white = clouds, blue = rain, purple = thunde
 
 | Address | What's there |
 |---|---|
-| `/` | Settings |
-| `/dashboard` | Live dashboard |
+| `/` | Live dashboard (start page; `/dashboard` also still works) |
+| `/settings` | Settings |
 | `/history` | History charts, export, import, backfill |
 | `/debug` | Debug console |
 

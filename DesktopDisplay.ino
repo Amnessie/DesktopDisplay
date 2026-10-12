@@ -42,6 +42,7 @@
 SPIClass sdSPI(HSPI); // dedicated bus for the SD card only - genuinely separate hardware peripheral from the display/touch's VSPI
 bool sdOK = false;
 void handleHistoryPage(); // defined at the very end of the sketch (see [HISTORY WEB PAGE])
+extern const char SEG_CLOCK_JS[]; // dashboard 7-segment clock script, also at the end of the sketch
 // NOTE: history is now stored per city (/hist_c0.csv, /hist_c1.csv,
 // /hist_c2.csv) - see the [PER-CITY HISTORY] section further down.
 
@@ -297,7 +298,7 @@ const int HOME_ARROW_Y        = 25;
 const int STATUS_DOT_X        = 270;
 const int STATUS_DOT_Y        = 395; // NEW: raised to sit level with the "NEXT RAIN" title, was overlapping the rain preview's rightmost point down at 450
 const int STATUS_DOT_R        = 5;
-const int NAV_DOT_Y           = 474;
+const int NAV_DOT_Y           = 475; // cards end at y=466, so the dots no longer touch their border
 const int CITY_DOT_Y          = 44;
 const int UPDATE_BADGE_X      = 270;
 const int UPDATE_BADGE_Y      = 6;
@@ -1023,7 +1024,7 @@ String buildProviderSelect(String fieldName, int currentProvider) {
 
 // --- [SMARTER WEB PORTAL FUNCTIONS] ---
 // UPDATE 2: Added API key input to HTML and Saving Process
-void handleRoot() {
+void handleSettingsPage() {
   // NEW: current values, converted to the 0-100% scale the sliders use
   int screenPct = map(globalBrightness, 10, 255, 0, 100);
   int ledPct    = map(ledBrightness, 0, 255, 0, 100);
@@ -1279,8 +1280,8 @@ void handleSaveColor() {
 // NEW: small nav bar shared by all three web pages, so they feel like one site
 String navBar(String current) {
   String html = "<div style='text-align:center;margin-bottom:15px;font-size:0.95em;'>";
-  html += "<a href='/' style='margin:0 10px;" + String(current == "settings" ? "font-weight:bold;text-decoration:underline;" : "") + "'>Settings</a>";
-  html += "<a href='/dashboard' style='margin:0 10px;" + String(current == "dashboard" ? "font-weight:bold;text-decoration:underline;" : "") + "'>Live Dashboard</a>";
+  html += "<a href='/' style='margin:0 10px;" + String(current == "dashboard" ? "font-weight:bold;text-decoration:underline;" : "") + "'>Live Dashboard</a>";
+  html += "<a href='/settings' style='margin:0 10px;" + String(current == "settings" ? "font-weight:bold;text-decoration:underline;" : "") + "'>Settings</a>";
   html += "<a href='/history' style='margin:0 10px;" + String(current == "history" ? "font-weight:bold;text-decoration:underline;" : "") + "'>History</a>";
   html += "<a href='/debug' style='margin:0 10px;" + String(current == "debug" ? "font-weight:bold;text-decoration:underline;" : "") + "'>Debug</a>";
   html += "</div>";
@@ -1431,7 +1432,7 @@ void handleDashboardPage() {
   html += ".card{background:#fff;border-radius:15px;border:2px solid #4a5a7a;padding:20px 10px;margin-top:15px;}";
   html += ".cityRow{display:flex;align-items:center;justify-content:center;gap:14px;}";
   html += ".cityRow button{border:none;background:none;font-size:1.4em;color:#4a5a7a;cursor:pointer;padding:0 8px;}";
-  html += ".clock{font-family:'Courier New',monospace;font-weight:bold;font-size:3em;letter-spacing:2px;}";
+  html += ".clock{margin:14px 0 6px;min-height:70px;} .clock svg{display:block;margin:0 auto;max-width:100%;}";
   html += ".temp{font-size:2.2em;}";
   html += ".grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;text-align:left;margin-top:15px;font-size:0.95em;}";
   html += ".swatchRow{display:flex;justify-content:center;gap:20px;margin-top:12px;}";
@@ -1483,6 +1484,7 @@ void handleDashboardPage() {
   html += "</div>";
 
   html += "<script>";
+  html += FPSTR(SEG_CLOCK_JS); // segClock(): 7-segment digits like the device's clock
   html += "var ctx=document.getElementById('rainChart').getContext('2d');";
   html += "var curData=null;";
   html += "function cityNav(delta){";
@@ -1512,8 +1514,10 @@ void handleDashboardPage() {
   html += "document.getElementById('desc').innerText=d.weatherDesc;";
   html += "document.getElementById('temp').innerText=d.temp.toFixed(1)+'\\u00B0C';";
   html += "document.getElementById('minmax').innerText='L:'+d.tempMin.toFixed(1)+'  H:'+d.tempMax.toFixed(1);";
-  html += "document.getElementById('clock').innerText=String(d.hour).padStart(2,'0')+':'+String(d.minute).padStart(2,'0');";
-  html += "document.getElementById('clock').style.color='rgb('+d.textR+','+d.textG+','+d.textB+')';";
+  // Hour black, minutes in the text color - same as the device (incl. its
+  // near-white -> black fallback, since the card behind it is white).
+  html += "var minCol=(d.textR>235&&d.textG>235&&d.textB>235)?'#000':'rgb('+d.textR+','+d.textG+','+d.textB+')';";
+  html += "document.getElementById('clock').innerHTML=segClock(d.hour,d.minute,minCol);";
   html += "document.getElementById('date').innerText=d.dateStr;";
   html += "document.getElementById('feels').innerText=d.feelsLike.toFixed(1);";
   html += "document.getElementById('wind').innerText=d.windSpeed.toFixed(1)+' '+d.windDir;";
@@ -2592,18 +2596,24 @@ void drawPageBackground(int mode) {
     tft.drawString(">", HOME_ARROW_RIGHT_X, HOME_ARROW_Y, 4);
     tft.setTextColor(0x4228); tft.drawString(weatherDesc, 160, 60, 2);
     tft.setTextColor(TFT_BLACK);
-    String tNum = String(tempnum, 1); 
-    tft.drawString(tNum, 160, 110, 7);
-    int nW = tft.textWidth(tNum, 7); tft.setTextDatum(TL_DATUM);
-    tft.drawString("o", 160 + (nW/2) + 2, 85, 2);
-    tft.drawString("C", 160 + (nW/2) + 12, 95, 4);
+    // Center the number AND its unit together - centering only the number
+    // left the whole "14.6 °C" group sitting visibly right of center.
+    String tNum = String(tempnum, 1);
+    int nW = tft.textWidth(tNum, 7);
+    int groupW = nW + 12 + tft.textWidth("C", 4); // number + gap/degree mark + "C"
+    int tx = 160 - groupW / 2;
+    tft.setTextDatum(ML_DATUM);
+    tft.drawString(tNum, tx, 110, 7);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString("o", tx + nW + 2, 85, 2);
+    tft.drawString("C", tx + nW + 12, 95, 4);
     tft.setTextDatum(CC_DATUM);
     tft.drawString("L:" + String(tempMin, 1) + "  H:" + String(tempMax, 1), 160, 145, 2);
-    tft.fillRoundRect(15, 165, 290, 305, 15, TFT_WHITE);
-    tft.drawRoundRect(15, 165, 290, 305, 15, 0x4228);
+    tft.fillRoundRect(15, 165, 290, 302, 15, TFT_WHITE);
+    tft.drawRoundRect(15, 165, 290, 302, 15, 0x4228);
   } else {
-    tft.fillRoundRect(15, 70, 290, 400, 15, TFT_WHITE);
-    tft.drawRoundRect(15, 70, 290, 400, 15, 0x4228);
+    tft.fillRoundRect(15, 70, 290, 397, 15, TFT_WHITE);
+    tft.drawRoundRect(15, 70, 290, 397, 15, 0x4228);
     String titles[] = {"", "ATMOSPHERIC LOG", "PRECIPITATION", "SOLAR & LUNAR", "SYSTEM INFO", "5-DAY FORECAST", "7-DAY HISTORY"};
     tft.drawString(titles[mode], 160, 35, 4);
   }
@@ -3368,12 +3378,13 @@ void setup() {
   // The WebServer only keeps request headers it's told about up front
   const char* collectedHeaders[] = { APP_HEADER_NAME, "If-None-Match" };
   server.collectHeaders(collectedHeaders, 2);
-  server.on("/", handleRoot);
+  server.on("/", handleDashboardPage);         // the live dashboard is the start page
+  server.on("/settings", handleSettingsPage);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/live", handleLive);           // NEW: live slider updates (color, brightness, mode)
   server.on("/saveColor", handleSaveColor); // NEW: persists the current custom color as the boot default
   server.on("/saveTextColor", handleSaveTextColor); // NEW: persists the current text color as the boot default
-  server.on("/dashboard", handleDashboardPage); // NEW: live-mirroring dashboard
+  server.on("/dashboard", handleDashboardPage); // old address, kept so existing bookmarks still work
   server.on("/api/status", handleApiStatus);    // NEW: JSON feed for the dashboard
   server.on("/debug", handleDebugPage);         // NEW: live touch/system debug console
   server.on("/api/debug", handleApiDebug);      // NEW: JSON feed for the debug console
@@ -4138,3 +4149,24 @@ void handleHistoryPage() {
 }
 
 #endif // USE_SD_HISTORY
+
+// --- [DASHBOARD 7-SEGMENT CLOCK] ---
+// Draws the time as SVG 7-segment digits, styled after TFT_eSPI's Font 7 that
+// the device's own clock uses (bevelled segments with small gaps). Kept down
+// here with the history page for the same reason: quote-heavy JavaScript
+// confuses the Arduino IDE's prototype generator for any C++ after it.
+const char SEG_CLOCK_JS[] PROGMEM = R"rawliteral(
+var SEG=(function(){var T=11,h=T/2,G=1.3,W=70,L=h,R=W-h,TP=h,M=50,B=100-h;
+function H(y,a,b){a+=G;b-=G;return [[a,y],[a+h,y-h],[b-h,y-h],[b,y],[b-h,y+h],[a+h,y+h]];}
+function V(x,a,b){a+=G;b-=G;return [[x,a],[x+h,a+h],[x+h,b-h],[x,b],[x-h,b-h],[x-h,a+h]];}
+return {a:H(TP,L,R),g:H(M,L,R),d:H(B,L,R),f:V(L,TP,M),b:V(R,TP,M),e:V(L,M,B),c:V(R,M,B)};})();
+var DIG=['abcdef','bc','abdeg','abcdg','bcfg','acdfg','acdefg','abc','abcdefg','abcdfg'];
+function segDigit(d,x,col){return DIG[d].split('').map(s=>'<polygon fill="'+col+'" points="'+SEG[s].map(p=>(p[0]+x)+','+p[1]).join(' ')+'"/>').join('');}
+function segClock(hh,mm,minCol){
+  var hs=String(hh).padStart(2,'0'),ms=String(mm).padStart(2,'0'),blk='#000',o='',x=0;
+  o+=segDigit(+hs[0],x,blk);x+=82;o+=segDigit(+hs[1],x,blk);x+=70+24;
+  o+='<rect x="'+x+'" y="25" width="12" height="12" rx="2" fill="'+blk+'"/><rect x="'+x+'" y="63" width="12" height="12" rx="2" fill="'+blk+'"/>';x+=12+24;
+  o+=segDigit(+ms[0],x,minCol);x+=82;o+=segDigit(+ms[1],x,minCol);x+=70;
+  return '<svg viewBox="-2 -2 '+(x+4)+' 104" height="70" role="img" aria-label="'+hs+':'+ms+'">'+o+'</svg>';
+}
+)rawliteral";
