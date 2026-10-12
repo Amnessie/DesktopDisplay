@@ -219,6 +219,22 @@ String weatherDesc, mainWeather, windDir, sunRise, sunSet;
 int Anim = 0;
 bool showAnimation = true; // NEW: toggle for the home-page animation, set via the web portal
 bool showRainPreview = true; // NEW: toggle for the Home page's compact upcoming-rain preview, shares the same on-screen space as the animation (see drawPageHome)
+
+// Rain outlook for the next 2 hours and the pressure trend, for the city on
+// screen (see [RAIN NOWCAST + PRESSURE TREND]).
+const int NOW_STEPS_MAX = 25;
+float nowMm[NOW_STEPS_MAX];            // rain intensity per step, mm/h
+String nowLabel[NOW_STEPS_MAX];        // "HH:MM", local time of the city
+int nowCount = 0, nowStepMin = 5, nowCity = -1, nowFirst = 0, nowStartIdx = -1;
+bool nowRadar = false, nowValid = false, nowRainingNow = false;
+float nowMaxMm = 0;
+String nowMsg = "", nowSource = "", nowLastError = "";
+unsigned long nowFetchedAt = 0, nowNextFetch = 0, nowVersion = 0;
+float pTrendRate = 0;                  // hPa per 3 hours
+int pTrendLevel = 0, pTrendCity = -1;  // -3..3 (falling very fast .. rising very fast)
+unsigned long pTrendFetchedAt = 0, pTrendNextFetch = 0, pTrendVersion = 0;
+String pTrendLastError = "";
+bool rainLedAlert = true;              // web setting: pulse the LED when rain is coming
 unsigned long AprevTime = 0, weatherUpdateTimer = 0;
 time_t prevDisplay = 0, sysRise = 0, sysSet = 0;
 int displayMode = 0, drawnMode = -1;
@@ -1079,6 +1095,275 @@ void checkWifiHealth() {
   wifiWasConnected = isConnected;
 }
 
+// --- [RAIN NOWCAST + PRESSURE TREND] ---
+// Short-term rain (next 2 hours) and the 3-hour pressure tendency for the city
+// on screen. Both follow the same rules: a message is only shown when the data
+// clearly supports it, and it disappears when the data gets old - showing
+// nothing beats showing something wrong.
+//
+// Rain: Buienradar's radar-based forecast for the Netherlands/Belgium (5-min
+// steps, refreshed every 5 minutes; mm/h = 10^((value-109)/32), value 77 =
+// 0.1 mm/h per their documentation). Elsewhere, or if Buienradar can't be
+// reached, Open-Meteo's 15-minute model forecast - labelled as "forecast".
+
+bool inBuienradarArea(double lat, double lon) { return lat > 49.4 && lat < 54.0 && lon > 2.4 && lon < 7.5; }
+
+// Parses Buienradar's "value|HH:MM" lines into nowMm/nowLabel. Returns the step count.
+int parseRainText(const String &body) {
+  int n = 0, from = 0;
+  while (n < NOW_STEPS_MAX && from < (int)body.length()) {
+    int nl = body.indexOf('\n', from);
+    if (nl < 0) nl = body.length();
+    String line = body.substring(from, nl);
+    from = nl + 1;
+    line.trim();
+    int bar = line.indexOf('|');
+    if (bar <= 0) continue;
+    String v = line.substring(0, bar); v.replace(",", ".");
+    String t = line.substring(bar + 1); t.trim();
+    if (t.length() < 5 || t[2] != ':') continue;
+    float val = v.toFloat();
+    nowMm[n] = val <= 0 ? 0 : pow(10.0, (val - 109.0) / 32.0);
+    nowLabel[n] = t.substring(0, 5);
+    n++;
+  }
+  return n;
+}
+
+bool fetchNowcast(int city) {
+  double lat, lon;
+  if (!getCityCoords(city, lat, lon)) { nowLastError = "no coordinates for the city"; return false; }
+
+  if (inBuienradarArea(lat, lon)) {
+    // Buienradar has used two hostnames for this feed over the years
+    const char *bases[] = {"https://gps.buienradar.nl/getrr.php", "https://gpsgadget.buienradar.nl/data/raintext"};
+    for (const char *base : bases) {
+      String url = String(base) + "?lat=" + String(lat, 2) + "&lon=" + String(lon, 2);
+      HTTPClient http;
+      http.setTimeout(6000);
+      http.begin(url);
+      int code = http.GET();
+      if (code == HTTP_CODE_OK) {
+        String body = http.getString();
+        http.end();
+        int n = parseRainText(body);
+        if (n >= 6) {
+          nowCount = n; nowStepMin = 5; nowRadar = true;
+          nowSource = "Buienradar radar (" + url.substring(8, url.indexOf('/', 8)) + ")";
+          nowLastError = "";
+          return true;
+        }
+        nowLastError = "Buienradar: unexpected reply (" + String(n) + " steps)";
+      } else {
+        http.end();
+        nowLastError = "Buienradar HTTP " + String(code);
+      }
+    }
+  }
+
+  // Fallback / outside NL-BE: Open-Meteo 15-minute model forecast (mm per 15 min)
+  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) + "&longitude=" + String(lon, 4)
+    + "&minutely_15=precipitation&forecast_minutely_15=9&timezone=auto";
+  HTTPClient http;
+  http.setTimeout(6000);
+  http.begin(url);
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) { http.end(); nowLastError += String(nowLastError.length() ? "; " : "") + "Open-Meteo HTTP " + String(code); return false; }
+  String payload = http.getString();
+  http.end();
+  DynamicJsonDocument doc(4096);
+  if (deserializeJson(doc, payload)) { nowLastError = "Open-Meteo: bad JSON"; return false; }
+  JsonArray t = doc["minutely_15"]["time"], p = doc["minutely_15"]["precipitation"];
+  int n = 0;
+  for (int i = 0; i < (int)t.size() && i < (int)p.size() && n < NOW_STEPS_MAX; i++) {
+    if (p[i].isNull()) continue;
+    nowMm[n] = p[i].as<float>() * 4.0f; // mm per 15 min -> mm/h
+    nowLabel[n] = t[i].as<String>().substring(11, 16);
+    n++;
+  }
+  if (n < 4) { nowLastError = "Open-Meteo: no 15-minute data here"; return false; }
+  nowCount = n; nowStepMin = 15; nowRadar = false;
+  nowSource = "Open-Meteo 15-min forecast";
+  return true;
+}
+
+// Minutes from now (local time of the city on screen) until a "HH:MM" label;
+// negative if it's in the past. Handles midnight.
+int minutesUntil(const String &hhmm) {
+  int m = timeStrToMinutes(hhmm);
+  if (m < 0) return 9999;
+  time_t lt = now() + tzOffsetSec[currentCity];
+  int cur = hour(lt) * 60 + minute(lt);
+  return ((m - cur + 1440 + 720) % 1440) - 720;
+}
+
+// Turns the raw steps into the outlook shown everywhere (display, web, LED).
+// Rules: steps under 0.1 mm/h count as dry (radar noise and mist); rain only
+// "starts" when two steps in a row are wet (no single-speckle alarms), and
+// only "stops" when two steps in a row are dry.
+void analyzeNowcast() {
+  unsigned long maxAge = (nowRadar ? 15UL : 30UL) * 60000UL;
+  nowValid = nowCount >= 4 && nowCity == currentCity && nowFetchedAt != 0
+             && millis() - nowFetchedAt < maxAge && timeStatus() != timeNotSet;
+  nowMsg = ""; nowStartIdx = -1; nowRainingNow = false; nowMaxMm = 0; nowFirst = 0;
+  if (!nowValid) return;
+
+  // Skip steps that are already in the past
+  while (nowFirst < nowCount - 1 && minutesUntil(nowLabel[nowFirst]) < -nowStepMin) nowFirst++;
+  if (nowCount - nowFirst < 4) { nowValid = false; return; }
+
+  const float WET = 0.1f;
+  auto wet = [&](int i) { return i < nowCount && nowMm[i] >= WET; };
+  for (int i = nowFirst; i < nowCount; i++) nowMaxMm = max(nowMaxMm, nowMm[i]);
+  nowRainingNow = wet(nowFirst) && (wet(nowFirst + 1) || nowMm[nowFirst] >= 0.5f);
+
+  if (nowRainingNow) {
+    int stop = -1;
+    for (int i = nowFirst + 1; i < nowCount - 1; i++) if (!wet(i) && !wet(i + 1)) { stop = i; break; }
+    nowMsg = stop < 0 ? String("Rain for the next 2 hours") : "Rain stops around " + nowLabel[stop];
+  } else {
+    for (int i = nowFirst + 1; i < nowCount - 1; i++) if (wet(i) && wet(i + 1)) { nowStartIdx = i; break; }
+    nowMsg = nowStartIdx < 0 ? String("Dry for the next 2 hours") : "Rain from " + nowLabel[nowStartIdx];
+  }
+  if (nowRainingNow || nowStartIdx >= 0) nowMsg += nowMaxMm < 1.0f ? ", light" : (nowMaxMm < 4.0f ? ", moderate" : ", heavy");
+}
+
+// --- LED rain alert: two slow "breaths" towards blue, once per rain spell.
+unsigned long ledPulseStart = 0;
+bool ledPulsing = false;
+bool rainAlertArmed = true;
+const unsigned long LED_PULSE_MS = 2600; // one slow breath
+
+void startLedPulse() { ledPulsing = true; ledPulseStart = millis(); }
+
+void ledPulseLoop() {
+  if (!ledPulsing) return;
+  unsigned long t = millis() - ledPulseStart;
+  if (t >= 2 * LED_PULSE_MS) { ledPulsing = false; setWeatherLED(mainWeather); return; }
+  float k = 0.5f - 0.5f * cosf((t % LED_PULSE_MS) * 2.0f * PI / LED_PULSE_MS); // 0 -> 1 -> 0
+  int r = currentLedR + (int)((0 - currentLedR) * k);
+  int g = currentLedG + (int)((90 - currentLedG) * k);
+  int b = currentLedB + (int)((255 - currentLedB) * k);
+  int val = max(ledBrightness, 120); // stays visible even when the LED is dimmed right down
+  analogWrite(LED_R, 255 - ((r * val) / 255));
+  analogWrite(LED_G, 255 - ((g * val) / 255));
+  analogWrite(LED_B, 255 - ((b * val) / 255));
+}
+
+// Fires once when rain is expected within 30 minutes. It only re-arms after
+// the outlook has been clear (no rain within 45 minutes, not raining) again,
+// so a forecast that wobbles around the 30-minute mark can't pulse repeatedly.
+void checkRainAlert() {
+  if (!nowValid) return;
+  int mins = (!nowRainingNow && nowStartIdx >= 0) ? minutesUntil(nowLabel[nowStartIdx]) : -1;
+  bool soon = mins >= 0 && mins <= 30;
+  if (soon && rainAlertArmed) {
+    rainAlertArmed = false;
+    logDebug("RAIN ALERT: " + nowMsg + (rainLedAlert ? " (LED pulse)" : ""));
+    if (rainLedAlert) startLedPulse();
+  }
+  if (!nowRainingNow && (mins < 0 || mins > 45)) rainAlertArmed = true;
+}
+
+// --- Pressure trend (Open-Meteo hourly sea-level pressure, same source for every city)
+bool fetchPressureTrend(int city) {
+  double lat, lon;
+  if (!getCityCoords(city, lat, lon)) { pTrendLastError = "no coordinates for the city"; return false; }
+  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) + "&longitude=" + String(lon, 4)
+    + "&hourly=pressure_msl&past_hours=3&forecast_hours=1&timezone=auto";
+  HTTPClient http;
+  http.setTimeout(6000);
+  http.begin(url);
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) { http.end(); pTrendLastError = "Open-Meteo HTTP " + String(code); return false; }
+  String payload = http.getString();
+  http.end();
+  DynamicJsonDocument doc(2048);
+  if (deserializeJson(doc, payload)) { pTrendLastError = "bad JSON"; return false; }
+  JsonArray p = doc["hourly"]["pressure_msl"];
+  // Least-squares slope over the hourly points (past 3 hours + now) - steadier
+  // than comparing just the first and last value.
+  float sx = 0, sy = 0, sxx = 0, sxy = 0; int n = 0;
+  for (int i = 0; i < (int)p.size(); i++) {
+    if (p[i].isNull()) continue;
+    float x = i, y = p[i].as<float>();
+    sx += x; sy += y; sxx += x * x; sxy += x * y; n++;
+  }
+  if (n < 3) { pTrendLastError = "not enough hourly values (" + String(n) + ")"; return false; }
+  float slopePerHour = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+  float rate = slopePerHour * 3.0f;
+  pTrendLevel = pressureTrendLevel(rate, pTrendCity == city ? pTrendLevel : 0);
+  pTrendRate = rate;
+  pTrendLastError = "";
+  return true;
+}
+
+// WMO pressure-tendency classes (hPa per 3 h): steady < 1.6, then 1.6-3.5,
+// 3.6-6.0, > 6.0. Leaving a class needs the rate to drop 0.6 hPa below the
+// class's entry threshold, so a value hovering at a boundary can't make the
+// label flip back and forth on every update.
+int pressureTrendLevel(float rate, int prev) {
+  const float enter[4] = {0, 1.6f, 3.6f, 6.0f};
+  float a = fabs(rate);
+  int lvl = 0;
+  for (int k = 3; k >= 1; k--) if (a >= enter[k]) { lvl = k; break; }
+  int pa = abs(prev);
+  bool sameDirection = prev != 0 && ((prev > 0) == (rate > 0));
+  if (sameDirection && lvl < pa && a >= enter[pa] - 0.6f) lvl = pa; // hold the previous class
+  return rate < 0 ? -lvl : lvl;
+}
+
+bool pTrendValid() {
+  return pTrendCity == currentCity && pTrendFetchedAt != 0 && millis() - pTrendFetchedAt < 2UL * 3600000UL;
+}
+
+const char *pressureTrendText(int lvl) {
+  static const char *up[] = {"Steady", "Rising", "Rising fast", "Rising very fast"};
+  static const char *down[] = {"Steady", "Falling", "Falling fast", "Falling very fast"};
+  return lvl >= 0 ? up[min(lvl, 3)] : down[min(-lvl, 3)];
+}
+
+// Only the fast classes get an interpretation; "slowly rising/falling" alone
+// says too little to promise anything.
+const char *pressureTrendHint(int lvl) {
+  if (lvl <= -2) return "unsettled, windy weather likely";
+  if (lvl >= 2) return "weather likely improving";
+  return "";
+}
+
+// Call every loop(): keeps the rain outlook (5 min radar / 15 min forecast)
+// and the pressure trend (hourly) fresh for the city on screen. At most one
+// request per 10 seconds, so the screen and touch stay responsive.
+void nowcastLoop() {
+  ledPulseLoop();
+  static unsigned long lastAttempt = 0, lastAnalyze = 0;
+  if (millis() - lastAnalyze > 15000) { lastAnalyze = millis(); analyzeNowcast(); checkRainAlert(); }
+
+  if (WiFi.status() != WL_CONNECTED || isUpdating || timeStatus() == timeNotSet) return;
+  if (lastAttempt != 0 && millis() - lastAttempt < 10000) return;
+
+  if (nowCity != currentCity || (long)(millis() - nowNextFetch) >= 0) {
+    lastAttempt = millis();
+    bool cityChanged = nowCity != currentCity;
+    bool ok = fetchNowcast(currentCity);
+    if (ok) { nowFetchedAt = millis(); nowVersion++; }
+    else if (cityChanged) { nowCount = 0; nowVersion++; } // never show the old city's rain
+    nowCity = currentCity;
+    nowNextFetch = millis() + (ok ? (nowRadar ? 5UL : 15UL) * 60000UL : 2UL * 60000UL);
+    analyzeNowcast(); checkRainAlert();
+    if (!ok) logDebug("RAIN 2H fetch failed: " + nowLastError);
+    return;
+  }
+  if (pTrendCity != currentCity || (long)(millis() - pTrendNextFetch) >= 0) {
+    lastAttempt = millis();
+    bool ok = fetchPressureTrend(currentCity);
+    if (ok) { pTrendCity = currentCity; pTrendFetchedAt = millis(); pTrendVersion++; }
+    else if (pTrendCity != currentCity) { pTrendCity = currentCity; pTrendFetchedAt = 0; pTrendVersion++; }
+    pTrendNextFetch = millis() + (ok ? 60UL : 10UL) * 60000UL;
+    if (!ok) logDebug("PRESSURE TREND fetch failed: " + pTrendLastError);
+  }
+}
+
 // NEW: builds the <select> dropdown for one city's weather-data provider
 String buildProviderSelect(String fieldName, int currentProvider) {
   String html = "<select name='" + fieldName + "'>";
@@ -1104,6 +1389,7 @@ void handleApiSettings() {
   j += "],\"api\":\"" + jsonEsc(apiKey) + "\",\"apiBackup\":\"" + jsonEsc(apiKeyBackup) + "\"";
   j += ",\"theme\":" + String(themeMode);
   j += ",\"animOn\":" + String(showAnimation ? "true" : "false") + ",\"rainPrevOn\":" + String(showRainPreview ? "true" : "false");
+  j += ",\"rainLed\":" + String(rainLedAlert ? "true" : "false");
   j += ",\"screenPct\":" + String(map(globalBrightness, 10, 255, 0, 100)) + ",\"ledPct\":" + String(map(ledBrightness, 0, 255, 0, 100));
   j += ",\"useCustom\":" + String(useCustomColor ? "true" : "false");
   j += ",\"hue\":" + String(customHue) + ",\"satPct\":" + String(map(customSat, 0, 255, 0, 100)) + ",\"valPct\":" + String(map(customVal, 0, 255, 0, 100));
@@ -1135,6 +1421,8 @@ void handleSave() {
   prefs.putBool("animOn", showAnimation);
   showRainPreview = server.hasArg("rainPrevOn");
   prefs.putBool("rainPrevOn", showRainPreview);
+  rainLedAlert = server.hasArg("rainLed");
+  prefs.putBool("rainLed", rainLedAlert);
   if (server.hasArg("theme")) {
     themeMode = constrain(server.arg("theme").toInt(), 0, 2);
     prefs.putInt("theme", themeMode); // applied by the triggerWeatherUpdate() below
@@ -1192,6 +1480,8 @@ void handleLive() {
   } else if (action == "textVal") {
     textVal = map(constrain(value, 0, 100), 0, 100, 0, 255);
     applyTextColor();
+  } else if (action == "testPulse") {
+    startLedPulse(); // "Test" button next to the rain-alert setting
   } else if (action == "city") {
     // NEW: lets the web dashboard switch cities too, exactly like the
     // touchscreen's arrows - same triggerWeatherUpdate() call, so it
@@ -1311,6 +1601,19 @@ void handleApiDebug() {
   json += "\"uptimeSec\":" + String(millis() / 1000) + ",";
   json += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
   json += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+  // Data sources: what each feed last returned, so feeds can be checked on the device
+  auto age = [](unsigned long t) { return t == 0 ? String("never") : String((millis() - t) / 60000) + " min ago"; };
+  analyzeNowcast();
+  json += "\"sources\":[";
+  json += "{\"name\":\"Weather\",\"ok\":" + String(lastFetchOK ? "true" : "false") + ",\"age\":\"" + age(lastFetchMillis)
+        + "\",\"info\":\"" + jsonEsc(getDisplayCity(locs[currentCity]) + ", " + String(tempnum, 1) + " C, " + weatherDesc) + "\"},";
+  json += "{\"name\":\"Rain next 2h\",\"ok\":" + String(nowValid ? "true" : "false") + ",\"age\":\"" + age(nowFetchedAt)
+        + "\",\"info\":\"" + jsonEsc(nowValid ? nowSource + ": " + String(nowCount - nowFirst) + " steps, max " + String(nowMaxMm, 2) + " mm/h. " + nowMsg
+                                              : (nowLastError.length() ? nowLastError : String("waiting for first fetch"))) + "\"},";
+  json += "{\"name\":\"Pressure trend\",\"ok\":" + String(pTrendValid() ? "true" : "false") + ",\"age\":\"" + age(pTrendFetchedAt)
+        + "\",\"info\":\"" + jsonEsc(pTrendValid() ? String(pTrendRate, 2) + " hPa/3h: " + pressureTrendText(pTrendLevel)
+                                                      : (pTrendLastError.length() ? pTrendLastError : String("waiting for first fetch"))) + "\"}";
+  json += "],";
   json += "\"log\":[";
   int n = debugLogCount;
   for (int i = 0; i < n; i++) {
@@ -1345,6 +1648,16 @@ void handleApiStatus() {
   static const char *PROVIDER_NAMES[] = {"OpenWeatherMap", "Open-Meteo", "Open-Meteo KNMI"};
   json += "\"provider\":\"" + String(PROVIDER_NAMES[constrain(cityProvider[currentCity], 0, 2)]) + "\",";
   json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  analyzeNowcast();
+  if (nowValid) {
+    json += "\"nowcast\":{\"valid\":true,\"radar\":" + String(nowRadar ? "true" : "false") + ",\"stepMin\":" + String(nowStepMin)
+          + ",\"ageMin\":" + String((millis() - nowFetchedAt) / 60000) + ",\"msg\":\"" + jsonEsc(nowMsg) + "\",\"steps\":[";
+    for (int i = nowFirst; i < nowCount; i++) json += String(i > nowFirst ? "," : "") + "[\"" + nowLabel[i] + "\"," + String(nowMm[i], 2) + "]";
+    json += "]},";
+  } else json += "\"nowcast\":{\"valid\":false},";
+  if (pTrendValid()) json += "\"pTrend\":{\"valid\":true,\"rate\":" + String(pTrendRate, 1) + ",\"level\":" + String(pTrendLevel)
+                           + ",\"text\":\"" + pressureTrendText(pTrendLevel) + "\",\"hint\":\"" + pressureTrendHint(pTrendLevel) + "\"},";
+  else json += "\"pTrend\":{\"valid\":false},";
   json += "\"temp\":" + String(tempnum, 1) + ",";
   json += "\"feelsLike\":" + String(feels_like, 1) + ",";
   json += "\"tempMin\":" + String(tempMin, 1) + ",";
@@ -2600,6 +2913,21 @@ void drawHomeTile(int x, int y, const char *label, const String &value, const St
   drawValue(x + 11, y + 33, value, unit, degree, T.card);
 }
 
+// Pressure tile, with an arrow for the 3-hour trend (two arrows when fast).
+// No arrow when steady or when there's no recent trend data.
+void drawPressureTile() {
+  drawHomeTile(162, 316, "PRESSURE", String(pressure), "hPa", false);
+  if (!pTrendValid() || pTrendLevel == 0) return;
+  bool up = pTrendLevel > 0;
+  int n = abs(pTrendLevel) >= 2 ? 2 : 1;
+  uint16_t c = abs(pTrendLevel) >= 2 ? T.text : T.muted;
+  for (int k = 0; k < n; k++) {
+    int cx = 162 + 146 - 16 - k * 13, cy = 316 + 31;
+    if (up) tft.fillTriangle(cx - 5, cy + 4, cx + 5, cy + 4, cx, cy - 5, c);
+    else tft.fillTriangle(cx - 5, cy - 4, cx + 5, cy - 4, cx, cy + 5, c);
+  }
+}
+
 // Everything on the home page that only changes when new weather arrives
 // (or the city/theme changes). The clock, date, rain bars and status dot are
 // drawn by drawPageHome() since they change on their own.
@@ -2640,14 +2968,10 @@ void drawHomeStatic() {
   drawHomeTile(12, 262, "FEELS", String(feels_like, 1), "C", true);
   drawHomeTile(162, 262, "WIND", String((int)round(windSpeedKmH)), "km/h " + windDir, false);
   drawHomeTile(12, 316, "HUMIDITY", String(huminum), "%", false);
-  drawHomeTile(162, 316, "PRESSURE", String(pressure), "hPa", false);
+  drawPressureTile();
 
   // Bottom card: upcoming rain (or the animation, if that's chosen instead)
-  drawCard(12, 370, 296, 92, 12, T.card, T.border, T.bg);
-  if (showRainPreview) {
-    tft.setTextDatum(ML_DATUM); tft.setTextColor(T.muted);
-    tft.drawString("RAIN NEXT 15H", 24, 381, 2);
-  }
+  drawCard(12, 370, 296, 92, 12, T.card, T.border, T.bg); // contents: drawHomeRainPreview()
 }
 
 void drawPageBackground(int mode) {
@@ -2677,30 +3001,69 @@ void drawStatusIndicator(bool forceDraw = false) {
   tft.drawString(lastFetchOK ? (String(ageMin) + "m") : String("ERR"), STATUS_DOT_X - STATUS_DOT_R - 5, STATUS_DOT_Y + 1, 2);
 }
 
-// Upcoming rain on the home page: one bar per 3-hour step (~15h ahead), plus
-// the total. Only redraws when the values change.
+// Bottom card of the home page. When there's a fresh 2-hour outlook (radar in
+// NL/BE, 15-min forecast elsewhere) it shows that: a one-line message and a
+// bar per step. Otherwise the 3-hour steps for the next 15 hours. Only
+// redraws when something visible changed.
 void drawHomeRainPreview() {
-  static float lastVals[RAIN_GRAPH_POINTS];
-  int n = upcomingRainCount;
-  bool changed = (drawnMode != 0);
-  for (int i = 0; i < RAIN_GRAPH_POINTS; i++) {
-    float v = (i < n) ? upcomingRainMm[i] : -1;
-    if (v != lastVals[i]) changed = true;
-    lastVals[i] = v;
+  static String lastSig = "";
+  String sig;
+  if (nowValid) {
+    sig = "N" + nowMsg + "/" + String(nowVersion) + "/" + String(nowFirst);
+  } else {
+    sig = "F";
+    for (int i = 0; i < upcomingRainCount; i++) sig += String(upcomingRainMm[i], 1) + ",";
   }
-  if (!changed) return;
+  if (sig == lastSig && drawnMode == 0) return;
+  lastSig = sig;
 
-  tft.fillRect(132, 373, 96, 16, T.card);  // total, next to the title
-  tft.fillRect(18, 392, 284, 66, T.card);  // bars + labels
-  if (n == 0) {
+  tft.fillRect(18, 373, 214, 17, T.card); // title row (the status dot sits to its right)
+  tft.fillRect(18, 391, 284, 68, T.card); // bars + labels
+
+  if (nowValid) {
+    // Message, bold if it fits; drop the intensity word before shrinking
+    String msg = nowMsg;
+    const GFXfont *f = &FreeSansBold9pt7b;
+    if (ffWidth(msg, f) > 206 && msg.indexOf(',') > 0) msg = msg.substring(0, msg.indexOf(','));
+    if (ffWidth(msg, f) > 206) f = &FreeSans9pt7b;
+    ffText(msg, 24, 381, f, ML_DATUM, nowRainingNow || nowStartIdx >= 0 ? T.text : T.muted);
+
+    int n = min(nowCount - nowFirst, 24);
+    float slot = 272.0f / n;
+    int bw = max(2, (int)slot - 2), baseline = 436, maxH = 34;
+    float scale = max(1.0f, nowMaxMm);
+    for (int k = 0; k < n; k++) {
+      float mm = nowMm[nowFirst + k];
+      int x = 24 + (int)(k * slot);
+      if (mm >= 0.1f) {
+        int h = max(3, (int)(mm / scale * maxH));
+        tft.fillSmoothRoundRect(x, baseline - h, bw, h, min(2, bw / 2), T.rain, T.card);
+      } else tft.fillRect(x, baseline - 2, bw, 2, T.line);
+    }
+    // Time labels every 30 minutes, plus where the data comes from
     tft.setTextDatum(MC_DATUM); tft.setTextColor(T.muted);
-    tft.drawString("NO FORECAST DATA", 160, 422, 2);
+    int per = 30 / nowStepMin;
+    for (int k = 0; k < n; k += per) {
+      int x = constrain(24 + (int)(k * slot + slot / 2), 40, 280);
+      tft.drawString(k == 0 ? String("now") : nowLabel[nowFirst + k], x, baseline + 13, 2);
+    }
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(nowRadar ? "RADAR" : "FORECAST", 300, 393, 1);
     return;
   }
 
+  // 15-hour view: one bar per 3-hour step, plus the total
+  tft.setTextDatum(ML_DATUM); tft.setTextColor(T.muted);
+  tft.drawString("RAIN NEXT 15H", 24, 381, 2);
+  int n = upcomingRainCount;
+  if (n == 0) {
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("NO FORECAST DATA", 160, 422, 2);
+    return;
+  }
   float total = 0, maxRain = 1.0f; // 1 mm floor so a dry forecast doesn't fill the card
   for (int i = 0; i < n; i++) { total += upcomingRainMm[i]; if (upcomingRainMm[i] > maxRain) maxRain = upcomingRainMm[i]; }
-  tft.setTextDatum(ML_DATUM); tft.setTextColor(T.text);
+  tft.setTextColor(T.text);
   tft.drawString(String(total, 1) + " mm", 136, 381, 2);
 
   int baseline = 436, maxH = 36;
@@ -2746,6 +3109,12 @@ void drawPageHome() {
     prevDisplay = now();
   }
 
+  // Pressure trend arrived / changed / expired -> redraw just that tile
+  static unsigned long lastPV = 0;
+  static bool lastPValid = false;
+  if (drawnMode == 0 && (pTrendVersion != lastPV || pTrendValid() != lastPValid)) drawPressureTile();
+  lastPV = pTrendVersion; lastPValid = pTrendValid();
+
   if (showRainPreview) {
     drawHomeRainPreview();
   } else if (showAnimation) {
@@ -2761,18 +3130,21 @@ void drawPageHome() {
 void drawPageStats() {
   if (drawnMode == 1) return;
   int sY = 80;
-  String labels[8] = {"CITY", "TEMPERATURE", "FEELS LIKE", "HUMIDITY", "PRESSURE", "VISIBILITY", "", ""};
-  String vals[8]   = {getDisplayCity(locs[currentCity]), String(tempnum, 1), String(feels_like, 1),
-                      String(huminum), String(pressure), String(visibility), "", ""};
-  String units[8]  = {"", "C", "C", "%", "hPa", "km", "", ""};
-  bool deg[8]      = {false, true, true, false, false, false, false, false};
+  String labels[9] = {"CITY", "TEMPERATURE", "FEELS LIKE", "HUMIDITY", "PRESSURE", "VISIBILITY", "", "", ""};
+  String vals[9]   = {getDisplayCity(locs[currentCity]), String(tempnum, 1), String(feels_like, 1),
+                      String(huminum), String(pressure), String(visibility), "", "", ""};
+  String units[9]  = {"", "C", "C", "%", "hPa", "km", "", "", ""};
+  bool deg[9]      = {false, true, true, false, false, false, false, false, false};
   int rowCount = 6;
+  if (pTrendValid()) {
+    labels[rowCount] = "PRESSURE TREND"; vals[rowCount] = pressureTrendText(pTrendLevel); units[rowCount] = "";
+    rowCount++;
+  }
 #if USE_BME280
   // Local sensor readings, if a BME280 was detected
   if (bmeOK) {
-    labels[6] = "INDOOR TEMP";     vals[6] = String(localTemp, 1); units[6] = "C"; deg[6] = true;
-    labels[7] = "INDOOR HUMIDITY"; vals[7] = String(localHumid, 1); units[7] = "%";
-    rowCount = 8;
+    labels[rowCount] = "INDOOR TEMP";     vals[rowCount] = String(localTemp, 1); units[rowCount] = "C"; deg[rowCount] = true; rowCount++;
+    labels[rowCount] = "INDOOR HUMIDITY"; vals[rowCount] = String(localHumid, 1); units[rowCount] = "%"; rowCount++;
   }
 #endif
   // One row per value: label on the left, value right-aligned
@@ -2797,10 +3169,17 @@ void drawPageRain() {
   ffText(String(rain1h, 1) + " mm", 90, 122, &FreeSansBold12pt7b, MC_DATUM, T.text);
   ffText(String(rain3h, 1) + " mm", 230, 122, &FreeSansBold12pt7b, MC_DATUM, T.text);
   tft.drawFastVLine(160, 86, 52, T.line);
+  analyzeNowcast();
+  if (nowValid) {
+    String line = nowMsg + (nowRadar ? " (radar)" : " (forecast)");
+    if (tft.textWidth(line, 2) > 270) line = nowMsg;
+    tft.setTextDatum(MC_DATUM); tft.setTextColor(T.text);
+    tft.drawString(line, 160, 150, 2);
+  }
 
   // Graph of the next few 3-hour steps, so you can see *when* rain is expected
   tft.setTextColor(T.muted);
-  tft.drawString("UPCOMING RAIN (3H STEPS)", 160, 170, 2);
+  tft.drawString("UPCOMING RAIN (3H STEPS)", 160, 184, 2);
 
   int graphLeft = 55, graphRight = 265, baseline = 420, maxBarHeight = 190;
   int n = upcomingRainCount;
@@ -3278,6 +3657,7 @@ void setup() {
   applyTextColor();
   showAnimation = prefs.getBool("animOn", true); // NEW
   showRainPreview = prefs.getBool("rainPrevOn", true); // NEW
+  rainLedAlert = prefs.getBool("rainLed", true);
   themeMode = constrain(prefs.getInt("theme", THEME_AUTO), 0, 2);
   applyTheme(); // AUTO can't know about sunset yet - re-checked after the first weather fetch
   updateBacklight(); 
@@ -3419,6 +3799,7 @@ void loop() {
 #if USE_SD_HISTORY
   historyLoop(); // NEW: background per-city history sync (one city at a time, every 6h)
 #endif
+  nowcastLoop(); // rain in the next 2 hours, pressure trend, LED rain alert
 
   // Text color changed (web sliders) -> redraw once it has settled
   if (accentDirty && millis() - accentChangedAt > 400) {
@@ -4317,6 +4698,8 @@ const char DASHBOARD_BODY[] PROGMEM = R"rawliteral(
 .status{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:.9em;margin-top:10px}
 .status i{width:9px;height:9px;border-radius:50%;background:var(--good);flex:none}
 .empty{color:var(--muted);text-align:center;padding:30px 0}
+.nowmsg{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-bottom:4px}
+.nowmsg b{font-size:1.15em}.tag{font-size:.72em;font-weight:700;letter-spacing:.06em;color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:2px 6px;white-space:nowrap}
 @media (max-width:900px){
  .dash{grid-template-columns:minmax(0,1fr);padding:14px 14px 96px;gap:12px}
  .hero,.details,.rain,.sun,.fc,.side{grid-column:1/-1}
@@ -4335,10 +4718,10 @@ const char DASHBOARD_BODY[] PROGMEM = R"rawliteral(
  <section class="card details"><h3>Right now</h3>
   <div class="tile"><span class="k">Wind</span><div class="compass"><svg width="30" height="30" viewBox="0 0 30 30"><circle cx="15" cy="15" r="13" fill="none" stroke="var(--line)" stroke-width="2"/><path id="windArrow" d="M15 6 L19 18 L15 15.5 L11 18 Z" fill="var(--blue)"/></svg><span class="v" id="wind">--</span></div></div>
   <div class="tile"><span class="k">Humidity</span><span class="v" id="humid">--</span><div class="bar"><i id="humidBar" style="width:0"></i></div></div>
-  <div class="tile"><span class="k">Pressure</span><span class="v" id="baro">--</span><span class="k">sea level</span></div>
+  <div class="tile"><span class="k">Pressure</span><span class="v" id="baro">--</span><span class="k" id="pTrend">sea level</span></div>
   <div class="tile"><span class="k">Visibility</span><span class="v" id="vis">--</span><span class="k" id="clouds"></span></div>
  </section>
- <section class="card rain"><h3>Rain &middot; next 15 hours <span id="rainTotal"></span></h3><div id="rainChart"></div></section>
+ <section class="card rain"><h3>Rain <span id="rainTotal"></span></h3><div id="nowcast"></div><div class="label" id="rain15Label" style="margin-top:6px">Next 15 hours</div><div id="rainChart"></div></section>
  <section class="card sun"><h3>Sun &amp; Moon</h3>
   <svg class="sunarc" viewBox="0 0 300 120" id="sunArc"></svg>
   <div class="sunrow"><div><span class="muted">Sunrise</span><b id="sunRise">--</b></div><div style="text-align:center"><span class="muted" id="sunEvent">--</span><b id="sunIn" style="color:var(--accent)">--</b></div><div style="text-align:right"><span class="muted">Sunset</span><b id="sunSet">--</b></div></div>
@@ -4361,7 +4744,7 @@ function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {'&':'&amp
 function cityTabs(d){var t=$('cityTabs');if(!t)return;var h='';d.cityNames.forEach(function(n,i){h+='<button class="'+(i==d.cityIndex?'on':'')+'" onclick="setCity('+i+')">'+esc(n)+'</button>';});t.innerHTML=h;}
 function setCity(i){if(cur&&i==cur.cityIndex)return;$('desc').innerText='Loading...';api('/live?action=city&value='+i).then(refresh);}
 function rainChart(d){
- var pts=d.rain||[],tot=0;pts.forEach(function(p){tot+=p.mm;});$('rainTotal').innerText=pts.length?tot.toFixed(1)+' mm total':'';
+ var pts=d.rain||[],tot=0;pts.forEach(function(p){tot+=p.mm;});$('rainTotal').innerText=pts.length?tot.toFixed(1)+' mm in 15 h':'';
  if(!pts.length){$('rainChart').innerHTML='<div class="empty">No forecast data</div>';return;}
  var W=Math.max(300,Math.round($('rainChart').clientWidth||760)),Hh=W<500?190:230,l=40,r=10,t=16,b=30,max=Math.max(1,Math.max.apply(null,pts.map(function(p){return p.mm;}))),bw=(W-l-r)/pts.length,o='';
  var st=max<=2?0.5:(max<=5?1:(max<=10?2:5));max=Math.ceil(max/st)*st;
@@ -4372,6 +4755,15 @@ function rainChart(d){
   o+='<text x="'+(x+w/2)+'" y="'+(Hh-9)+'" font-size="12" fill="var(--muted)" text-anchor="middle">'+esc(p.label)+'</text>';});
  o+='<text x="'+l+'" y="11" font-size="11" fill="var(--muted)">mm per 3 h</text>';
  $('rainChart').innerHTML='<svg viewBox="0 0 '+W+' '+Hh+'" style="width:100%;height:auto;display:block">'+o+'</svg>';}
+// Next 2 hours: one bar per step (5 min radar / 15 min forecast), same rules as the display
+function nowcast(d){var n=d.nowcast||{},el=$('nowcast');
+ if(!n.valid){el.innerHTML='';$('rain15Label').style.display='none';return;}$('rain15Label').style.display='';
+ var st=n.steps,W=Math.max(300,Math.round(el.clientWidth||760)),Hh=120,l=6,r=6,t=10,b=24,mx=Math.max(1,Math.max.apply(null,st.map(function(x){return x[1];}))),sw=(W-l-r)/st.length,o='',per=Math.round(30/n.stepMin);
+ st.forEach(function(x,i){var bx=l+i*sw+1,w=Math.max(2,sw-2);
+  if(x[1]>=0.1){var h=Math.max(3,(Hh-t-b)*x[1]/mx);o+='<rect x="'+bx+'" y="'+(Hh-b-h)+'" width="'+w+'" height="'+h+'" rx="2" fill="var(--rain)"><title>'+x[0]+' '+x[1].toFixed(1)+' mm/h</title></rect>';}
+  else o+='<rect x="'+bx+'" y="'+(Hh-b-2)+'" width="'+w+'" height="2" fill="var(--line)"/>';
+  if(i%per==0)o+='<text x="'+(bx+w/2)+'" y="'+(Hh-7)+'" font-size="12" fill="var(--muted)" text-anchor="middle">'+(i==0?'now':x[0])+'</text>';});
+ el.innerHTML='<div class="nowmsg"><b>'+esc(n.msg)+'</b><span class="tag">'+(n.radar?'RADAR':'FORECAST')+' &middot; '+n.ageMin+' min ago</span></div><svg viewBox="0 0 '+W+' '+Hh+'" style="width:100%;height:auto;display:block">'+o+'</svg>';}
 function toMin(s){return s&&s.length>=5?(+s.slice(0,2))*60+(+s.slice(3,5)):-1;}
 function sunArc(d){var rise=toMin(d.sunRise),set=toMin(d.sunSet),now=d.hour*60+d.minute,cx=150,cy=108,R=92;
  var o='<path d="M'+(cx-R)+' '+cy+' A'+R+' '+R+' 0 0 1 '+(cx+R)+' '+cy+'" fill="none" stroke="var(--line)" stroke-width="3" stroke-dasharray="4 6"/><line x1="20" x2="280" y1="'+cy+'" y2="'+cy+'" stroke="var(--line)"/>';
@@ -4408,7 +4800,10 @@ async function refresh(){
   $('humid').innerHTML=d.humid+' <small>%</small>';$('humidBar').style.width=Math.min(100,d.humid)+'%';
   $('baro').innerHTML=d.pressure+' <small>hPa</small>';
   $('vis').innerHTML=d.visibility+' <small>km</small>';$('clouds').innerText='Clouds '+d.clouds+'%';
-  rainChart(d);sunArc(d);moon();forecast(d);
+  rainChart(d);nowcast(d);sunArc(d);moon();forecast(d);
+  var pt=d.pTrend||{},ar={'-3':'\u25bc\u25bc','-2':'\u25bc\u25bc','-1':'\u25bc','0':'','1':'\u25b2','2':'\u25b2\u25b2','3':'\u25b2\u25b2'};
+  $('pTrend').innerHTML=pt.valid?(ar[pt.level]+' '+esc(pt.text)+' <span class="muted">('+(pt.rate>0?'+':'')+pt.rate.toFixed(1)+' hPa/3h)</span>'+(pt.hint?'<br>'+esc(pt.hint):'')):'sea level';
+  $('pTrend').style.color=pt.valid&&Math.abs(pt.level)>=2?'var(--text)':'';
   $('sunRise').innerText=d.sunRise||'--';$('sunSet').innerText=d.sunSet||'--';
   $('sunEvent').innerText=d.sunEvent=='SUNRISE'?'Sunrise in':'Sunset in';$('sunIn').innerText=d.sunDiffMin>=0?Math.floor(d.sunDiffMin/60)+'h '+(d.sunDiffMin%60)+'m':'--';
   $('moonName').innerText=(d.moonPhase||'').toLowerCase().replace(/^./,function(c){return c.toUpperCase();});
@@ -4419,7 +4814,7 @@ async function refresh(){
  }catch(e){$('stText').innerText='Connection lost - retrying';$('stDot').style.background='var(--bad)';}
 }
 document.addEventListener('themechange',function(){if(cur){refresh();}});
-var rz;window.addEventListener('resize',function(){clearTimeout(rz);rz=setTimeout(function(){if(cur)rainChart(cur);},150);});
+var rz;window.addEventListener('resize',function(){clearTimeout(rz);rz=setTimeout(function(){if(cur){rainChart(cur);nowcast(cur);}},150);});
 refresh();setInterval(refresh,7000);
 </script>
 )rawliteral";
@@ -4441,6 +4836,8 @@ const char SETTINGS_BODY[] PROGMEM = R"rawliteral(
  <div class="field"><span>Screen theme</span><select name="theme" id="theme"><option value="2">Auto &ndash; dark from sunset to sunrise</option><option value="0">Light</option><option value="1">Dark</option></select></div>
  <label class="switch"><div>Upcoming rain on the home screen<small>Bars for the next 15 hours</small></div><input type="checkbox" name="rainPrevOn" id="rainPrevOn" value="1"></label>
  <label class="switch"><div>Home screen animation<small>Shown instead of the rain bars when those are off</small></div><input type="checkbox" name="animOn" id="animOn" value="1"></label>
+ <label class="switch"><div>Pulse the LED when rain is coming<small>Two slow blue pulses when rain is expected within 30 minutes. Once per rain spell; uses radar in NL/BE.</small></div><input type="checkbox" name="rainLed" id="rainLed" value="1"></label>
+ <div style="margin:2px 0 6px"><button type="button" class="btn" onclick="var b=this;api('/live?action=testPulse').then(function(){flash(b,'Pulsing...');})">Test the pulse</button></div>
  <div class="label" style="margin-top:14px">Brightness <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">&middot; applies right away, saved automatically</span></div>
  <div class="slider"><span>Screen</span><input type="range" id="screenSlider" min="0" max="100"><b id="screenVal"></b></div>
  <div class="slider"><span>LED</span><input type="range" id="ledSlider" min="0" max="100"><b id="ledVal"></b></div>
@@ -4481,7 +4878,7 @@ function paint(){var c=hsv(+$('hueSlider').value,+$('satSlider').value,+$('valSl
 function bind(id,action,valId,suffix){var s=$(id);s.oninput=function(){$(valId).innerText=s.value+(suffix||'');paint();liveSend(action,s.value,false);};s.onchange=function(){liveSend(action,s.value,true);};}
 fetch('/api/settings').then(function(r){return r.json();}).then(function(d){
  for(var i=1;i<=3;i++){$('c'+i).value=d.cities[i-1];var sel=$('provider'+i);sel.innerHTML=PROV.map(function(p,k){return '<option value="'+k+'">'+p+'</option>';}).join('');sel.value=d.providers[i-1];}
- $('api').value=d.api;$('apiBackup').value=d.apiBackup;$('theme').value=d.theme;$('animOn').checked=d.animOn;$('rainPrevOn').checked=d.rainPrevOn;
+ $('api').value=d.api;$('apiBackup').value=d.apiBackup;$('theme').value=d.theme;$('animOn').checked=d.animOn;$('rainPrevOn').checked=d.rainPrevOn;$('rainLed').checked=d.rainLed;
  var set=function(id,v,suffix){$(id+'Slider').value=v;$(id+'Val').innerText=v+(suffix||'');};
  set('screen',d.screenPct,'%');set('led',d.ledPct,'%');set('hue',d.hue);set('sat',d.satPct,'%');set('val',d.valPct,'%');
  set('textHue',d.textHue);set('textSat',d.textSatPct,'%');set('textVal',d.textValPct,'%');
@@ -4514,6 +4911,7 @@ const char DEBUG_BODY[] PROGMEM = R"rawliteral(
  <div class="drow"><span>Free heap</span><span id="heap">--</span></div>
  <div class="drow"><span>WiFi</span><span id="wifi">--</span></div>
 </section>
+<section class="card"><h3>Data sources <span>last fetch per feed</span></h3><div id="sources">Loading...</div></section>
 <section class="card"><h3>Event log <span>newest first</span></h3><div class="con" id="log">Loading...</div></section>
 </main>
 <script>
@@ -4530,6 +4928,7 @@ async function refresh(){
   $('heap').innerText=(d.freeHeap/1024).toFixed(1)+' KB';
   var w=$('wifi');w.innerText=d.wifiConnected?'connected':'DISCONNECTED';w.className=d.wifiConnected?'ok':'bad';
   $('log').innerText=d.log.join('\n');
+  $('sources').innerHTML=(d.sources||[]).map(function(x){return '<div class="drow" style="display:block"><div style="display:flex;justify-content:space-between;gap:10px"><b>'+x.name+'</b><span class="'+(x.ok?'ok':'bad')+'">'+(x.ok?'OK':'not available')+' &middot; '+x.age+'</span></div><div class="muted small" style="margin-top:3px;font-family:inherit;font-weight:400">'+String(x.info).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];})+'</div></div>';}).join('');
  }catch(e){$('log').innerText='connection lost: '+e;}
 }
 refresh();setInterval(refresh,400);
