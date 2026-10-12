@@ -1023,7 +1023,7 @@ String buildProviderSelect(String fieldName, int currentProvider) {
 }
 
 // --- [SMARTER WEB PORTAL FUNCTIONS] ---
-// UPDATE 2: Added API key input to HTML and Saving Process
+// Settings page (served at /settings - the dashboard is the start page at /)
 void handleSettingsPage() {
   // NEW: current values, converted to the 0-100% scale the sliders use
   int screenPct = map(globalBrightness, 10, 255, 0, 100);
@@ -1203,11 +1203,11 @@ void handleSave() {
 
 // NEW: live-update endpoint for the web portal's sliders. Applies a change
 // immediately (LED color, backlight, sync mode) the moment the browser sends
-// it - the web equivalent of dragging a slider on the touchscreen. Nothing
-// here is written to flash except the sync-mode toggle (which the
-// touchscreen also persists immediately) - the custom color itself is only
-// saved permanently via handleSaveColor()/"Save Color as Default" below,
-// matching the touchscreen's separate "SAVE CUSTOM AS DEFAULT" button.
+// it - the web equivalent of dragging a slider on the touchscreen. The
+// sync-mode toggle is saved right away and brightness a few seconds after the
+// last change (markBrightnessDirty); the custom color itself is only saved
+// permanently via handleSaveColor()/"Save Color as Default" below, matching
+// the touchscreen's separate "SAVE CUSTOM AS DEFAULT" button.
 void handleLive() {
   if (!requireAppHeader()) return;
   String action = server.arg("action");
@@ -1277,7 +1277,7 @@ void handleSaveColor() {
   server.send(200, "text/plain", "OK");
 }
 
-// NEW: small nav bar shared by all three web pages, so they feel like one site
+// NEW: small nav bar shared by all the web pages, so they feel like one site
 String navBar(String current) {
   String html = "<div style='text-align:center;margin-bottom:15px;font-size:0.95em;'>";
   html += "<a href='/' style='margin:0 10px;" + String(current == "dashboard" ? "font-weight:bold;text-decoration:underline;" : "") + "'>Live Dashboard</a>";

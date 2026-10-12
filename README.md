@@ -22,7 +22,7 @@ A touch-screen weather station for the 3.5-inch **E32R35T / E32N35T** ESP32 disp
 - Open-Meteo
 - Open-Meteo with the KNMI model (KNMI's 2 km Netherlands model, topped up with ECMWF beyond its ~2.5-day range)
 
-**Web interface** (open the device's IP address in a browser)
+**Web interface** (open the device's IP address in a browser; it starts on the live dashboard)
 - Settings: cities, weather source per city, API keys (with an optional backup key), screen and LED brightness (remembered across restarts), colors
 - Live dashboard that mirrors what's on the display
 - History page with charts per city: temperature, rain, sunshine, wind, humidity, pressure, monthly averages and a summary table
@@ -97,7 +97,7 @@ Open `DesktopDisplay.ino` and click Upload. The sketch folder must be called `De
 
 1. **Touch calibration.** On the very first boot the screen says *TOUCH CORNERS TO CALIBRATE*. Tap each corner marker. The result is saved, so this only happens once.
 2. **WiFi.** The display creates a WiFi network called **WeatherStation-Setup**. Connect to it with your phone, open **192.168.4.1** if the setup page doesn't appear by itself, and pick your home WiFi.
-3. **API key.** Get a free API key at [openweathermap.org](https://openweathermap.org/api). Then open the device's IP address (shown on the system page of the display) in a browser, paste the key into **API Key** and save. A key is needed even if you only use Open-Meteo, because city names are looked up through OpenWeatherMap's geocoder.
+3. **API key.** Get a free API key at [openweathermap.org](https://openweathermap.org/api). Then open the device's IP address (shown on the system page of the display) in a browser, go to **Settings** (or open `http://<device-ip>/settings` directly), paste the key into **API Key** and save. A key is needed even if you only use Open-Meteo, because city names are looked up through OpenWeatherMap's geocoder.
 4. **Cities.** Enter up to three cities as `City,CountryCode`, for example `Amsterdam,NL` or `London,GB`, and pick a weather source for each.
 
 All settings are stored in the ESP32's flash and survive power cuts and new uploads.
@@ -113,7 +113,7 @@ All settings are stored in the ESP32's flash and survive power cuts and new uplo
 
 The pages are: **Home**, **Stats**, **Rain**, **Astro**, **System**, **Forecast** and **History**.
 
-On the **System** page you can drag the sliders for screen and LED brightness, switch the LED between weather colors and a custom color, pick the custom color, and save it.
+On the **System** page you can drag the sliders for screen and LED brightness (saved automatically a few seconds after you let go), switch the LED between weather colors and a custom color, pick the custom color, and save it as the default.
 
 LED weather colors: orange = clear, white = clouds, blue = rain, purple = thunderstorm, cyan = snow.
 
@@ -156,8 +156,11 @@ This happens if the SD card is moved onto the same SPI bus as the display. The S
 **The touch calibration screen appears again**
 Normal after changing the partition scheme, because the calibration file lives in the SPIFFS area. Tap the corners once more.
 
+**A script gets "403 Forbidden"**
+Endpoints that change something need the header `X-Requested-With: DesktopDisplay` (see [Web pages](#web-pages)). Reading endpoints like `/api/status` don't.
+
 **Weather doesn't load**
-Check the API key on the settings page and that the city is written as `City,CountryCode`. A new OpenWeatherMap key can take up to a couple of hours to start working.
+Check the API key on the settings page (`/settings`) and that the city is written as `City,CountryCode`. A new OpenWeatherMap key can take up to a couple of hours to start working.
 
 ## Known limitations
 
