@@ -1,0 +1,18 @@
+# Build output
+build/
+*.bin
+*.elf
+*.map
+
+# Archives / backups
+*.zip
+*.bak
+
+# Local secrets (if you ever add one)
+secrets.h
+
+# Editor / OS junk
+.vscode/
+desktop.ini
+Thumbs.db
+.DS_Store
