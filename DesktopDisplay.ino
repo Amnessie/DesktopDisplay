@@ -1657,6 +1657,67 @@ bool histFieldOK(String s) {
   return true;
 }
 
+// Reads a text file line by line in 2 KB blocks. File::readStringUntil()
+// fetches ONE byte per call from the SD card (each one a full trip through the
+// filesystem layers) and grows the String a character at a time - with years
+// of history that's what made the History page take ~10+ seconds to load.
+class LineReader {
+ public:
+  explicit LineReader(File &file) : f(file), buf((uint8_t *)malloc(BUF_SIZE)) {}
+  ~LineReader() { free(buf); }
+  // Next line into out, without the line ending. Returns false at the end of the file.
+  bool next(String &out) {
+    out = "";
+    bool got = false;
+    while (buf) {
+      if (pos >= len) {
+        len = f.read(buf, BUF_SIZE);
+        pos = 0;
+        if (len == 0) return got;
+      }
+      uint8_t *start = buf + pos;
+      uint8_t *nl = (uint8_t *)memchr(start, '\n', len - pos);
+      size_t n = nl ? (size_t)(nl - start) : len - pos;
+      if (out.length() < MAX_LINE) out.concat((const char *)start, n);
+      got = true;
+      pos += n + (nl ? 1 : 0);
+      if (nl) { if (out.endsWith("\r")) out.remove(out.length() - 1); return true; }
+    }
+    return false;
+  }
+ private:
+  static const size_t BUF_SIZE = 2048, MAX_LINE = 512;
+  File &f;
+  uint8_t *buf;
+  size_t len = 0, pos = 0;
+  LineReader(const LineReader &) = delete;
+  LineReader &operator=(const LineReader &) = delete;
+};
+
+// Sends the rest of an open file to the client as-is, in 4 KB blocks.
+void histStreamFileBody(File &f) {
+  const size_t BLOCK = 4096;
+  uint8_t *b = (uint8_t *)malloc(BLOCK);
+  if (!b) return;
+  WiFiClient client = server.client();
+  size_t n;
+  while ((n = f.read(b, BLOCK)) > 0) {
+    if (client.write(b, n) != n) break; // browser went away
+  }
+  free(b);
+}
+
+// Each city's file gets a version number that goes up whenever the file is
+// written. Together with a per-boot random id it forms the file's ETag, so a
+// browser that already has the data gets a tiny "304 Not Modified" instead of
+// downloading the whole file again.
+uint32_t histBootId = 0;
+uint32_t histGen[NUM_CITIES] = {0, 0, 0};
+void histTouch(int i) { histGen[i]++; }
+String histEtag(int i, size_t size) {
+  return "\"" + String(histBootId, HEX) + "-" + String(histGen[i]) + "-" + String((unsigned long)size) + "\"";
+}
+
 String histReadMeta(int i) {
   String p = histMetaPath(i);
   if (!SD.exists(p)) return "";
@@ -1682,6 +1743,7 @@ void histArchive(int i) {
   String dst;
   do { dst = "/hist_c" + String(i) + "_old" + String(n) + ".csv"; n++; } while (SD.exists(dst));
   SD.rename(src, dst);
+  histTouch(i);
   logDebug("HIST city " + String(i + 1) + " renamed - old log kept as " + dst);
 }
 
@@ -1811,8 +1873,9 @@ bool histMergeDays(int i, int n, int overwriteFrom, String dropFrom) {
 
   if (SD.exists(path)) {
     File in = SD.open(path, FILE_READ);
-    while (in && in.available()) {
-      String line = in.readStringUntil('\n');
+    LineReader lr(in);
+    String line;
+    while (in && lr.next(line)) {
       line.trim();
       if (line.length() < 11) continue;
       String d = line.substring(0, 10);
@@ -1831,6 +1894,7 @@ bool histMergeDays(int i, int n, int overwriteFrom, String dropFrom) {
   out.close();
 
   if (SD.exists(path)) SD.remove(path);
+  histTouch(i);
   return SD.rename(tmp, path);
 }
 
@@ -2038,6 +2102,7 @@ int histListArchives(bool deleteThem) {
 
 void histWipeCity(int i) {
   if (SD.exists(histPath(i))) SD.remove(histPath(i));
+  histTouch(i);
   histTodayValid[i] = false;
   histFullDone[i] = false;
   histNextSync[i] = 0; // re-download the last 92 days right away
@@ -2047,12 +2112,8 @@ void histSendJson(bool ok, String msg) {
   server.send(ok ? 200 : 400, "application/json", "{\"ok\":" + String(ok ? "true" : "false") + ",\"msg\":\"" + jsonEsc(msg) + "\"}");
 }
 
-// GET /api/history?city=N  (no city = whichever city the device is showing)
-// Streamed in chunks, so there's no size limit.
-// days: [date,tMin,tMax,rain,humid,pressure,gust|null,sun|null(,1 = today's forecast)]
-void handleApiHistory() {
-  int city = server.hasArg("city") ? constrain(server.arg("city").toInt(), 0, NUM_CITIES - 1) : currentCity;
-
+// Fields shared by /api/history and /api/history/meta (no surrounding braces).
+String histMetaFields() {
   uint32_t histBytes = 0;
   int archives = 0;
   if (sdOK) {
@@ -2063,29 +2124,81 @@ void handleApiHistory() {
     }
     archives = histListArchives(false);
   }
+  String j = "\"currentCity\":" + String(currentCity) + ",\"names\":[";
+  for (int i = 0; i < NUM_CITIES; i++) {
+    if (i > 0) j += ",";
+    j += "\"" + jsonEsc(getDisplayCity(locs[i])) + "\"";
+  }
+  j += "],\"sdOK\":" + String(sdOK ? "true" : "false");
+  j += ",\"cardTotalKB\":" + String(histCardTotalKB) + ",\"cardUsedKB\":" + String(histCardUsedKB);
+  j += ",\"histKB\":" + String((histBytes + 1023) / 1024);
+  j += ",\"archives\":" + String(archives);
+  return j;
+}
+
+// Today's forecast row for a city as a JSON array (with a trailing 1 marking
+// it as a forecast), or "null" if there isn't one yet.
+String histTodayJson(int city) {
+  if (!histTodayValid[city]) return "null";
+  return "[\"" + histTodayDate[city] + "\"," + String(histTodayMin[city], 1) + "," + String(histTodayMax[city], 1)
+       + "," + String(histTodayRain[city], 1) + "," + String(histTodayHum[city], 0) + "," + String(histTodayPres[city], 0)
+       + "," + (histTodayGustOK[city] ? String(histTodayGust[city], 0) : String("null"))
+       + "," + (histTodaySunOK[city] ? String(histTodaySun[city], 1) : String("null")) + ",1]";
+}
+
+// GET /api/history/meta - everything the History page needs except the day
+// rows themselves: names, storage info and today's forecast row per city.
+void handleHistoryMeta() {
+  String j = "{" + histMetaFields() + ",\"today\":[";
+  for (int i = 0; i < NUM_CITIES; i++) { if (i > 0) j += ","; j += histTodayJson(i); }
+  j += "]}";
+  server.send(200, "application/json", j);
+}
+
+// GET /api/history/raw?city=N - the city's history file exactly as stored
+// (CSV: date,tMin,tMax,rainMm,humidAvg,pressureAvg,gustMaxKmh,sunHours).
+// The History page parses it in the browser, which is far faster than
+// building JSON on the ESP32. Supports ETag/If-None-Match, so reloading the
+// page only re-downloads files that actually changed.
+void handleHistoryRaw() {
+  int city = constrain(server.arg("city").toInt(), 0, NUM_CITIES - 1);
+  File f;
+  if (sdOK && SD.exists(histPath(city))) f = SD.open(histPath(city), FILE_READ);
+  size_t size = f ? f.size() : 0;
+  String etag = histEtag(city, size);
+  server.sendHeader("Cache-Control", "no-cache"); // always revalidate - a 304 is cheap
+  server.sendHeader("ETag", etag);
+  if (server.header("If-None-Match") == etag) {
+    if (f) f.close();
+    server.send(304);
+    return;
+  }
+  server.setContentLength(size);
+  server.send(200, "text/csv", "");
+  if (f) { histStreamFileBody(f); f.close(); }
+}
+
+// GET /api/history?city=N  (no city = whichever city the device is showing)
+// Streamed in chunks, so there's no size limit. (The History page itself uses
+// the faster /api/history/meta + /api/history/raw; this stays for scripts.)
+// days: [date,tMin,tMax,rain,humid,pressure,gust|null,sun|null(,1 = today's forecast)]
+void handleApiHistory() {
+  int city = server.hasArg("city") ? constrain(server.arg("city").toInt(), 0, NUM_CITIES - 1) : currentCity;
 
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "application/json", "");
 
   String chunk;
   chunk.reserve(1400);
-  chunk = "{\"city\":" + String(city) + ",\"currentCity\":" + String(currentCity) + ",\"names\":[";
-  for (int i = 0; i < NUM_CITIES; i++) {
-    if (i > 0) chunk += ",";
-    chunk += "\"" + jsonEsc(getDisplayCity(locs[i])) + "\"";
-  }
-  chunk += "],\"sdOK\":" + String(sdOK ? "true" : "false");
-  chunk += ",\"cardTotalKB\":" + String(histCardTotalKB) + ",\"cardUsedKB\":" + String(histCardUsedKB);
-  chunk += ",\"histKB\":" + String((histBytes + 1023) / 1024);
-  chunk += ",\"archives\":" + String(archives);
-  chunk += ",\"days\":[";
+  chunk = "{\"city\":" + String(city) + "," + histMetaFields() + ",\"days\":[";
 
   bool first = true;
   if (sdOK && SD.exists(histPath(city))) {
     File f = SD.open(histPath(city), FILE_READ);
     if (f) {
-      while (f.available()) {
-        String line = f.readStringUntil('\n');
+      LineReader lr(f);
+      String line;
+      while (lr.next(line)) {
         line.trim();
         String fl[8];
         int n = histSplit(line, fl, 8);
@@ -2105,10 +2218,7 @@ void handleApiHistory() {
   }
   if (histTodayValid[city]) {
     if (!first) chunk += ",";
-    chunk += "[\"" + histTodayDate[city] + "\"," + String(histTodayMin[city], 1) + "," + String(histTodayMax[city], 1)
-           + "," + String(histTodayRain[city], 1) + "," + String(histTodayHum[city], 0) + "," + String(histTodayPres[city], 0)
-           + "," + (histTodayGustOK[city] ? String(histTodayGust[city], 0) : String("null"))
-           + "," + (histTodaySunOK[city] ? String(histTodaySun[city], 1) : String("null")) + ",1]";
+    chunk += histTodayJson(city);
   }
   chunk += "]}";
   server.sendContent(chunk);
@@ -2160,8 +2270,9 @@ void handleApiLocal() {
   bool first = true;
   if (sdOK && SD.exists(LOCAL_LOG)) {
     File f = SD.open(LOCAL_LOG, FILE_READ);
-    while (f && f.available()) {
-      String line = f.readStringUntil('\n');
+    LineReader lr(f);
+    String line;
+    while (f && lr.next(line)) {
       line.trim();
       String fl[4];
       if (histSplit(line, fl, 4) < 4 || !histFieldOK(fl[0]) || !histFieldOK(fl[1]) || !histFieldOK(fl[2]) || !histFieldOK(fl[3])) continue;
@@ -2192,9 +2303,10 @@ void handleLocalExport() {
   String chunk = "timeUTC,epochUTC,tempC,humidity,pressureHpa\n";
   if (sdOK && SD.exists(LOCAL_LOG)) {
     File f = SD.open(LOCAL_LOG, FILE_READ);
+    LineReader lr(f);
+    String line;
     char tb[20];
-    while (f && f.available()) {
-      String line = f.readStringUntil('\n');
+    while (f && lr.next(line)) {
       line.trim();
       if (line.length() < 10) continue;
       time_t e = (time_t)line.substring(0, line.indexOf(',')).toInt();
@@ -2217,25 +2329,14 @@ void handleHistoryExport() {
   for (unsigned int k = 0; k < name.length(); k++) safe += isalnum((unsigned char)name[k]) ? name[k] : '_';
 
   server.sendHeader("Content-Disposition", "attachment; filename=\"history_" + safe + ".csv\"");
-  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-  server.send(200, "text/csv", "");
 
-  String chunk = "date,tMin,tMax,rainMm,humidAvg,pressureAvg,gustMaxKmh,sunHours\n";
-  if (sdOK && SD.exists(histPath(city))) {
-    File f = SD.open(histPath(city), FILE_READ);
-    if (f) {
-      while (f.available()) {
-        String line = f.readStringUntil('\n');
-        line.trim();
-        if (line.length() < 10) continue;
-        chunk += line + "\n";
-        if (chunk.length() > 1200) { server.sendContent(chunk); chunk = ""; }
-      }
-      f.close();
-    }
-  }
-  server.sendContent(chunk);
-  server.sendContent("");
+  // The file is already plain CSV, so it's sent as-is after a header row.
+  File f;
+  if (sdOK && SD.exists(histPath(city))) f = SD.open(histPath(city), FILE_READ);
+  String header = "date,tMin,tMax,rainMm,humidAvg,pressureAvg,gustMaxKmh,sunHours\r\n";
+  server.setContentLength(header.length() + (f ? f.size() : 0));
+  server.send(200, "text/csv", header);
+  if (f) { histStreamFileBody(f); f.close(); }
 }
 
 const char* HIST_IMPORT_TMP = "/hist_import.tmp";
@@ -2320,7 +2421,11 @@ bool histImportProcess(int city, bool replaceAll, String &msg) {
   int count = 0;
   File in = SD.open(HIST_IMPORT_TMP, FILE_READ);
   if (!in) { msg = "Upload failed."; return false; }
-  while (in.available()) { String line = in.readStringUntil('\n'); if (histParseImportLine(line, key, v)) count++; }
+  {
+    LineReader lr(in);
+    String line;
+    while (lr.next(line)) if (histParseImportLine(line, key, v)) count++;
+  }
   in.close();
 
   if (count == 0) { msg = "No valid rows found. Expected columns: date,tMin,tMax,rainMm,humidAvg,pressureAvg,gustMaxKmh,sunHours with dates as YYYY-MM-DD."; return false; }
@@ -2332,8 +2437,10 @@ bool histImportProcess(int city, bool replaceAll, String &msg) {
   in = SD.open(HIST_IMPORT_TMP, FILE_READ);
   if (!in) { msg = "Upload failed."; return false; }
   uint16_t seq = 0;
-  while (in.available() && (int)rows.size() < count) {
-    String line = in.readStringUntil('\n');
+  {
+  LineReader lr(in);
+  String line;
+  while ((int)rows.size() < count && lr.next(line)) {
     if (!histParseImportLine(line, key, v)) continue;
     HistImportRow r;
     r.key = key;
@@ -2346,6 +2453,7 @@ bool histImportProcess(int city, bool replaceAll, String &msg) {
     r.sun10  = isnan(v[6]) ? HIST_NONE : (uint16_t)constrain(lroundf(v[6] * 10), 0L, 300L);
     r.seq    = seq++;
     rows.push_back(r);
+  }
   }
   in.close();
 
@@ -2380,8 +2488,9 @@ bool histImportProcess(int city, bool replaceAll, String &msg) {
   size_t ri = 0;
   if (!replaceAll && SD.exists(path)) {
     File ex = SD.open(path, FILE_READ);
-    while (ex && ex.available()) {
-      String line = ex.readStringUntil('\n');
+    LineReader lr(ex);
+    String line;
+    while (ex && lr.next(line)) {
       line.trim();
       if (line.length() < 10) continue;
       uint32_t k = (uint32_t)(line.substring(0, 4).toInt() * 10000L + line.substring(5, 7).toInt() * 100L + line.substring(8, 10).toInt());
@@ -2396,6 +2505,7 @@ bool histImportProcess(int city, bool replaceAll, String &msg) {
   out.close();
 
   if (SD.exists(path)) SD.remove(path);
+  histTouch(city);
   if (!SD.rename(tmp, path)) { msg = "Could not save the merged file."; return false; }
 
   String name = getDisplayCity(locs[city]);
@@ -3251,12 +3361,13 @@ void setup() {
 #endif
 
 #if USE_SD_HISTORY
+  histBootId = esp_random(); // makes this boot's history ETags unique
   historySetup(); // NEW: per-city history files (migrates the old /history.csv to City 1 on first boot)
 #endif
 
   // The WebServer only keeps request headers it's told about up front
-  const char* collectedHeaders[] = { APP_HEADER_NAME };
-  server.collectHeaders(collectedHeaders, 1);
+  const char* collectedHeaders[] = { APP_HEADER_NAME, "If-None-Match" };
+  server.collectHeaders(collectedHeaders, 2);
   server.on("/", handleRoot);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/live", handleLive);           // NEW: live slider updates (color, brightness, mode)
@@ -3269,6 +3380,8 @@ void setup() {
 #if USE_SD_HISTORY
   server.on("/history", handleHistoryPage);     // NEW: charted history page
   server.on("/api/history", handleApiHistory);  // NEW: JSON feed for the history page
+  server.on("/api/history/meta", handleHistoryMeta);                                      // NEW: page metadata + today's forecast rows
+  server.on("/api/history/raw", handleHistoryRaw);                                        // NEW: raw history CSV (fast, cacheable)
   server.on("/api/history/export", handleHistoryExport);                                  // NEW: CSV download per city
   server.on("/api/history/import", HTTP_POST, handleHistoryImportDone, handleHistoryUpload); // NEW: CSV upload (merge/replace)
   server.on("/api/history/wipe", HTTP_POST, handleHistoryWipe);                            // NEW: wipe a city / all / archived logs / local log
@@ -3643,10 +3756,23 @@ var monthTitle=function(k){return MONTHS[+k.slice(5,7)-1]+' '+k.slice(0,4);}
 var lbl=function(d,n){if(d.length==7)return MONTHS[+d.slice(5,7)-1]+" '"+d.slice(2,4);return n>400?d.slice(0,7):d.slice(5);}
 
 // ---------- data
+// Raw CSV from /api/history/raw -> the same row arrays /api/history returns.
+// Same validation as the device used to do: numeric fields only, and skip the
+// old logger's 999/-999 placeholder days.
+var NUMF=/^-?[0-9]*\.?[0-9]+$/;
+var parseCsv=function(t){var out=[];t.split('\n').forEach(l=>{l=l.trim();if(!l)return;var f=l.split(',');
+  if(f.length<6||f[0].length!=10)return;var v=[];
+  for(var k=1;k<6;k++){if(!NUMF.test(f[k]))return;v.push(+f[k]);}
+  if(v[0]>900||v[1]<-900)return;
+  var opt=k=>(f.length>k&&NUMF.test(f[k]))?+f[k]:null;
+  out.push([f[0]].concat(v,[opt(6),opt(7)]));});return out;}
 var loadAll=async function(){
   try{
-    var cities=[],meta=null,i=0,n=1;
-    while(i<n){var j=await (await fetch('/api/history?city='+i)).json();meta=j;n=j.names.length;cities.push({name:j.names[i],days:parseDays(j.days)});i++;}
+    var meta=await (await fetch('/api/history/meta')).json(),cities=[];
+    for(var i=0;i<meta.names.length;i++){
+      var rows=parseCsv(await (await fetch('/api/history/raw?city='+i)).text());
+      if(meta.today[i])rows.push(meta.today[i]);
+      cities.push({name:meta.names[i],days:parseDays(rows)});}
     S.cities=cities;S.meta=meta;
     if(!S.loaded){S.sel=meta.currentCity;S.loaded=true;}
     buildStatic();render();
