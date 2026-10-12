@@ -21,6 +21,9 @@ All notable changes to this project are listed here.
 - Endpoints that change settings or history now require the `X-Requested-With: DesktopDisplay` header, so other websites can't change them through your browser
 
 ### Changed
+- Opening the device's address now shows the Live Dashboard; Settings moved to `/settings`
+- The dashboard clock uses 7-segment digits like the device's own clock
+- Home screen: the temperature and its °C are now centered together, and the page dots no longer touch the card border
 - The History page loads much faster with years of data: the SD card is read in 2 KB blocks instead of one byte at a time, the raw CSV is sent as-is and parsed in the browser, and unchanged files are not downloaded again (ETag). Background history syncs, imports and exports use the faster reading too
 - New endpoints `/api/history/meta` and `/api/history/raw?city=N` (raw CSV); `/api/history` still works for your own scripts
 - Raw API responses are no longer printed to the serial port
