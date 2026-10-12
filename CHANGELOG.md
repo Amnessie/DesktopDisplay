@@ -27,7 +27,7 @@ All notable changes to this project are listed here.
 - Endpoints that change settings or history now require the `X-Requested-With: DesktopDisplay` header, so other websites can't change them through your browser
 
 ### Changed
-- The moon photo on the Sun & Moon page is cropped to a smooth circle; the dark theme's inner cards are slightly darker
+- The moon photo on the Sun & Moon page is cropped at the moon's own edge, so only the moon shows (no grey square or frame); the dark theme's inner cards are slightly darker
 - The Settings page loads its values from the new `/api/settings` endpoint
 - Requires TFT_eSPI 2.5 or newer (anti-aliased drawing functions)
 - Atmosphere page shows label and value on one line; forecast rows show an icon and a temperature range bar

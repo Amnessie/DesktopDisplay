@@ -2916,12 +2916,15 @@ void drawPageAstro() {
     int imgY = moonCardY + 40;
 
     TJpgDec.drawJpg(imgX, imgY, moonImages[pIdx], moonSizes[pIdx]);
-    // Crop the square photo to a smooth circle: an anti-aliased ring in the
-    // card color covers the corners. Its inner edge blends into the photo's
-    // black sky; a second ring cleans up the outer edge against the card.
+    // The photos are the moon disc (radius ~35% of the image) on a light grey
+    // square. Paint everything outside the disc in the card color with a
+    // smooth ring, so only the moon itself shows - no grey frame or outline.
+    // The ring's inner edge is blended against a mid grey (the moon's edge is
+    // dark on the shadow side and light on the lit side); a second ring
+    // cleans up its outer edge against the card.
     int mcx = imgX + imgW / 2, mcy = imgY + imgH / 2;
-    int rIn = min(imgW, imgH) / 2 - 1, rOut = (max(imgW, imgH) * 72) / 100 + 2;
-    tft.drawArc(mcx, mcy, rOut, rIn, 0, 360, T.card2, TFT_BLACK, true);
+    int rIn = (min(imgW, imgH) * 35) / 100, rOut = (max(imgW, imgH) * 72) / 100 + 2;
+    tft.drawArc(mcx, mcy, rOut, rIn, 0, 360, T.card2, RGB565(0x60, 0x64, 0x62), true);
     tft.drawArc(mcx, mcy, rOut + 2, rOut - 2, 0, 360, T.card2, T.card2, true);
     ffText(getMoonPhaseName(pIdx), 160, imgY + imgH + 26, &FreeSansBold9pt7b, MC_DATUM, T.text);
   }
