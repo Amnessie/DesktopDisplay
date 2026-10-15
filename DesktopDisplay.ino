@@ -1256,12 +1256,15 @@ void nowcastDone(int city, bool ok) {
   if (!ok) logDebug("RAIN 2H fetch failed: " + nowLastError);
 }
 
+int nowBrPreferred = 0; // the Buienradar hostname (step 0 or 1) that answered last time
+
 void nowcastStart(int city) {
   double lat, lon;
   nowLastError = "";
   if (!cachedCoords(city, lat, lon)) { nowLastError = "no coordinates for the city yet"; nowcastDone(city, false); return; }
-  int step = inBuienradarArea(lat, lon) ? 0 : 2;
-  netPost(NJ_NOW, city, step, 0, 0, nowcastUrl(step, lat, lon));
+  int step = inBuienradarArea(lat, lon) ? nowBrPreferred : 2;
+  // 'slot' carries which Buienradar hostnames were tried (bit 0 / bit 1)
+  netPost(NJ_NOW, city, step, step < 2 ? (1 << step) : 0, 0, nowcastUrl(step, lat, lon));
 }
 
 void nowcastResult(NetJob &j) {
@@ -1276,6 +1279,7 @@ void nowcastResult(NetJob &j) {
       for (int i = 0; i < n; i++) { nowMm[i] = mm[i]; nowLabel[i] = lbl[i]; }
       nowCount = n; nowStepMin = 5; nowRadar = true;
       nowSource = "Buienradar radar (" + j.url.substring(8, j.url.indexOf('/', 8)) + ")";
+      nowBrPreferred = j.step; // start with this hostname next time
       ok = true;
     } else err = "Buienradar: unexpected reply (" + String(n) + " steps)";
   } else {
@@ -1303,9 +1307,10 @@ void nowcastResult(NetJob &j) {
   if (!ok) {
     nowLastError += String(nowLastError.length() ? "; " : "") + err;
     double lat, lon;
-    if (j.step < 2 && cachedCoords(j.city, lat, lon)) { // next source
-      int next = j.step + 1, city = j.city;
-      netPost(NJ_NOW, city, next, 0, 0, nowcastUrl(next, lat, lon));
+    if (j.step < 2 && cachedCoords(j.city, lat, lon)) { // next source: the other hostname, then Open-Meteo
+      int tried = j.slot, city = j.city;
+      int next = !(tried & 1) ? 0 : (!(tried & 2) ? 1 : 2);
+      netPost(NJ_NOW, city, next, next < 2 ? (tried | (1 << next)) : tried, 0, nowcastUrl(next, lat, lon));
       return;
     }
   }
@@ -1649,6 +1654,7 @@ void verifyResult(NetJob &j) {
   if (j.kind == NJ_VF_OBS) {
     float v[3]; String l[3];
     if (j.code == HTTP_CODE_OK && parseRainText(j.body, v, l, 3) >= 1) { vfObsSum[c][slot] += v[0]; vfObsN[c][slot]++; }
+    else nowBrPreferred = 1 - nowBrPreferred; // that hostname failed - try the other one next time
     return;
   }
   if (j.kind == NJ_VF_OM) {
@@ -1731,7 +1737,7 @@ bool verifyLoop() {
       if (vfRadarFromNowcast(c, mm)) { vfObsSum[c][cs] += mm; vfObsN[c][cs]++; continue; } // no request needed
       double lat, lon;
       if (!cachedCoords(c, lat, lon)) continue;
-      return netPost(NJ_VF_OBS, c, 0, cs, cur, "https://gps.buienradar.nl/getrr.php?lat=" + String(lat, 2) + "&lon=" + String(lon, 2));
+      return netPost(NJ_VF_OBS, c, 0, cs, cur, nowcastUrl(nowBrPreferred, lat, lon)); // the Buienradar hostname that works
     }
   }
   return false;
@@ -3220,34 +3226,43 @@ int iconKindFor(String main, String desc) {
 }
 
 void drawWeatherIcon(int kind, int x, int y, int size, bool night, uint16_t bg) {
-  float f = size / 64.0f;
-  auto X = [&](float v) { return x + v * f; };
-  auto Y = [&](float v) { return y + v * f; };
-  auto S = [&](float v) { return v * f; };
-  // Cloud = three circles on a rounded base. The second pass re-fills the
-  // insides without anti-aliasing, hiding the faint seams where the smooth
-  // edges of overlapping shapes were blended against the background.
+  // Shapes on a 64x64 design grid, listed back to front. Every screen pixel is
+  // sampled 4x4 times and each sample takes the color of the topmost shape
+  // there, so overlapping shapes (a cloud over the sun) blend into each other
+  // instead of showing a light fringe where an edge was blended against the
+  // background.
+  struct Shape { uint8_t type; float p[6]; uint16_t color; float x0, y0, x1, y1; };
+  enum { SH_CIRCLE, SH_CAPSULE, SH_RRECT, SH_TRI, SH_CRESCENT };
+  Shape sh[16];
+  int n = 0;
+  auto add = [&](uint8_t type, uint16_t color, float a, float b, float c, float d, float e, float g) {
+    if (n >= 16) return;
+    Shape &q = sh[n++];
+    q.type = type; q.color = color;
+    q.p[0] = a; q.p[1] = b; q.p[2] = c; q.p[3] = d; q.p[4] = e; q.p[5] = g;
+    switch (type) { // bounding box, for skipping empty pixels quickly
+      case SH_CIRCLE: case SH_CRESCENT: q.x0 = a - c; q.x1 = a + c; q.y0 = b - c; q.y1 = b + c; break;
+      case SH_CAPSULE: q.x0 = min(a, c) - e; q.x1 = max(a, c) + e; q.y0 = min(b, d) - e; q.y1 = max(b, d) + e; break;
+      case SH_RRECT: q.x0 = a; q.x1 = a + c; q.y0 = b; q.y1 = b + d; break;
+      default: q.x0 = min(a, min(c, e)); q.x1 = max(a, max(c, e)); q.y0 = min(b, min(d, g)); q.y1 = max(b, max(d, g));
+    }
+  };
+  auto circle = [&](float cx, float cy, float r, uint16_t c) { add(SH_CIRCLE, c, cx, cy, r, 0, 0, 0); };
+  auto line = [&](float x1, float y1, float x2, float y2, float w, uint16_t c) { add(SH_CAPSULE, c, x1, y1, x2, y2, w / 2, 0); };
   auto cloud = [&](float dx, float dy, uint16_t c) {
-    tft.fillSmoothCircle(X(20 + dx), Y(38 + dy), S(11), c, bg);
-    tft.fillSmoothCircle(X(33 + dx), Y(29 + dy), S(15), c, bg);
-    tft.fillSmoothCircle(X(46 + dx), Y(38 + dy), S(11), c, bg);
-    tft.fillSmoothRoundRect(X(9 + dx), Y(36 + dy), S(48), S(13), S(6), c, bg);
-    tft.fillCircle(X(20 + dx), Y(38 + dy), S(11) - 1, c);
-    tft.fillCircle(X(33 + dx), Y(29 + dy), S(15) - 1, c);
-    tft.fillCircle(X(46 + dx), Y(38 + dy), S(11) - 1, c);
-    tft.fillRect(X(12 + dx), Y(37 + dy), S(42), S(11), c);
+    circle(20 + dx, 38 + dy, 11, c);
+    circle(33 + dx, 29 + dy, 15, c);
+    circle(46 + dx, 38 + dy, 11, c);
+    add(SH_RRECT, c, 9 + dx, 36 + dy, 48, 13, 6, 0);
   };
   auto sun = [&](float cx, float cy, float r, float r1, float r2, float w) {
     for (int k = 0; k < 8; k++) {
       float a = k * PI / 4;
-      tft.drawWideLine(X(cx + cos(a) * r1), Y(cy + sin(a) * r1), X(cx + cos(a) * r2), Y(cy + sin(a) * r2), S(w), T.sun, bg);
+      line(cx + cos(a) * r1, cy + sin(a) * r1, cx + cos(a) * r2, cy + sin(a) * r2, w, T.sun);
     }
-    tft.fillSmoothCircle(X(cx), Y(cy), S(r), T.sun, bg);
+    circle(cx, cy, r, T.sun);
   };
-  auto moon = [&](float cx, float cy, float r) {
-    tft.fillSmoothCircle(X(cx), Y(cy), S(r), T.moon, bg);
-    tft.fillSmoothCircle(X(cx + r * 0.45f), Y(cy - r * 0.35f), S(r * 0.85f), bg, T.moon);
-  };
+  auto moon = [&](float cx, float cy, float r) { add(SH_CRESCENT, T.moon, cx, cy, r, cx + r * 0.45f, cy - r * 0.35f, r * 0.85f); };
 
   switch (kind) {
     case ICON_CLEAR:
@@ -3258,34 +3273,83 @@ void drawWeatherIcon(int kind, int x, int y, int size, bool night, uint16_t bg) 
       cloud(6, 8, T.icon);
       break;
     case ICON_RAIN:
+      for (int i = 0; i < 3; i++) line(23 + 11 * i, 47, 19 + 11 * i, 58, 3.5f, T.rain);
       cloud(0, -6, T.icon);
-      for (int i = 0; i < 3; i++) tft.drawWideLine(X(23 + 11 * i), Y(47), X(19 + 11 * i), Y(58), S(3.5f), T.rain, bg);
       break;
     case ICON_DRIZZLE:
+      for (int i = 0; i < 3; i++) { circle(22 + 11 * i, 50, 2.4f, T.rain); circle(27 + 11 * i, 58, 2.4f, T.rain); }
       cloud(0, -6, T.icon);
-      for (int i = 0; i < 3; i++) {
-        tft.fillSmoothCircle(X(22 + 11 * i), Y(50), S(2.4f), T.rain, bg);
-        tft.fillSmoothCircle(X(27 + 11 * i), Y(58), S(2.4f), T.rain, bg);
-      }
       break;
     case ICON_THUNDER:
       cloud(0, -6, T.icon);
-      tft.fillTriangle(X(36), Y(40), X(25), Y(54), X(33), Y(54), T.sun);
-      tft.fillTriangle(X(30), Y(52), X(39), Y(52), X(27), Y(64), T.sun);
+      add(SH_TRI, T.sun, 36, 40, 25, 54, 33, 54);
+      add(SH_TRI, T.sun, 30, 52, 39, 52, 27, 64);
       break;
     case ICON_SNOW:
       cloud(0, -6, T.icon);
-      tft.fillSmoothCircle(X(21), Y(50), S(2.8f), T.lo, bg);
-      tft.fillSmoothCircle(X(33), Y(55), S(2.8f), T.lo, bg);
-      tft.fillSmoothCircle(X(45), Y(50), S(2.8f), T.lo, bg);
-      tft.fillSmoothCircle(X(27), Y(61), S(2.8f), T.lo, bg);
-      tft.fillSmoothCircle(X(39), Y(61), S(2.8f), T.lo, bg);
+      circle(21, 50, 2.8f, T.lo); circle(33, 55, 2.8f, T.lo); circle(45, 50, 2.8f, T.lo);
+      circle(27, 61, 2.8f, T.lo); circle(39, 61, 2.8f, T.lo);
       break;
     case ICON_FOG:
-      for (int i = 0; i < 4; i++) tft.drawWideLine(X(i % 2 ? 14 : 8), Y(20 + 10 * i), X(i % 2 ? 56 : 50), Y(20 + 10 * i), S(5), T.icon, bg);
+      for (int i = 0; i < 4; i++) line(i % 2 ? 14 : 8, 20 + 10 * i, i % 2 ? 56 : 50, 20 + 10 * i, 5, T.icon);
       break;
     default:
       cloud(0, 0, T.icon);
+  }
+
+  auto inside = [&](const Shape &q, float px, float py) -> bool {
+    const float *p = q.p;
+    switch (q.type) {
+      case SH_CIRCLE: { float dx = px - p[0], dy = py - p[1]; return dx * dx + dy * dy <= p[2] * p[2]; }
+      case SH_CRESCENT: {
+        float dx = px - p[0], dy = py - p[1], ex = px - p[3], ey = py - p[4];
+        return dx * dx + dy * dy <= p[2] * p[2] && ex * ex + ey * ey > p[5] * p[5];
+      }
+      case SH_CAPSULE: { // distance from the segment <= half the width (round caps)
+        float vx = p[2] - p[0], vy = p[3] - p[1], wx = px - p[0], wy = py - p[1];
+        float t = constrain((wx * vx + wy * vy) / (vx * vx + vy * vy), 0.0f, 1.0f);
+        float dx = wx - t * vx, dy = wy - t * vy;
+        return dx * dx + dy * dy <= p[4] * p[4];
+      }
+      case SH_RRECT: {
+        float hw = p[2] / 2, hh = p[3] / 2, r = p[4];
+        float qx = fabsf(px - (p[0] + hw)) - (hw - r), qy = fabsf(py - (p[1] + hh)) - (hh - r);
+        if (qx <= 0 || qy <= 0) return qx <= r && qy <= r;
+        return qx * qx + qy * qy <= r * r;
+      }
+      default: { // triangle: same side of all three edges
+        float d1 = (px - p[2]) * (p[1] - p[3]) - (p[0] - p[2]) * (py - p[3]);
+        float d2 = (px - p[4]) * (p[3] - p[5]) - (p[2] - p[4]) * (py - p[5]);
+        float d3 = (px - p[0]) * (p[5] - p[1]) - (p[4] - p[0]) * (py - p[1]);
+        bool neg = d1 < 0 || d2 < 0 || d3 < 0, pos = d1 > 0 || d2 > 0 || d3 > 0;
+        return !(neg && pos);
+      }
+    }
+  };
+
+  float f = size / 64.0f, inv = 1.0f / f;
+  int cand[16];
+  for (int py = 0; py < size; py++) {
+    float gy0 = py * inv, gy1 = (py + 1) * inv;
+    for (int px = 0; px < size; px++) {
+      float gx0 = px * inv, gx1 = (px + 1) * inv;
+      int nc = 0;
+      for (int i = n - 1; i >= 0; i--) // topmost first
+        if (sh[i].x1 >= gx0 && sh[i].x0 <= gx1 && sh[i].y1 >= gy0 && sh[i].y0 <= gy1) cand[nc++] = i;
+      if (!nc) continue;
+      int r = 0, g = 0, b = 0, hit = 0;
+      for (int sy = 0; sy < 4; sy++) {
+        float gy = (py + (sy + 0.5f) / 4) * inv;
+        for (int sx = 0; sx < 4; sx++) {
+          float gx = (px + (sx + 0.5f) / 4) * inv;
+          uint16_t c = bg;
+          for (int k = 0; k < nc; k++) if (inside(sh[cand[k]], gx, gy)) { c = sh[cand[k]].color; hit++; break; }
+          r += (c >> 11) & 31; g += (c >> 5) & 63; b += c & 31;
+        }
+      }
+      if (!hit) continue; // nothing here - leave the background as it is
+      tft.drawPixel(x + px, y + py, (((r + 8) / 16) << 11) | (((g + 8) / 16) << 5) | ((b + 8) / 16));
+    }
   }
 }
 

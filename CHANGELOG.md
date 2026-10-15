@@ -17,6 +17,8 @@ All notable changes to this project are listed here.
 - Redesigned web interface for desktop and phone, with light/dark/auto themes: a new dashboard (weather icons, rain chart, sun arc, moon phase, forecast range bars, indoor sensor and device status), card-based Settings, and History and Debug in the same style. Shared stylesheet/script are cached by the browser
 
 ### Fixed
+- Weather icons on the display are drawn with 4x4 supersampling: no more light fringes where a cloud overlaps the sun, seams inside clouds, or a ring around the crescent moon
+- The rain outlook remembers which Buienradar hostname answered and starts there, instead of first waiting on one that's down every time; the forecast check's radar samples use the working hostname too (they were stuck on the first one, so cities could never be scored when it was down)
 - Freezes and a slow web interface: the rain outlook, rain model, pressure trend and forecast check requests now run on a background task, so a slow server can no longer hold up the touchscreen or the web pages. HTTPS requests also give up after 8 s in the TLS handshake instead of the library's 120 s, and they never run two at a time (each needs ~45 KB of RAM). The Debug page shows the longest freeze since boot and the lowest free memory, and the log records why the device last restarted
 - A failed weather refresh no longer blanks the screen (0.0 °C) until the next attempt; the last good data stays up, with the status dot turning red
 - Open-Meteo (KNMI) no longer shows made-up "0/0 C CLEAR" forecast days: it now uses KNMI's seamless model (2 km Netherlands model, topped up with ECMWF), and any day a model doesn't cover shows "NO DATA"
