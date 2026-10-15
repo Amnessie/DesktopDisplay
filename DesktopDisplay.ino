@@ -743,6 +743,19 @@ int httpGetJson(String baseUrlNoKey, String &payload) {
 // (either from cache, or freshly fetched). City coordinates don't change,
 // so once geocoded we don't need to hit that endpoint again unless the
 // location string itself changes.
+// Reads OpenWeatherMap's geocoder reply and remembers the city's coordinates.
+bool applyGeoPayload(int idx, const String &payload, double &lat, double &lon) {
+  DynamicJsonDocument geoDoc(1536);
+  if (deserializeJson(geoDoc, payload) || geoDoc.size() == 0) return false;
+  lat = geoDoc[0]["lat"]; lon = geoDoc[0]["lon"];
+  cityLat[idx] = lat; cityLon[idx] = lon;
+  cityGeoCached[idx] = true; cityGeoLocStr[idx] = locs[idx];
+  prefs.putFloat(("lat" + String(idx)).c_str(), (float)lat);
+  prefs.putFloat(("lon" + String(idx)).c_str(), (float)lon);
+  prefs.putString(("geoLoc" + String(idx)).c_str(), locs[idx]);
+  return true;
+}
+
 bool getCityCoords(int idx, double &lat, double &lon) {
   String loc = locs[idx];
 
@@ -754,162 +767,100 @@ bool getCityCoords(int idx, double &lat, double &lon) {
   String currentLoc = loc;
   currentLoc.replace(",UK", ",GB");
   currentLoc.replace(",uk", ",GB");
-  String encodedLoc = urlEncode(currentLoc);
-  String geoUrl = "http://api.openweathermap.org/geo/1.0/direct?q=" + encodedLoc + "&limit=1";
-
+  String geoUrl = "http://api.openweathermap.org/geo/1.0/direct?q=" + urlEncode(currentLoc) + "&limit=1";
   String payload;
-  bool ok = false;
-  if (httpGetJson(geoUrl, payload) == HTTP_CODE_OK) {
-    DynamicJsonDocument geoDoc(1536);
-    deserializeJson(geoDoc, payload);
-    if (geoDoc.size() > 0) {
-      lat = geoDoc[0]["lat"]; lon = geoDoc[0]["lon"];
-      cityLat[idx] = lat; cityLon[idx] = lon;
-      cityGeoCached[idx] = true; cityGeoLocStr[idx] = loc;
-      prefs.putFloat(("lat" + String(idx)).c_str(), (float)lat);
-      prefs.putFloat(("lon" + String(idx)).c_str(), (float)lon);
-      prefs.putString(("geoLoc" + String(idx)).c_str(), loc);
-      ok = true;
-    }
-  }
-  return ok;
+  return httpGetJson(geoUrl, payload) == HTTP_CODE_OK && applyGeoPayload(idx, payload, lat, lon);
 }
 
 // --- [CORE WEATHER DATA FETCH] ---
 
-// NEW: fetches from OpenWeatherMap - this is the original fetch logic,
-// unchanged, just moved into its own function so getOpenWeatherData() can
-// dispatch to whichever provider the current city is configured to use.
-bool fetchFromOpenWeatherMap() {
+// OpenWeatherMap current weather (the /weather reply) into the globals.
+bool parseOwmNow(const String &payload) {
   bool weatherFetchSuccess = false;
-
-  // Step 1: Geocoding (cached per-city, see getCityCoords)
-  double lat = 0, lon = 0;
-  bool foundByGeo = getCityCoords(currentCity, lat, lon);
-
-  String currentLoc = locs[currentCity];
-  currentLoc.replace(",UK", ",GB");
-  currentLoc.replace(",uk", ",GB");
-  String encodedLoc = urlEncode(currentLoc);
-
-  // Step 2: Weather Call
-  String weatherUrl;
-  if (foundByGeo) weatherUrl = "http://api.openweathermap.org/data/2.5/weather?lat=" + String(lat, 6) + "&lon=" + String(lon, 6) + "&units=metric&cb=" + String(millis());
-  else weatherUrl = "http://api.openweathermap.org/data/2.5/weather?q=" + encodedLoc + "&units=metric&cb=" + String(millis());
-
-  String weatherPayload;
-  if (httpGetJson(weatherUrl, weatherPayload) == HTTP_CODE_OK) {
-    DynamicJsonDocument doc(3072); deserializeJson(doc, weatherPayload);
-    if (doc.containsKey("main")) {
-      tempnum = doc["main"]["temp"].as<float>(); 
-      tempMin = doc["main"]["temp_min"].as<float>(); 
-      tempMax = doc["main"]["temp_max"].as<float>();
-      feels_like = doc["main"]["feels_like"].as<float>();
-      huminum = (int)doc["main"]["humidity"]; 
-      pressure = (int)doc["main"]["pressure"];
-      clouds = (int)doc["clouds"]["all"]; 
-      visibility = (int)doc["visibility"] / 1000;
-      windSpeedKmH = doc["wind"]["speed"].as<float>() * 3.6;
-      windDir = getWindDir(doc["wind"]["deg"]);
-      mainWeather = doc["weather"][0]["main"].as<String>(); 
-      weatherDesc = doc["weather"][0]["description"].as<String>(); 
-      weatherDesc.toUpperCase();
-      rain1h = doc["rain"]["1h"] | 0.0; 
-      rain3h = doc["rain"]["3h"] | 0.0;
-      if (!foundByGeo && doc.containsKey("coord")) { lat = doc["coord"]["lat"]; lon = doc["coord"]["lon"]; }
-      tzOffsetSec[currentCity] = doc["timezone"].as<long>();
-      sysRise = doc["sys"]["sunrise"].as<long>() + tzOffsetSec[currentCity];
-      sysSet  = doc["sys"]["sunset"].as<long>() + tzOffsetSec[currentCity];
-      sunRise = (hour(sysRise) < 10 ? "0" : "") + String(hour(sysRise)) + ":" + (minute(sysRise) < 10 ? "0" : "") + String(minute(sysRise));
-      sunSet  = (hour(sysSet) < 10 ? "0" : "") + String(hour(sysSet)) + ":" + (minute(sysSet) < 10 ? "0" : "") + String(minute(sysSet));
-      setWeatherLED(mainWeather);
-      weatherFetchSuccess = true;
-    }
+  DynamicJsonDocument doc(3072); deserializeJson(doc, payload);
+  if (doc.containsKey("main")) {
+    tempnum = doc["main"]["temp"].as<float>(); 
+    tempMin = doc["main"]["temp_min"].as<float>(); 
+    tempMax = doc["main"]["temp_max"].as<float>();
+    feels_like = doc["main"]["feels_like"].as<float>();
+    huminum = (int)doc["main"]["humidity"]; 
+    pressure = (int)doc["main"]["pressure"];
+    clouds = (int)doc["clouds"]["all"]; 
+    visibility = (int)doc["visibility"] / 1000;
+    windSpeedKmH = doc["wind"]["speed"].as<float>() * 3.6;
+    windDir = getWindDir(doc["wind"]["deg"]);
+    mainWeather = doc["weather"][0]["main"].as<String>(); 
+    weatherDesc = doc["weather"][0]["description"].as<String>(); 
+    weatherDesc.toUpperCase();
+    rain1h = doc["rain"]["1h"] | 0.0; 
+    rain3h = doc["rain"]["3h"] | 0.0;
+    tzOffsetSec[currentCity] = doc["timezone"].as<long>();
+    sysRise = doc["sys"]["sunrise"].as<long>() + tzOffsetSec[currentCity];
+    sysSet  = doc["sys"]["sunset"].as<long>() + tzOffsetSec[currentCity];
+    sunRise = (hour(sysRise) < 10 ? "0" : "") + String(hour(sysRise)) + ":" + (minute(sysRise) < 10 ? "0" : "") + String(minute(sysRise));
+    sunSet  = (hour(sysSet) < 10 ? "0" : "") + String(hour(sysSet)) + ":" + (minute(sysSet) < 10 ? "0" : "") + String(minute(sysSet));
+    setWeatherLED(mainWeather);
+    weatherFetchSuccess = true;
   }
-
-  // Step 3: Forecast (Today + 4 Days)
-  String forecastUrl;
-  if (lat != 0 || lon != 0) forecastUrl = "http://api.openweathermap.org/data/2.5/forecast?lat=" + String(lat, 6) + "&lon=" + String(lon, 6) + "&units=metric&cb=" + String(millis());
-  else forecastUrl = "http://api.openweathermap.org/data/2.5/forecast?q=" + encodedLoc + "&units=metric&cb=" + String(millis());
-
-  String forecastPayload;
-  if (httpGetJson(forecastUrl, forecastPayload) == HTTP_CODE_OK) {
-    // Only keep the fields we actually use - the full 40-slice response is far
-    // bigger than needed and could run out of memory part-way through parsing
-    // (silently dropping the later forecast days).
-    DynamicJsonDocument filter(512);
-    filter["list"][0]["dt"] = true;
-    filter["list"][0]["main"]["temp"] = true;
-    filter["list"][0]["weather"][0]["main"] = true;
-    filter["list"][0]["rain"]["3h"] = true;
-    DynamicJsonDocument fdoc(12288);
-    DeserializationError ferr = deserializeJson(fdoc, forecastPayload, DeserializationOption::Filter(filter));
-    if (ferr) logDebug("Forecast JSON error: " + String(ferr.c_str()));
-    if (!ferr && fdoc.containsKey("list")) {
-      JsonArray list = fdoc["list"];
-      int dIdx = -1; String curL = "";
-      for (JsonObject slice : list) {
-        long dt = slice["dt"].as<long>() + tzOffsetSec[currentCity];
-
-        // Grab the rainfall figure for each of the next few 3-hour slices,
-        // independent of the day-bucketing below, for the precipitation graph
-        if (upcomingRainCount < RAIN_GRAPH_POINTS) {
-          float r3 = slice["rain"]["3h"] | 0.0;
-          upcomingRainMm[upcomingRainCount] = r3;
-          int hh = hour(dt);
-          upcomingRainLabel[upcomingRainCount] = (hh < 10 ? "0" : "") + String(hh) + "h";
-          upcomingRainCount++;
-        }
-
-        String dL = getDayName(weekday(dt)); 
-        if (dL != curL) { 
-          dIdx++;
-          if (dIdx >= 5) break;
-          curL = dL; forecast[dIdx].dayName = dL;
-          forecast[dIdx].high = -99.0; forecast[dIdx].low = 99.0;
-          forecast[dIdx].main = slice["weather"][0]["main"].as<String>();
-          forecast[dIdx].main.toUpperCase();
-          forecast[dIdx].valid = true;
-        }
-        float t = slice["main"]["temp"].as<float>();
-        if (t > forecast[dIdx].high) forecast[dIdx].high = t;
-        if (t < forecast[dIdx].low) forecast[dIdx].low = t;
-      }
-    }
-  }
-
   return weatherFetchSuccess;
 }
 
-// NEW: fetches from Open-Meteo - no API key needed, one combined request
-// gets current + hourly + daily data. useKnmiModel uses KNMI's "seamless"
-// blend: their 2km Harmonie AROME Netherlands model where it has data, filled
-// in with KNMI's Europe model and then ECMWF beyond its ~2.5-day range or
-// outside the Netherlands - so all 5 forecast days always get real values.
+// OpenWeatherMap 5-day / 3-hour forecast (the /forecast reply) into the globals.
+void parseOwmForecast(const String &payload) {
+  // Only keep the fields we actually use - the full 40-slice response is far
+  // bigger than needed and could run out of memory part-way through parsing
+  // (silently dropping the later forecast days).
+  DynamicJsonDocument filter(512);
+  filter["list"][0]["dt"] = true;
+  filter["list"][0]["main"]["temp"] = true;
+  filter["list"][0]["weather"][0]["main"] = true;
+  filter["list"][0]["rain"]["3h"] = true;
+  DynamicJsonDocument fdoc(12288);
+  DeserializationError ferr = deserializeJson(fdoc, payload, DeserializationOption::Filter(filter));
+  if (ferr) logDebug("Forecast JSON error: " + String(ferr.c_str()));
+  if (!ferr && fdoc.containsKey("list")) {
+    JsonArray list = fdoc["list"];
+    int dIdx = -1; String curL = "";
+    for (JsonObject slice : list) {
+      long dt = slice["dt"].as<long>() + tzOffsetSec[currentCity];
+
+      // Grab the rainfall figure for each of the next few 3-hour slices,
+      // independent of the day-bucketing below, for the precipitation graph
+      if (upcomingRainCount < RAIN_GRAPH_POINTS) {
+        float r3 = slice["rain"]["3h"] | 0.0;
+        upcomingRainMm[upcomingRainCount] = r3;
+        int hh = hour(dt);
+        upcomingRainLabel[upcomingRainCount] = (hh < 10 ? "0" : "") + String(hh) + "h";
+        upcomingRainCount++;
+      }
+
+      String dL = getDayName(weekday(dt)); 
+      if (dL != curL) { 
+        dIdx++;
+        if (dIdx >= 5) break;
+        curL = dL; forecast[dIdx].dayName = dL;
+        forecast[dIdx].high = -99.0; forecast[dIdx].low = 99.0;
+        forecast[dIdx].main = slice["weather"][0]["main"].as<String>();
+        forecast[dIdx].main.toUpperCase();
+        forecast[dIdx].valid = true;
+      }
+      float t = slice["main"]["temp"].as<float>();
+      if (t > forecast[dIdx].high) forecast[dIdx].high = t;
+      if (t < forecast[dIdx].low) forecast[dIdx].low = t;
+    }
+  }
+}
+
 // Reads a JSON number as float, or def if it's missing/null (Open-Meteo uses
 // null for values a model doesn't cover).
 float jsonNum(JsonVariant v, float def) { return v.isNull() ? def : v.as<float>(); }
 
-bool fetchFromOpenMeteo(bool useKnmiModel) {
-  double lat = 0, lon = 0;
-  if (!getCityCoords(currentCity, lat, lon)) return false; // Open-Meteo needs coordinates, not a free-text city name
-
-  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 6) + "&longitude=" + String(lon, 6)
-    + "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,pressure_msl,wind_speed_10m,wind_direction_10m,visibility,cloud_cover"
-    + "&hourly=weather_code,precipitation"
-    + "&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset"
-    + "&timezone=auto&forecast_days=5&forecast_hours=15";
-  if (useKnmiModel) url += "&models=knmi_seamless";
-
-  HTTPClient http;
-  http.setTimeout(5000);
-  WiFiClientSecure tls; WiFiClient plain;
-  httpBeginSafe(http, tls, plain, url);
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) { http.end(); return false; }
-  String payload = http.getString();
-  http.end();
-
+// Open-Meteo's combined reply (current + hourly + daily) into the globals. No
+// API key needed. The KNMI option uses KNMI's "seamless" blend: their 2 km
+// Harmonie AROME Netherlands model where it has data, filled in with KNMI's
+// Europe model and then ECMWF beyond its ~2.5-day range or outside the
+// Netherlands - so all 5 forecast days always get real values.
+bool parseOpenMeteo(const String &payload) {
   DynamicJsonDocument doc(8192);
   DeserializationError err = deserializeJson(doc, payload);
   if (err || !doc.containsKey("current")) return false;
@@ -1013,8 +964,101 @@ void restoreCurrentFrom(const WeatherSnapshot &s) {
 int lastDataCity = -1;  // which city the data currently in memory belongs to
 bool lastDataOK = false; // whether that data came from a successful fetch
 
-void getOpenWeatherData() {
-  if (WiFi.status() != WL_CONNECTED) { lastFetchOK = false; return; }
+// --- Weather update as a short sequence of requests, so the same code can run
+// in the background (normal use) or straight through (once, at boot):
+//   OpenWeatherMap: [find the city] -> current weather -> forecast
+//   Open-Meteo:     [find the city] -> one combined request
+// "Find the city" (OpenWeatherMap's geocoder) is only needed the first time.
+const int WX_GEO = 0, WX_OWM_NOW = 1, WX_OWM_FC = 2, WX_OM = 3, WX_DONE = 9;
+int wxStep = WX_DONE, wxCity = -1, wxProvider = 0;
+uint32_t wxGen = 0;              // bumped for every new update; older replies are ignored
+bool wxActive = false;           // an update is running in the background
+bool wxHasCoords = false, wxBackupTried = false, wxNowOK = false, wxFcOK = false;
+double wxLat = 0, wxLon = 0;
+String wxNowBody, wxFcBody;
+unsigned long wxStartedAt = 0;
+
+String wxKey() { return wxBackupTried ? apiKeyBackup : apiKey; }
+
+int wxFirstDataStep() { return wxProvider == PROVIDER_OPENWEATHER ? WX_OWM_NOW : WX_OM; }
+
+void wxBegin(int city) {
+  wxGen++;
+  wxCity = city; wxProvider = constrain(cityProvider[city], 0, 2);
+  wxNowBody = ""; wxFcBody = ""; wxNowOK = wxFcOK = false; wxBackupTried = false;
+  wxHasCoords = cachedCoords(city, wxLat, wxLon);
+  wxStep = wxHasCoords ? wxFirstDataStep() : WX_GEO;
+}
+
+String wxCityQuery() {
+  String loc = locs[wxCity];
+  loc.replace(",UK", ",GB"); loc.replace(",uk", ",GB");
+  return urlEncode(loc);
+}
+
+String wxUrl() {
+  String ll = "lat=" + String(wxLat, 6) + "&lon=" + String(wxLon, 6);
+  switch (wxStep) {
+    case WX_GEO: return "http://api.openweathermap.org/geo/1.0/direct?q=" + wxCityQuery() + "&limit=1&appid=" + wxKey();
+    case WX_OWM_NOW: return "http://api.openweathermap.org/data/2.5/weather?" + (wxHasCoords ? ll : "q=" + wxCityQuery()) + "&units=metric&cb=" + String(millis()) + "&appid=" + wxKey();
+    case WX_OWM_FC: return "http://api.openweathermap.org/data/2.5/forecast?" + (wxHasCoords ? ll : "q=" + wxCityQuery()) + "&units=metric&cb=" + String(millis()) + "&appid=" + wxKey();
+    default: {
+      String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(wxLat, 6) + "&longitude=" + String(wxLon, 6)
+        + "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,pressure_msl,wind_speed_10m,wind_direction_10m,visibility,cloud_cover"
+        + "&hourly=weather_code,precipitation"
+        + "&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset"
+        + "&timezone=auto&forecast_days=5&forecast_hours=15";
+      if (wxProvider == PROVIDER_OPENMETEO_KNMI) url += "&models=knmi_seamless";
+      return url;
+    }
+  }
+}
+
+// One reply came back: store it and move on to the next step.
+void wxOnResult(int code, String &body) {
+  bool owmStep = wxStep != WX_OM;
+  // Rejected or rate-limited key: try the same request once more with the backup key
+  if (owmStep && (code == 401 || code == 429) && !wxBackupTried && apiKeyBackup.length() > 0 && apiKeyBackup != apiKey) {
+    wxBackupTried = true;
+    return;
+  }
+  if (owmStep && code == HTTP_CODE_OK) activeApiKeySource = wxBackupTried ? "backup" : "primary";
+  switch (wxStep) {
+    case WX_GEO:
+      if (code == HTTP_CODE_OK) wxHasCoords = applyGeoPayload(wxCity, body, wxLat, wxLon);
+      // Open-Meteo needs coordinates; OpenWeatherMap can fall back to the city name
+      wxStep = (wxHasCoords || wxProvider == PROVIDER_OPENWEATHER) ? wxFirstDataStep() : WX_DONE;
+      break;
+    case WX_OWM_NOW:
+      wxNowOK = code == HTTP_CODE_OK;
+      if (wxNowOK) {
+        wxNowBody = body;
+        if (!wxHasCoords) { // found by name: use its coordinates for the forecast
+          DynamicJsonDocument filter(64); filter["coord"] = true;
+          DynamicJsonDocument d(256);
+          if (!deserializeJson(d, body, DeserializationOption::Filter(filter)) && d.containsKey("coord")) {
+            wxLat = d["coord"]["lat"]; wxLon = d["coord"]["lon"]; wxHasCoords = true;
+          }
+        }
+      }
+      wxStep = WX_OWM_FC;
+      break;
+    case WX_OWM_FC:
+      wxFcOK = code == HTTP_CODE_OK;
+      if (wxFcOK) wxFcBody = body;
+      wxStep = WX_DONE;
+      break;
+    default:
+      wxNowOK = code == HTTP_CODE_OK;
+      if (wxNowOK) wxNowBody = body;
+      wxStep = WX_DONE;
+  }
+}
+
+// All replies are in: put them into the globals, keeping the previous data if
+// the refresh failed (same rules as always).
+void wxApply() {
+  if (WiFi.status() != WL_CONNECTED && !wxNowOK) { lastFetchOK = false; return; }
 
   // Keep a copy of the current data if it's a good set for this same city -
   // a refresh that fails (or only half-succeeds) then falls back to it.
@@ -1039,11 +1083,13 @@ void getOpenWeatherData() {
   upcomingRainCount = 0;
 
   bool weatherFetchSuccess;
-  if (cityProvider[currentCity] == PROVIDER_OPENWEATHER) {
-    weatherFetchSuccess = fetchFromOpenWeatherMap();
+  if (wxProvider == PROVIDER_OPENWEATHER) {
+    weatherFetchSuccess = wxNowOK && parseOwmNow(wxNowBody);
+    if (wxFcOK) parseOwmForecast(wxFcBody);
   } else {
-    weatherFetchSuccess = fetchFromOpenMeteo(cityProvider[currentCity] == PROVIDER_OPENMETEO_KNMI);
+    weatherFetchSuccess = wxNowOK && parseOpenMeteo(wxNowBody);
   }
+  wxNowBody = ""; wxFcBody = ""; // free memory
 
   if (canRestore) {
     if (!weatherFetchSuccess) {
@@ -1067,10 +1113,21 @@ void getOpenWeatherData() {
   // all three cities in the background regardless of which one is shown.
 }
 
-// --- [NEW: NON-BLOCKING-FEELING UPDATE WRAPPER] ---
-// Shows a small "..." badge instead of wiping the whole screen, so the old
-// data stays visible (and the UI doesn't look frozen/blank) while the
-// network calls run. Once done, forces a full redraw of the current page.
+// Blocking version, used once at boot (before the screen shows anything).
+void getOpenWeatherData() {
+  if (WiFi.status() != WL_CONNECTED) { lastFetchOK = false; return; }
+  wxBegin(currentCity);
+  while (wxStep != WX_DONE) {
+    String body;
+    int code = netGet(wxUrl(), body);
+    wxOnResult(code, body);
+  }
+  wxApply();
+}
+
+// --- [BACKGROUND WEATHER UPDATE] ---
+// Shows a small "..." badge while the update runs in the background; the old
+// data stays on screen meanwhile. Once done, the current page is redrawn.
 void drawUpdatingBadge(bool show) {
   if (show) {
     // Home page: over the city dots (the corners hold the city arrows).
@@ -1085,15 +1142,23 @@ void drawUpdatingBadge(bool show) {
 }
 
 void triggerWeatherUpdate() {
-  unsigned long t0 = millis();
   isUpdating = true;
   drawUpdatingBadge(true);
-  bool locked = netLock(3000); // let a background request finish first, but never stall the screen for long
-  unsigned long waited = millis() - t0;
-  getOpenWeatherData();
-  if (locked) netUnlock();
+  if (WiFi.status() != WL_CONNECTED) { lastFetchOK = false; wxFinish(); return; }
+  wxBegin(currentCity); // a new city (or a second tap) simply restarts the sequence
+  wxActive = true;
+  wxStartedAt = millis();
+  // nowcastLoop() hands the requests to the background worker one by one and calls wxFinish()
+}
+
+// The background weather update is complete (or couldn't start): show it.
+void wxFinish() {
+  if (wxActive) {
+    wxActive = false;
+    if (wxCity == currentCity) wxApply();
+    if (millis() - wxStartedAt > 8000) logDebug("Weather update took " + String((millis() - wxStartedAt) / 1000) + " s");
+  }
   isUpdating = false;
-  if (millis() - t0 > 1000) logDebug("SLOW weather update: " + String(millis() - t0) + " ms (waited " + String(waited) + " ms for a background request)");
   applyTheme(); // new sunrise/sunset times (or another city) can change the AUTO theme
   drawPageBackground(displayMode);
   drawnMode = -1;
@@ -1161,7 +1226,7 @@ int parseRainText(const String &body, float *mm, String *lbl, int maxN) {
 // server or a stalled TLS handshake can never freeze the device. One job at a
 // time; the blocking weather and history fetches on the main loop take the
 // same lock, so two HTTPS sessions (~45 KB of RAM each) never run at once.
-enum NetKind { NJ_NOW = 1, NJ_MODEL, NJ_PTREND, NJ_VF_OBS, NJ_VF_OM, NJ_VF_OWM, NJ_HIST };
+enum NetKind { NJ_NOW = 1, NJ_MODEL, NJ_PTREND, NJ_VF_OBS, NJ_VF_OM, NJ_VF_OWM, NJ_HIST, NJ_WX };
 NetJob netJob;
 bool netBusy = false;
 QueueHandle_t netJobQ = nullptr, netDoneQ = nullptr;
@@ -1227,11 +1292,6 @@ bool netPost(int kind, int city, int step, int slot, uint32_t start, const Strin
   return true;
 }
 
-// For the blocking fetches still on the main loop (weather, history). They
-// wait at most a few seconds; if the background request is still running they
-// go ahead anyway rather than freezing the screen.
-bool netLock(unsigned long ms) { return netMutex && xSemaphoreTake(netMutex, pdMS_TO_TICKS(ms)) == pdTRUE; }
-void netUnlock() { xSemaphoreGive(netMutex); }
 
 // Coordinates only if already known - never a (blocking) geocoding request.
 bool cachedCoords(int c, double &lat, double &lon) {
@@ -1564,11 +1624,24 @@ void nowcastLoop() {
       case NJ_PTREND: pTrendResult(*jp); break;
       case NJ_VF_OBS: case NJ_VF_OM: case NJ_VF_OWM: verifyResult(*jp); break;
       case NJ_HIST: histResult(*jp); break;
+      case NJ_WX:
+        if (jp->start == wxGen && wxActive) { // ignore replies for an update that was restarted
+          wxOnResult(jp->code, jp->body);
+          if (wxStep == WX_DONE) wxFinish();
+        }
+        break;
     }
     if (millis() - pt0 > 500) logDebug("SLOW handling job " + String(pkind) + ": " + String(millis() - pt0) + " ms");
     if (!netBusy) { netJob.body = ""; netJob.url = ""; } // free the reply (unless a follow-up was posted)
   }
   if (netBusy) return;
+
+  // The weather update for the screen goes first, one request at a time
+  if (wxActive) {
+    if (WiFi.status() != WL_CONNECTED) { lastFetchOK = false; wxFinish(); return; }
+    netPost(NJ_WX, wxCity, wxStep, 0, wxGen, wxUrl());
+    return;
+  }
 
   if (WiFi.status() != WL_CONNECTED || isUpdating || timeStatus() == timeNotSet) return;
   if (lastAttempt != 0 && millis() - lastAttempt < 3000) return; // a short breather between requests
@@ -2056,6 +2129,7 @@ void handleApiStatus() {
   static const char *PROVIDER_NAMES[] = {"OpenWeatherMap", "Open-Meteo", "Open-Meteo KNMI"};
   json += "\"provider\":\"" + String(PROVIDER_NAMES[constrain(cityProvider[currentCity], 0, 2)]) + "\",";
   json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"updating\":" + String(isUpdating ? "true" : "false") + ",";
   analyzeNowcast();
   if (nowValid) {
     json += "\"nowcast\":{\"valid\":true,\"radar\":" + String(nowRadar ? "true" : "false") + ",\"stepMin\":" + String(nowStepMin)
@@ -4584,7 +4658,7 @@ void loop() {
       }
     }
 
-    if (!touchHandled && dur > 1500 && dur < 5000) {
+    if (!touchHandled && dur > 2500 && dur < 5000) { // a deliberate long press, not a slow tap
         currentCity = (currentCity + 1) % NUM_CITIES;
         triggerWeatherUpdate(); touchHandled = true;
     }
@@ -5439,7 +5513,8 @@ async function refresh(){
   setAccentFromText([d.textR,d.textG,d.textB]);
   $('heroIcon').innerHTML=iconSvg(iconKind(d.main,d.weatherDesc),d.night);
   $('temp').innerHTML=d.temp.toFixed(1)+'<sup>&deg;C</sup>';
-  $('desc').innerText=(d.weatherDesc||'').toLowerCase();
+  $('desc').innerText=d.updating?'Updating...':(d.weatherDesc||'').toLowerCase();
+  if(d.updating&&!window._upd){window._upd=1;setTimeout(function(){window._upd=0;refresh();},1500);} // check back soon
   $('hl').innerHTML='H '+d.tempMax.toFixed(1)+'&deg; &middot; L '+d.tempMin.toFixed(1)+'&deg; &middot; Feels '+d.feelsLike.toFixed(1)+'&deg;';
   var txt=document.documentElement.style.getPropertyValue('--accent')?'var(--accent)':'rgb('+d.textR+','+d.textG+','+d.textB+')';
   $('clock').innerHTML=segClock(d.hour,d.minute,'var(--text)',(d.textR>235&&d.textG>235&&d.textB>235)||(d.textR+d.textG+d.textB<40)?'var(--text)':txt);

@@ -181,7 +181,7 @@ All settings are stored in the ESP32's flash and survive power cuts and new uplo
 | Tap the right half of the screen | Next page |
 | Tap the left half of the screen | Previous page |
 | Tap the arrows beside the city name (home page) | Previous / next city |
-| Hold anywhere for 1.5–5 seconds | Next city |
+| Hold anywhere for 2.5–5 seconds | Next city |
 
 The pages are: **Home**, **Stats**, **Rain**, **Astro**, **System**, **Forecast** and **History**.
 
