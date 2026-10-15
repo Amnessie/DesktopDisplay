@@ -5,6 +5,8 @@ All notable changes to this project are listed here.
 ## [Unreleased]
 
 ### Added
+- Night mode (web Settings): between two times (City 1's local time) the screen dims to a chosen level or switches off, with a smooth fade, and the LED can switch off too (the rain alert then stays quiet). When the screen is off, a touch wakes it for 30 seconds without pressing anything. The dashboard's device status shows when night mode is on
+- System page: an LED | TEXT switch above the color bar, so the bar on the device can set the text/accent color as well as the LED color; the save button stores the selected one
 - README with screenshots of the display and the web dashboard (desktop and phone) that follow your GitHub light/dark theme, and a short Highlights section
 - Rain in the next 2 hours: Buienradar radar for cities in the Netherlands/Belgium (5-minute steps, refreshed every 5 minutes), Open-Meteo 15-minute forecast elsewhere. Shown on the home screen, the Precipitation page and the dashboard. Rain only "starts" or "stops" on two consecutive steps, values under 0.1 mm/h count as dry, and the outlook disappears when the data is more than 15 minutes old
 - LED rain alert (web Settings, with a test button): the LED dims twice, slowly, when rain is expected within 30 minutes, once per rain spell

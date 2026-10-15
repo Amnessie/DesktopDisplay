@@ -74,6 +74,7 @@ Home, precipitation, sun & moon, and the 5-day forecast:
 - When the rain card is switched off, the home screen shows today's sunrise, sunset and hours of daylight instead
 - Status indicator showing whether the weather data is fresh, updating or failed
 - Light and dark themes, or Auto: dark from sunset to sunrise
+- Night mode (set up in the web Settings): between two times the screen dims or switches off, and optionally the LED too. A touch wakes a dark screen for 30 seconds
 - Anti-aliased weather icons drawn on the display (sun, moon at night, clouds, rain, drizzle, thunder, snow, fog)
 - RGB LED that changes color with the weather (or a fixed color you pick)
 
@@ -85,7 +86,7 @@ Home, precipitation, sun & moon, and the 5-day forecast:
 **Web interface** (open the device's IP address in a browser; it starts on the live dashboard)
 - Works on desktop and phone, in light or dark (the theme button in the top bar switches between Auto, Light and Dark; Auto follows your phone/PC setting)
 - Uses your chosen text color as the accent color, just like the display
-- Settings: cities, weather source per city, API keys (with an optional backup key), screen and LED brightness (remembered across restarts), colors, LED rain alert
+- Settings: cities, weather source per city, API keys (with an optional backup key), screen and LED brightness (remembered across restarts), colors, LED rain alert, night mode
 - Live dashboard:
   - current weather with icon and 7-segment clock
   - wind, humidity, pressure (with trend) and visibility
@@ -184,7 +185,7 @@ All settings are stored in the ESP32's flash and survive power cuts and new uplo
 
 The pages are: **Home**, **Stats**, **Rain**, **Astro**, **System**, **Forecast** and **History**.
 
-On the **System** page you can drag the sliders for screen and LED brightness (saved automatically a few seconds after you let go), switch the LED between weather colors and a custom color, pick the custom color, and save it as the default. The **THEME** button cycles between Auto (dark after sunset), Light and Dark; the same setting is also on the web Settings page.
+On the **System** page you can drag the sliders for screen and LED brightness (saved automatically a few seconds after you let go) and switch the LED between weather colors and a custom color. The **LED | TEXT** switch picks what the color bar changes: the LED's custom color, or the text/accent color (clock minutes, page dots, buttons). The save button stores the selected one as the default. The **THEME** button cycles between Auto (dark after sunset), Light and Dark; the same setting is also on the web Settings page.
 
 LED weather colors: orange = clear, white = clouds, blue = rain, purple = thunderstorm, cyan = snow.
 

@@ -209,6 +209,19 @@ int pTrendLevel = 0, pTrendCity = -1;  // -3..3 (falling very fast .. rising ver
 unsigned long pTrendFetchedAt = 0, pTrendNextFetch = 0, pTrendVersion = 0;
 String pTrendLastError = "";
 bool rainLedAlert = true;              // web setting: pulse the LED when rain is coming
+// Night mode (web Settings only): between nightFrom and nightTo (minutes after
+// midnight, City 1's local time) the screen is dimmed or switched off, and
+// optionally the LED too. A touch wakes a dark screen for NIGHT_WAKE_MS.
+bool nightOn = false, nightLedOff = true;
+int nightFrom = 23 * 60, nightTo = 7 * 60;
+int nightScreen = 0;                   // 0 = dim, 1 = off
+int nightDimPct = 10;                  // dim level, % of full brightness
+bool nightActive = false;              // currently inside the night window
+unsigned long nightWakeUntil = 0;      // screen woken by a touch until this millis()
+const unsigned long NIGHT_WAKE_MS = 30000;
+int backlightLevel = -1;               // what the backlight is actually set to (fades towards the target)
+// Which color the System page's color bar edits (device only, not saved)
+int colorTarget = 0;                   // 0 = LED, 1 = text/accent
 String nowShort = "";                  // shorter version of nowMsg for the home screen card
 bool nowBlend = false;                 // true = radar dry, but the model expects rain 1-3 h out
 // Model forecast (Open-Meteo, 15-min steps, 3 h) used next to the radar ("blending")
@@ -360,6 +373,7 @@ const int MODE_BTN_Y     = 304, MODE_BTN_H      = 32;
 // NEW: single hue-gradient picker bar replaces the three separate R/G/B
 // sliders - one continuous rainbow strip you drag along, plus a live
 // preview swatch showing the resulting color.
+const int TARGET_SEG_Y = 342, TARGET_SEG_H = 24; // LED | TEXT switch above the color bar
 const int HUE_BAR_Y = 375, HUE_BAR_H = 22;
 const int HUE_BAR_X = 30, HUE_BAR_W = 250;
 const int SAVE_BTN_Y     = 415, SAVE_BTN_H      = 36;
@@ -477,6 +491,7 @@ int ledBrightnessOverride = -1; // the rain-alert dip uses this; -1 = use the LE
 
 void setWeatherLED(String weather) {
   int r, g, b, val = ledBrightnessOverride >= 0 ? ledBrightnessOverride : ledBrightness;
+  if (ledBrightnessOverride < 0 && nightActive && nightLedOff) val = 0; // LED off at night
   if (useCustomColor) { r = custR; g = custG; b = custB; } 
   else {
     if (weather == "Clear") { r = 255; g = 165; b = 0; }      
@@ -502,7 +517,56 @@ void applyCustomColor() {
   setWeatherLED(mainWeather);
 }
 
-void updateBacklight() { analogWrite(LCD_BL_PIN, globalBrightness); }
+// The backlight level the screen should have right now: the brightness slider,
+// unless night mode dims it or switches it off.
+int backlightTarget() {
+  if (!nightActive || (long)(millis() - nightWakeUntil) < 0) return globalBrightness;
+  if (nightScreen == 1) return 0;
+  return min(globalBrightness, (int)map(constrain(nightDimPct, 1, 100), 0, 100, 0, 255));
+}
+
+// Sets the backlight straight away (brightness slider), or - fade=true - steps
+// it towards the target (night mode starting/ending, called every ~20 ms).
+void updateBacklight(bool fade = false) {
+  int target = backlightTarget();
+  if (backlightLevel < 0 || !fade) backlightLevel = target;
+  else if (backlightLevel < target) backlightLevel = min(target, backlightLevel + 6);
+  else if (backlightLevel > target) backlightLevel = max(target, backlightLevel - 6);
+  else return;
+  analogWrite(LCD_BL_PIN, backlightLevel);
+}
+
+bool screenIsDark() { return backlightTarget() == 0; }
+
+bool inNightWindow(int minuteOfDay) {
+  if (nightFrom == nightTo) return false;
+  if (nightFrom < nightTo) return minuteOfDay >= nightFrom && minuteOfDay < nightTo;
+  return minuteOfDay >= nightFrom || minuteOfDay < nightTo; // crosses midnight, e.g. 23:00-07:00
+}
+
+String minutesToHHMM(int m) {
+  char b[6]; snprintf(b, sizeof(b), "%02d:%02d", (m / 60) % 24, m % 60); return String(b);
+}
+
+// Called from loop(): enters/leaves night mode and fades the backlight.
+void nightLoop() {
+  static unsigned long lastCheck = 0, lastFade = 0;
+  if (millis() - lastCheck > 1000) {
+    lastCheck = millis();
+    bool active = false;
+    if (nightOn && timeStatus() != timeNotSet) {
+      time_t lt = now() + tzOffsetSec[0]; // City 1's local time: night doesn't move when you look at another city
+      active = inNightWindow(hour(lt) * 60 + minute(lt));
+    }
+    if (active != nightActive) {
+      nightActive = active;
+      nightWakeUntil = 0;
+      logDebug(active ? "NIGHT mode on until " + minutesToHHMM(nightTo) : String("NIGHT mode off"));
+      setWeatherLED(mainWeather); // LED off at night, or back on
+    }
+  }
+  if (millis() - lastFade >= 20) { lastFade = millis(); updateBacklight(true); }
+}
 
 // Screen/LED brightness are saved a few seconds after the last change rather
 // than on every slider step, so dragging a slider doesn't hammer the flash.
@@ -1085,6 +1149,13 @@ void wxApply() {
 
   // NEW: record fetch outcome/time for the status indicator
   lastFetchOK = weatherFetchSuccess;
+  if (weatherFetchSuccess) { // remember the time zone (night mode uses City 1's even while another city is shown)
+    static long savedTz[NUM_CITIES] = {LONG_MIN, LONG_MIN, LONG_MIN};
+    if (savedTz[currentCity] != tzOffsetSec[currentCity]) {
+      savedTz[currentCity] = tzOffsetSec[currentCity];
+      prefs.putLong(("tz" + String(currentCity)).c_str(), tzOffsetSec[currentCity]);
+    }
+  }
   if (weatherFetchSuccess) lastFetchMillis = millis();
   if (weatherFetchSuccess || !canRestore) { lastDataCity = currentCity; lastDataOK = weatherFetchSuccess; }
   // NOTE: history is no longer sampled here - see historyLoop(), which logs
@@ -1514,8 +1585,8 @@ void checkRainAlert() {
   bool soon = mins >= 0 && mins <= 30;
   if (soon && rainAlertArmed) {
     rainAlertArmed = false;
-    logDebug("RAIN ALERT: " + nowMsg + (rainLedAlert ? " (LED pulse)" : ""));
-    if (rainLedAlert) startLedPulse();
+    logDebug("RAIN ALERT: " + nowMsg + (rainLedAlert ? (nightActive && nightLedOff ? " (LED off for the night)" : " (LED pulse)") : ""));
+    if (rainLedAlert && !(nightActive && nightLedOff)) startLedPulse(); // quiet at night when the LED is off
   }
   if (!nowRainingNow && (mins < 0 || mins > 45)) rainAlertArmed = true;
 }
@@ -1852,6 +1923,8 @@ void handleApiSettings() {
   j += ",\"theme\":" + String(themeMode);
   j += ",\"rainPrevOn\":" + String(showRainPreview ? "true" : "false");
   j += ",\"rainLed\":" + String(rainLedAlert ? "true" : "false");
+  j += ",\"nightOn\":" + String(nightOn ? "true" : "false") + ",\"nightFrom\":\"" + minutesToHHMM(nightFrom) + "\",\"nightTo\":\"" + minutesToHHMM(nightTo)
+     + "\",\"nightScreen\":" + String(nightScreen) + ",\"nightDim\":" + String(nightDimPct) + ",\"nightLedOff\":" + String(nightLedOff ? "true" : "false");
   j += ",\"screenPct\":" + String(map(globalBrightness, 10, 255, 0, 100)) + ",\"ledPct\":" + String(map(ledBrightness, 0, 255, 0, 100));
   j += ",\"useCustom\":" + String(useCustomColor ? "true" : "false");
   j += ",\"hue\":" + String(customHue) + ",\"satPct\":" + String(map(customSat, 0, 255, 0, 100)) + ",\"valPct\":" + String(map(customVal, 0, 255, 0, 100));
@@ -1883,6 +1956,15 @@ void handleSave() {
   prefs.putBool("rainPrevOn", showRainPreview);
   rainLedAlert = server.hasArg("rainLed");
   prefs.putBool("rainLed", rainLedAlert);
+  // Night mode
+  nightOn = server.hasArg("nightOn");
+  if (server.hasArg("nightFrom") && timeStrToMinutes(server.arg("nightFrom")) >= 0) nightFrom = timeStrToMinutes(server.arg("nightFrom")) % 1440;
+  if (server.hasArg("nightTo") && timeStrToMinutes(server.arg("nightTo")) >= 0) nightTo = timeStrToMinutes(server.arg("nightTo")) % 1440;
+  if (server.hasArg("nightScreen")) nightScreen = constrain(server.arg("nightScreen").toInt(), 0, 1);
+  if (server.hasArg("nightDim")) nightDimPct = constrain(server.arg("nightDim").toInt(), 1, 100);
+  nightLedOff = server.hasArg("nightLedOff");
+  prefs.putBool("nightOn", nightOn); prefs.putInt("nightFrom", nightFrom); prefs.putInt("nightTo", nightTo);
+  prefs.putInt("nightScr", nightScreen); prefs.putInt("nightDim", nightDimPct); prefs.putBool("nightLed", nightLedOff);
   if (server.hasArg("theme")) {
     themeMode = constrain(server.arg("theme").toInt(), 0, 2);
     prefs.putInt("theme", themeMode); // applied by the triggerWeatherUpdate() below
@@ -1964,11 +2046,15 @@ void handleLive() {
 
 // NEW: persists the current text color (clock minutes + IP address) as the
 // boot default - the text-color equivalent of handleSaveColor() below.
-void handleSaveTextColor() {
-  if (!requireAppHeader()) return;
+void saveTextColorPrefs() {
   prefs.putInt("txHue", textHue);
   prefs.putInt("txSat", textSat);
   prefs.putInt("txVal", textVal);
+}
+
+void handleSaveTextColor() {
+  if (!requireAppHeader()) return;
+  saveTextColorPrefs();
   server.send(200, "text/plain", "OK");
 }
 
@@ -2122,6 +2208,8 @@ void handleApiStatus() {
   json += "\"provider\":\"" + String(PROVIDER_NAMES[constrain(cityProvider[currentCity], 0, 2)]) + "\",";
   json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
   json += "\"updating\":" + String(isUpdating ? "true" : "false") + ",";
+  json += "\"night\":{\"on\":" + String(nightOn ? "true" : "false") + ",\"active\":" + String(nightActive ? "true" : "false")
+        + ",\"from\":\"" + minutesToHHMM(nightFrom) + "\",\"to\":\"" + minutesToHHMM(nightTo) + "\"},";
   analyzeNowcast();
   if (nowValid) {
     json += "\"nowcast\":{\"valid\":true,\"radar\":" + String(nowRadar ? "true" : "false") + ",\"stepMin\":" + String(nowStepMin)
@@ -4198,10 +4286,25 @@ void drawModeToggleButton() {
 
 // Hue picker: one continuous rainbow strip you drag along. The IP address
 // above (drawSystemDynamicInfo) shows the live result.
+// Small two-part switch: which color the bar below edits.
+void drawColorTargetSwitch() {
+  int w = 150, x = 160 - w / 2, half = w / 2;
+  tft.fillRect(x - 2, TARGET_SEG_Y - 2, w + 4, TARGET_SEG_H + 4, T.card);
+  tft.fillSmoothRoundRect(x, TARGET_SEG_Y, w, TARGET_SEG_H, 8, T.card2, T.card);
+  int sx = colorTarget == 0 ? x : x + half;
+  tft.fillSmoothRoundRect(sx + 2, TARGET_SEG_Y + 2, half - 4, TARGET_SEG_H - 4, 6, T.accent, T.card2);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(colorTarget == 0 ? onAccentText() : T.muted); tft.drawString("LED", x + half / 2, TARGET_SEG_Y + TARGET_SEG_H / 2 + 1, 2);
+  tft.setTextColor(colorTarget == 1 ? onAccentText() : T.muted); tft.drawString("TEXT", x + half + half / 2, TARGET_SEG_Y + TARGET_SEG_H / 2 + 1, 2);
+}
+
+int pickerHue() { return colorTarget == 1 ? textHue : customHue; }
+bool pickerVisible() { return colorTarget == 1 || useCustomColor; } // the LED bar only matters for a custom color
+
 void drawHuePicker(bool forceDraw = false) {
   static int lastHue = -1;
 
-  if (!useCustomColor) {
+  if (!pickerVisible()) {
     if (lastHue != -1 || forceDraw) {
       tft.fillRect(20, HUE_BAR_Y - 16, 280, HUE_BAR_H + 32, T.card);
       lastHue = -1;
@@ -4209,8 +4312,8 @@ void drawHuePicker(bool forceDraw = false) {
     return;
   }
 
-  if (!forceDraw && customHue == lastHue) return; // nothing changed, skip redraw
-  lastHue = customHue;
+  if (!forceDraw && pickerHue() == lastHue) return; // nothing changed, skip redraw
+  lastHue = pickerHue();
 
   // Clear just the bar's own footprint (plus thumb overhang) before redrawing
   tft.fillRect(HUE_BAR_X - 6, HUE_BAR_Y - 6, HUE_BAR_W + 12, HUE_BAR_H + 12, T.card);
@@ -4224,7 +4327,7 @@ void drawHuePicker(bool forceDraw = false) {
   tft.drawRect(HUE_BAR_X - 1, HUE_BAR_Y - 1, HUE_BAR_W + 2, HUE_BAR_H + 2, T.border);
 
   // Thumb marker at the current hue's position
-  int thumbX = HUE_BAR_X + (customHue * HUE_BAR_W) / 360;
+  int thumbX = HUE_BAR_X + (pickerHue() * HUE_BAR_W) / 360;
   tft.drawRect(thumbX - 4, HUE_BAR_Y - 4, 8, HUE_BAR_H + 8, T.card);
   tft.drawRect(thumbX - 5, HUE_BAR_Y - 5, 10, HUE_BAR_H + 10, T.text);
 
@@ -4234,7 +4337,7 @@ void drawHuePicker(bool forceDraw = false) {
 void drawSaveButton(bool confirmed) {
   drawCard(50, SAVE_BTN_Y, 220, SAVE_BTN_H, 8, confirmed ? T.good : T.accent, confirmed ? T.good : T.accent, T.card);
   tft.setTextColor(confirmed ? TFT_WHITE : onAccentText()); tft.setTextDatum(MC_DATUM);
-  tft.drawString(confirmed ? "SAVED!" : "SAVE CUSTOM AS DEFAULT", 160, SAVE_BTN_Y + SAVE_BTN_H / 2 + 1, 2);
+  tft.drawString(confirmed ? "SAVED!" : (colorTarget == 1 ? "SAVE TEXT COLOR" : "SAVE LED COLOR"), 160, SAVE_BTN_Y + SAVE_BTN_H / 2 + 1, 2);
 }
 
 void drawSystemUI() {
@@ -4243,6 +4346,7 @@ void drawSystemUI() {
   drawScreenBrightnessSlider(true);
   drawLedBrightnessSlider(true);
   drawModeToggleButton();
+  drawColorTargetSwitch();
   drawHuePicker(true);
   drawSaveButton(false);
 }
@@ -4332,6 +4436,9 @@ void setup() {
   applyTextColor();
   showRainPreview = prefs.getBool("rainPrevOn", true); // NEW
   rainLedAlert = prefs.getBool("rainLed", true);
+  nightOn = prefs.getBool("nightOn", false); nightFrom = prefs.getInt("nightFrom", 23 * 60); nightTo = prefs.getInt("nightTo", 7 * 60);
+  nightScreen = prefs.getInt("nightScr", 0); nightDimPct = prefs.getInt("nightDim", 10); nightLedOff = prefs.getBool("nightLed", true);
+  for (int i = 0; i < NUM_CITIES; i++) tzOffsetSec[i] = prefs.getLong(("tz" + String(i)).c_str(), 0); // until the weather says otherwise
   vfLoad();
   netBegin(); // background task for the rain/pressure/verification requests
   {
@@ -4497,6 +4604,7 @@ void loop() {
   TIMED(hmActive ? "history (SD merge)" : "history", historyLoop()); // NEW: background per-city history sync (one city at a time, every 6h)
 #endif
   TIMED("background jobs", nowcastLoop()); // rain in the next 2 hours, pressure trend, LED rain alert
+  nightLoop(); // night mode: dims or switches off the screen (and LED) between the set times
 
   // Text color changed (web sliders) -> redraw once it has settled
   if (accentDirty && millis() - accentChangedAt > 400) {
@@ -4563,7 +4671,13 @@ void loop() {
     isTouched = true; touchHandled = false;
     touchStartTime = millis(); startX = x; startY = y;
     logDebug("TOUCH DOWN x=" + String(x) + " y=" + String(y));
+    if (screenIsDark()) { // night mode, screen off: this touch only wakes it
+      nightWakeUntil = millis() + NIGHT_WAKE_MS;
+      touchHandled = true;
+      logDebug("NIGHT screen woken for " + String(NIGHT_WAKE_MS / 1000) + " s");
+    }
   }
+  if (pressed && nightActive && (long)(millis() - nightWakeUntil) < 0) nightWakeUntil = millis() + NIGHT_WAKE_MS; // stays awake while used
 
   // NEW: stuck/ghost-touch watchdog. Every touch action in this UI (tap to
   // switch pages, arrows, sliders, long-press) only fires on RELEASE
@@ -4593,7 +4707,7 @@ void loop() {
   // starting position. Placed after the isTouched/touchStartTime setup
   // above (not before it) so this doesn't get its touchHandled flag
   // clobbered by that block resetting it to false on the same first frame.
-  if (pressed && displayMode == 4) {
+  if (pressed && displayMode == 4 && !touchHandled) {
     if (y > SCREEN_SLIDER_Y - 20 && y < SCREEN_SLIDER_Y + 20) {
       int pct = constrain(map((int)x, SLIDER_X, SLIDER_X + SLIDER_W, 0, 100), 0, 100);
       int newBrightness = map(pct, 0, 100, 10, 255);
@@ -4614,9 +4728,18 @@ void loop() {
         drawLedBrightnessSlider();
       }
       touchHandled = true;
-    } else if (useCustomColor && y > HUE_BAR_Y - 16 && y < HUE_BAR_Y + HUE_BAR_H + 16) {
+    } else if (pickerVisible() && y > HUE_BAR_Y - 16 && y < HUE_BAR_Y + HUE_BAR_H + 16) {
       int hue = constrain(map((int)x, HUE_BAR_X, HUE_BAR_X + HUE_BAR_W, 0, 360), 0, 360);
-      if (hue != customHue) {
+      if (colorTarget == 1) {
+        if (hue != textHue) {
+          textHue = hue;
+          // a white/grey text color has no hue to change - give it a clear color
+          if (textSat < 120) textSat = 210;
+          if (textVal < 150) textVal = 230;
+          applyTextColor(); // the accent follows; loop() redraws the page once you let go
+          drawHuePicker();
+        }
+      } else if (hue != customHue) {
         customHue = hue;
         applyCustomColor(); // NEW: uses whatever saturation/brightness the web portal's sliders last set
         drawHuePicker();
@@ -4646,8 +4769,14 @@ void loop() {
         drawHuePicker(true); // force: show/hide as mode changes
         drawSystemDynamicInfo(); // refreshes the IP-text color preview to match the new mode's LED color
         touchHandled = true;
+      } else if (ty > TARGET_SEG_Y - 4 && ty < TARGET_SEG_Y + TARGET_SEG_H + 4 && tx > 80 && tx < 240) {
+        colorTarget = tx < 160 ? 0 : 1;
+        drawColorTargetSwitch();
+        drawHuePicker(true);
+        drawSaveButton(false);
+        touchHandled = true;
       } else if (ty > SAVE_BTN_Y && ty < SAVE_BTN_Y + SAVE_BTN_H) {
-        saveCustomColor();
+        if (colorTarget == 1) saveTextColorPrefs(); else saveCustomColor();
         showSaveConfirmation = true; saveConfirmationTime = millis();
         drawSaveButton(true);
         touchHandled = true;
@@ -5257,9 +5386,11 @@ a{color:var(--blue)}
 /* forms */
 .field{display:grid;gap:6px;margin:0 0 14px}
 .field>span{font-size:.85em;font-weight:600;color:var(--muted)}
-input[type=text],input[type=password],select{width:100%;font:inherit;color:var(--text);background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:9px 12px;outline:none}
-input[type=text]:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 22%,transparent)}
+input[type=text],input[type=password],input[type=time],input[type=number],select{width:100%;font:inherit;color:var(--text);background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:9px 12px;outline:none}
+input[type=text]:focus,input[type=time]:focus,input[type=number]:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 22%,transparent)}
 .row2{display:grid;grid-template-columns:1fr 210px;gap:10px}
+.sub{display:none;padding:12px 0 2px;border-top:1px solid var(--line)}.sub.on{display:block}
+.row2e{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .switch{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-top:1px solid var(--line);cursor:pointer}
 .switch:first-of-type{border-top:0}
 .switch input{appearance:none;-webkit-appearance:none;width:44px;height:26px;border-radius:13px;background:var(--line);position:relative;cursor:pointer;flex:none;transition:background .15s;margin:0}
@@ -5541,7 +5672,8 @@ async function refresh(){
   if(d.bmeOK){$('indoorCard').style.display='';$('inTemp').innerHTML=d.localTemp.toFixed(1)+'&deg;';$('inHum').innerText=Math.round(d.localHumid)+'% humidity';$('inPres').innerText=Math.round(d.localPressure)+' hPa';}
   $('ledSw').style.background='rgb('+d.ledR+','+d.ledG+','+d.ledB+')';$('txtSw').style.background='rgb('+d.textR+','+d.textG+','+d.textB+')';
   $('stDot').style.background=d.lastFetchOK?'var(--good)':'var(--bad)';$('brandDot').className=d.lastFetchOK?'':'bad';
-  $('stText').innerText=(d.lastFetchOK?'Updated '+d.ageMin+' min ago':'Last update failed')+' · '+d.provider+' · Wi-Fi '+d.rssi+' dBm';
+  $('stText').innerText=(d.lastFetchOK?'Updated '+d.ageMin+' min ago':'Last update failed')+' · '+d.provider+' · Wi-Fi '+d.rssi+' dBm'
+   +(d.night&&d.night.active?' · Night mode until '+d.night.to:(d.night&&d.night.on?' · Night mode from '+d.night.from:''));
  }catch(e){$('stText').innerText='Connection lost - retrying';$('stDot').style.background='var(--bad)';}
 }
 document.addEventListener('themechange',function(){if(cur){refresh();}});
@@ -5572,6 +5704,16 @@ const char SETTINGS_BODY[] PROGMEM = R"rawliteral(
  <div class="slider"><span>Screen</span><input type="range" id="screenSlider" min="0" max="100"><b id="screenVal"></b></div>
  <div class="slider"><span>LED</span><input type="range" id="ledSlider" min="0" max="100"><b id="ledVal"></b></div>
 </section>
+<section class="card"><h3>Night mode</h3>
+ <label class="switch"><div>Night mode<small>Dim or switch off the screen between two times, and the LED if you like</small></div><input type="checkbox" name="nightOn" id="nightOn" value="1"></label>
+ <div class="sub" id="nightSub">
+  <div class="row2e"><div class="field"><span>From</span><input type="time" name="nightFrom" id="nightFrom"></div><div class="field"><span>Until</span><input type="time" name="nightTo" id="nightTo"></div></div>
+  <div class="row2e"><div class="field"><span>Screen at night</span><select name="nightScreen" id="nightScreen"><option value="0">Dimmed</option><option value="1">Off</option></select></div>
+   <div class="field" id="nightDimField"><span>Dim to</span><select name="nightDim" id="nightDim"><option value="3">3%</option><option value="5">5%</option><option value="10">10%</option><option value="20">20%</option><option value="35">35%</option><option value="50">50%</option></select></div></div>
+  <label class="switch"><div>LED off at night<small>The rain alert stays quiet too</small></div><input type="checkbox" name="nightLedOff" id="nightLedOff" value="1"></label>
+  <p class="note">The times follow City 1's time zone. When the screen is off, a touch wakes it for 30 seconds (that touch doesn't press anything).</p>
+ </div>
+</section>
 <section class="card"><h3>LED color <span>applies right away</span></h3>
  <div class="seg" id="modeSeg"><button type="button" data-m="0">Weather sync</button><button type="button" data-m="1">Custom color</button></div>
  <div id="colorSection" style="margin-top:14px">
@@ -5600,6 +5742,9 @@ function flash(b,t){var o=b.innerText;b.innerText=t;setTimeout(function(){b.inne
 // would mean the API key field, not the api() helper.)
 function testPulse(b){api('/live?action=testPulse&t='+Date.now(),{cache:'no-store'})
  .then(function(r){flash(b,r.ok?'Pulsing...':'Failed ('+r.status+')');}).catch(function(){flash(b,'No answer');});}
+// Night mode: the extra settings only show while it's switched on
+function showNight(){$('nightSub').classList.toggle('on',$('nightOn').checked);$('nightDimField').style.visibility=$('nightScreen').value=='1'?'hidden':'';}
+$('nightOn').addEventListener('change',showNight);$('nightScreen').addEventListener('change',showNight);
 function saveColor(b){api('/saveColor').then(function(){flash(b,'Saved');});}
 function saveTextColor(b){api('/saveTextColor').then(function(){flash(b,'Saved');});}
 function saveSettings(f){var m=$('saveMsg');m.innerText='Saving...';
@@ -5613,6 +5758,9 @@ function bind(id,action,valId,suffix){var s=$(id);s.oninput=function(){$(valId).
 fetch('/api/settings').then(function(r){return r.json();}).then(function(d){
  for(var i=1;i<=3;i++){$('c'+i).value=d.cities[i-1];var sel=$('provider'+i);sel.innerHTML=PROV.map(function(p,k){return '<option value="'+k+'">'+p+'</option>';}).join('');sel.value=d.providers[i-1];}
  $('api').value=d.api;$('apiBackup').value=d.apiBackup;$('theme').value=d.theme;$('rainPrevOn').checked=d.rainPrevOn;$('rainLed').checked=d.rainLed;
+ $('nightOn').checked=d.nightOn;$('nightFrom').value=d.nightFrom;$('nightTo').value=d.nightTo;$('nightScreen').value=d.nightScreen;$('nightLedOff').checked=d.nightLedOff;
+ var dimSel=$('nightDim');if(![].some.call(dimSel.options,function(o){return o.value==d.nightDim;}))dimSel.add(new Option(d.nightDim+'%',d.nightDim));dimSel.value=d.nightDim;
+ showNight();
  var set=function(id,v,suffix){$(id+'Slider').value=v;$(id+'Val').innerText=v+(suffix||'');};
  set('screen',d.screenPct,'%');set('led',d.ledPct,'%');set('hue',d.hue);set('sat',d.satPct,'%');set('val',d.valPct,'%');
  set('textHue',d.textHue);set('textSat',d.textSatPct,'%');set('textVal',d.textValPct,'%');
