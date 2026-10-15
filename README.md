@@ -237,7 +237,7 @@ Check the API key on the settings page (`/settings`) and that the city is writte
 ## Known limitations
 
 - The web interface has no password. See [SECURITY.md](SECURITY.md).
-
+- Downloading 10 years of data is too much and will slow the device down, making it unusable. (still figuring out if there is a way)
 ## Credits
 
 This project started as a heavily modified version of [SmallDesktopDisplay](https://github.com/SmallDesktopDisplay-team/SmallDesktopDisplay). The astronaut animation comes from that project.
