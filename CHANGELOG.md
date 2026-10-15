@@ -5,6 +5,7 @@ All notable changes to this project are listed here.
 ## [Unreleased]
 
 ### Added
+- README with screenshots of the display and the web dashboard (desktop and phone) that follow your GitHub light/dark theme, and a short Highlights section
 - Rain in the next 2 hours: Buienradar radar for cities in the Netherlands/Belgium (5-minute steps, refreshed every 5 minutes), Open-Meteo 15-minute forecast elsewhere. Shown on the home screen, the Precipitation page and the dashboard. Rain only "starts" or "stops" on two consecutive steps, values under 0.1 mm/h count as dry, and the outlook disappears when the data is more than 15 minutes old
 - LED rain alert (web Settings, with a test button): two slow blue pulses when rain is expected within 30 minutes, once per rain spell
 - Pressure trend: least-squares slope over the last 3 hours of Open-Meteo sea-level pressure, in WMO tendency classes with hysteresis so the label can't flicker at a boundary; arrow in the pressure tile, row on the Atmosphere page, text on the dashboard
