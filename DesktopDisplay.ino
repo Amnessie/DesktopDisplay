@@ -2,6 +2,8 @@
 #include "ArduinoJson.h"
 #include <TimeLib.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <esp_system.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <TFT_eSPI.h> 
@@ -233,6 +235,10 @@ float modMm[MOD_STEPS_MAX];            // mm/h
 String modLabel[MOD_STEPS_MAX];        // "HH:MM", local time of the city
 int modCount = 0, modCity = -1;
 unsigned long modFetchedAt = 0, modNextFetch = 0;
+// One background network request (see [BACKGROUND NETWORK WORKER]). Declared
+// up here, before any function, for the same prototype reason as SunCountdown.
+struct NetJob { int kind, city, step, slot; uint32_t start; String url; int code; String body; unsigned long ms; };
+unsigned long loopMaxMs = 0;           // longest main-loop pass since boot (Debug page)
 
 // Forecast verification (see [FORECAST VERIFICATION]): per city, per source
 // (0 = OpenWeatherMap, 1 = Open-Meteo, 2 = Open-Meteo KNMI - same order as
@@ -897,7 +903,8 @@ bool fetchFromOpenMeteo(bool useKnmiModel) {
 
   HTTPClient http;
   http.setTimeout(5000);
-  http.begin(url);
+  WiFiClientSecure tls; WiFiClient plain;
+  httpBeginSafe(http, tls, plain, url);
   int code = http.GET();
   if (code != HTTP_CODE_OK) { http.end(); return false; }
   String payload = http.getString();
@@ -1080,7 +1087,9 @@ void drawUpdatingBadge(bool show) {
 void triggerWeatherUpdate() {
   isUpdating = true;
   drawUpdatingBadge(true);
+  bool locked = netLock(20000); // let a background request finish first
   getOpenWeatherData();
+  if (locked) netUnlock();
   isUpdating = false;
   applyTheme(); // new sunrise/sunset times (or another city) can change the AUTO theme
   drawPageBackground(displayMode);
@@ -1142,90 +1151,195 @@ int parseRainText(const String &body, float *mm, String *lbl, int maxN) {
   return n;
 }
 
-bool fetchNowcast(int city) {
-  double lat, lon;
-  if (!getCityCoords(city, lat, lon)) { nowLastError = "no coordinates for the city"; return false; }
+// --- [BACKGROUND NETWORK WORKER] ---
+// Every request for the rain outlook, rain model, pressure trend and forecast
+// check runs on its own FreeRTOS task (core 0). The main loop - touch, screen
+// and web pages - only hands over a job and later parses the reply, so a slow
+// server or a stalled TLS handshake can never freeze the device. One job at a
+// time; the blocking weather and history fetches on the main loop take the
+// same lock, so two HTTPS sessions (~45 KB of RAM each) never run at once.
+enum NetKind { NJ_NOW = 1, NJ_MODEL, NJ_PTREND, NJ_VF_OBS, NJ_VF_OM, NJ_VF_OWM };
+NetJob netJob;
+bool netBusy = false;
+QueueHandle_t netJobQ = nullptr, netDoneQ = nullptr;
+SemaphoreHandle_t netMutex = nullptr;
 
-  if (inBuienradarArea(lat, lon)) {
-    // Buienradar has used two hostnames for this feed over the years
-    const char *bases[] = {"https://gps.buienradar.nl/getrr.php", "https://gpsgadget.buienradar.nl/data/raintext"};
-    for (const char *base : bases) {
-      String url = String(base) + "?lat=" + String(lat, 2) + "&lon=" + String(lon, 2);
-      HTTPClient http;
-      http.setTimeout(6000);
-      http.begin(url);
-      int code = http.GET();
-      if (code == HTTP_CODE_OK) {
-        String body = http.getString();
-        http.end();
-        int n = parseRainText(body, nowMm, nowLabel, NOW_STEPS_MAX);
-        if (n >= 6) {
-          nowCount = n; nowStepMin = 5; nowRadar = true;
-          nowSource = "Buienradar radar (" + url.substring(8, url.indexOf('/', 8)) + ")";
-          nowLastError = "";
-          return true;
-        }
-        nowLastError = "Buienradar: unexpected reply (" + String(n) + " steps)";
-      } else {
-        http.end();
-        nowLastError = "Buienradar HTTP " + String(code);
+// HTTPClient::begin(url) leaves the TLS handshake timeout at the library's
+// 120 s; this sets 8 s (plus 5 s to connect) for the fetches on the main loop.
+bool httpBeginSafe(HTTPClient &http, WiFiClientSecure &tls, WiFiClient &plain, const String &url) {
+  http.setConnectTimeout(5000);
+  if (url.startsWith("https://")) { tls.setInsecure(); tls.setHandshakeTimeout(8); return http.begin(tls, url); }
+  return http.begin(plain, url);
+}
+
+// Plain GET with hard limits: 5 s to connect, 8 s for the TLS handshake (the
+// library default is 120 s), 6 s per read.
+int netGet(const String &url, String &body) {
+  bool https = url.startsWith("https://");
+  WiFiClientSecure tls;
+  WiFiClient plain;
+  HTTPClient http;
+  http.setConnectTimeout(5000);
+  http.setTimeout(6000);
+  bool ok;
+  if (https) { tls.setInsecure(); tls.setHandshakeTimeout(8); ok = http.begin(tls, url); }
+  else ok = http.begin(plain, url);
+  if (!ok) return -1;
+  int code = http.GET();
+  body = code == HTTP_CODE_OK ? http.getString() : String("");
+  http.end();
+  return code;
+}
+
+void netWorker(void *) {
+  for (;;) {
+    NetJob *j;
+    if (xQueueReceive(netJobQ, &j, portMAX_DELAY) != pdTRUE) continue;
+    unsigned long t0 = millis();
+    xSemaphoreTake(netMutex, portMAX_DELAY);
+    j->code = WiFi.status() == WL_CONNECTED ? netGet(j->url, j->body) : -1;
+    xSemaphoreGive(netMutex);
+    j->ms = millis() - t0;
+    xQueueSend(netDoneQ, &j, portMAX_DELAY);
+  }
+}
+
+void netBegin() {
+  netJobQ = xQueueCreate(1, sizeof(NetJob *));
+  netDoneQ = xQueueCreate(1, sizeof(NetJob *));
+  netMutex = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(netWorker, "net", 12288, nullptr, 1, nullptr, 0);
+}
+
+// Main loop: hand a request to the worker. False if one is still running.
+bool netPost(int kind, int city, int step, int slot, uint32_t start, const String &url) {
+  if (netBusy || !netJobQ) return false;
+  netJob.kind = kind; netJob.city = city; netJob.step = step; netJob.slot = slot; netJob.start = start;
+  netJob.url = url; netJob.body = ""; netJob.code = 0; netJob.ms = 0;
+  NetJob *jp = &netJob;
+  if (xQueueSend(netJobQ, &jp, 0) != pdTRUE) return false;
+  netBusy = true;
+  return true;
+}
+
+// For the blocking fetches still on the main loop (weather, history).
+bool netLock(unsigned long ms) { return netMutex && xSemaphoreTake(netMutex, pdMS_TO_TICKS(ms)) == pdTRUE; }
+void netUnlock() { xSemaphoreGive(netMutex); }
+
+// Coordinates only if already known - never a (blocking) geocoding request.
+bool cachedCoords(int c, double &lat, double &lon) {
+  if (!cityGeoCached[c] || cityGeoLocStr[c] != locs[c]) return false;
+  lat = cityLat[c]; lon = cityLon[c];
+  return true;
+}
+
+// Rain outlook sources, tried in this order: Buienradar radar (it has used two
+// hostnames over the years), then Open-Meteo's 15-minute forecast.
+String nowcastUrl(int step, double lat, double lon) {
+  if (step == 0) return "https://gps.buienradar.nl/getrr.php?lat=" + String(lat, 2) + "&lon=" + String(lon, 2);
+  if (step == 1) return "https://gpsgadget.buienradar.nl/data/raintext?lat=" + String(lat, 2) + "&lon=" + String(lon, 2);
+  return "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) + "&longitude=" + String(lon, 4)
+    + "&minutely_15=precipitation&forecast_minutely_15=9&timezone=auto";
+}
+
+void nowcastDone(int city, bool ok) {
+  bool cityChanged = nowCity != city;
+  if (ok) { nowFetchedAt = millis(); nowVersion++; nowLastError = ""; }
+  else if (cityChanged) { nowCount = 0; nowVersion++; } // never show the old city's rain
+  nowCity = city;
+  nowNextFetch = millis() + (ok ? (nowRadar ? 5UL : 15UL) * 60000UL : 2UL * 60000UL);
+  analyzeNowcast(); checkRainAlert();
+  if (!ok) logDebug("RAIN 2H fetch failed: " + nowLastError);
+}
+
+void nowcastStart(int city) {
+  double lat, lon;
+  nowLastError = "";
+  if (!cachedCoords(city, lat, lon)) { nowLastError = "no coordinates for the city yet"; nowcastDone(city, false); return; }
+  int step = inBuienradarArea(lat, lon) ? 0 : 2;
+  netPost(NJ_NOW, city, step, 0, 0, nowcastUrl(step, lat, lon));
+}
+
+void nowcastResult(NetJob &j) {
+  if (j.city != currentCity) return; // city switched meanwhile - nowcastLoop starts over
+  bool ok = false;
+  String err;
+  if (j.code != HTTP_CODE_OK) err = String(j.step < 2 ? "Buienradar" : "Open-Meteo") + " HTTP " + String(j.code);
+  else if (j.step < 2) {
+    float mm[NOW_STEPS_MAX]; String lbl[NOW_STEPS_MAX];
+    int n = parseRainText(j.body, mm, lbl, NOW_STEPS_MAX);
+    if (n >= 6) {
+      for (int i = 0; i < n; i++) { nowMm[i] = mm[i]; nowLabel[i] = lbl[i]; }
+      nowCount = n; nowStepMin = 5; nowRadar = true;
+      nowSource = "Buienradar radar (" + j.url.substring(8, j.url.indexOf('/', 8)) + ")";
+      ok = true;
+    } else err = "Buienradar: unexpected reply (" + String(n) + " steps)";
+  } else {
+    DynamicJsonDocument doc(4096);
+    if (deserializeJson(doc, j.body)) err = "Open-Meteo: bad JSON";
+    else {
+      JsonArray t = doc["minutely_15"]["time"], p = doc["minutely_15"]["precipitation"];
+      float mm[NOW_STEPS_MAX]; String lbl[NOW_STEPS_MAX];
+      int n = 0;
+      for (int i = 0; i < (int)t.size() && i < (int)p.size() && n < NOW_STEPS_MAX; i++) {
+        if (p[i].isNull()) continue;
+        mm[n] = p[i].as<float>() * 4.0f; // mm per 15 min -> mm/h
+        lbl[n] = t[i].as<String>().substring(11, 16);
+        n++;
+      }
+      if (n < 4) err = "Open-Meteo: no 15-minute data here";
+      else {
+        for (int i = 0; i < n; i++) { nowMm[i] = mm[i]; nowLabel[i] = lbl[i]; }
+        nowCount = n; nowStepMin = 15; nowRadar = false;
+        nowSource = "Open-Meteo 15-min forecast";
+        ok = true;
       }
     }
   }
-
-  // Fallback / outside NL-BE: Open-Meteo 15-minute model forecast (mm per 15 min)
-  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) + "&longitude=" + String(lon, 4)
-    + "&minutely_15=precipitation&forecast_minutely_15=9&timezone=auto";
-  HTTPClient http;
-  http.setTimeout(6000);
-  http.begin(url);
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) { http.end(); nowLastError += String(nowLastError.length() ? "; " : "") + "Open-Meteo HTTP " + String(code); return false; }
-  String payload = http.getString();
-  http.end();
-  DynamicJsonDocument doc(4096);
-  if (deserializeJson(doc, payload)) { nowLastError = "Open-Meteo: bad JSON"; return false; }
-  JsonArray t = doc["minutely_15"]["time"], p = doc["minutely_15"]["precipitation"];
-  int n = 0;
-  for (int i = 0; i < (int)t.size() && i < (int)p.size() && n < NOW_STEPS_MAX; i++) {
-    if (p[i].isNull()) continue;
-    nowMm[n] = p[i].as<float>() * 4.0f; // mm per 15 min -> mm/h
-    nowLabel[n] = t[i].as<String>().substring(11, 16);
-    n++;
+  if (!ok) {
+    nowLastError += String(nowLastError.length() ? "; " : "") + err;
+    double lat, lon;
+    if (j.step < 2 && cachedCoords(j.city, lat, lon)) { // next source
+      int next = j.step + 1, city = j.city;
+      netPost(NJ_NOW, city, next, 0, 0, nowcastUrl(next, lat, lon));
+      return;
+    }
   }
-  if (n < 4) { nowLastError = "Open-Meteo: no 15-minute data here"; return false; }
-  nowCount = n; nowStepMin = 15; nowRadar = false;
-  nowSource = "Open-Meteo 15-min forecast";
-  return true;
+  nowcastDone(j.city, ok);
 }
 
 // Open-Meteo 15-minute model forecast for the next 3 hours, kept next to the
 // radar so the two can be compared ("blending", see analyzeNowcast).
-bool fetchModel15(int city) {
+void modelDone(int city, bool ok) {
+  if (ok) { modCity = city; modFetchedAt = millis(); nowVersion++; }
+  else if (modCity != city) { modCity = city; modFetchedAt = 0; }
+  modNextFetch = millis() + (ok ? 15UL : 5UL) * 60000UL;
+  analyzeNowcast();
+}
+
+void modelStart(int city) {
   double lat, lon;
-  if (!getCityCoords(city, lat, lon)) return false;
-  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) + "&longitude=" + String(lon, 4)
-    + "&minutely_15=precipitation&forecast_minutely_15=12&timezone=auto";
-  HTTPClient http;
-  http.setTimeout(6000);
-  http.begin(url);
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) { http.end(); return false; }
-  String payload = http.getString();
-  http.end();
+  if (!cachedCoords(city, lat, lon)) { modelDone(city, false); return; }
+  netPost(NJ_MODEL, city, 0, 0, 0, "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) + "&longitude=" + String(lon, 4)
+    + "&minutely_15=precipitation&forecast_minutely_15=12&timezone=auto");
+}
+
+void modelResult(NetJob &j) {
+  if (j.city != currentCity) return;
+  bool ok = false;
   DynamicJsonDocument doc(4096);
-  if (deserializeJson(doc, payload)) return false;
-  JsonArray t = doc["minutely_15"]["time"], p = doc["minutely_15"]["precipitation"];
-  int n = 0;
-  for (int i = 0; i < (int)t.size() && i < (int)p.size() && n < MOD_STEPS_MAX; i++) {
-    if (p[i].isNull()) continue;
-    modMm[n] = p[i].as<float>() * 4.0f; // mm per 15 min -> mm/h
-    modLabel[n] = t[i].as<String>().substring(11, 16);
-    n++;
+  if (j.code == HTTP_CODE_OK && !deserializeJson(doc, j.body)) {
+    JsonArray t = doc["minutely_15"]["time"], p = doc["minutely_15"]["precipitation"];
+    int n = 0;
+    for (int i = 0; i < (int)t.size() && i < (int)p.size() && n < MOD_STEPS_MAX; i++) {
+      if (p[i].isNull()) continue;
+      modMm[n] = p[i].as<float>() * 4.0f; // mm per 15 min -> mm/h
+      modLabel[n] = t[i].as<String>().substring(11, 16);
+      n++;
+    }
+    if (n >= 4) { modCount = n; ok = true; }
   }
-  if (n < 4) return false;
-  modCount = n;
-  return true;
+  modelDone(j.city, ok);
 }
 
 bool modelValid() {
@@ -1343,20 +1457,30 @@ void checkRainAlert() {
 }
 
 // --- Pressure trend (Open-Meteo hourly sea-level pressure, same source for every city)
-bool fetchPressureTrend(int city) {
+void pTrendDone(int city, bool ok) {
+  if (ok) { pTrendCity = city; pTrendFetchedAt = millis(); pTrendVersion++; }
+  else if (pTrendCity != city) { pTrendCity = city; pTrendFetchedAt = 0; pTrendVersion++; }
+  pTrendNextFetch = millis() + (ok ? 60UL : 10UL) * 60000UL;
+  if (!ok) logDebug("PRESSURE TREND fetch failed: " + pTrendLastError);
+}
+
+void pTrendStart(int city) {
   double lat, lon;
-  if (!getCityCoords(city, lat, lon)) { pTrendLastError = "no coordinates for the city"; return false; }
-  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) + "&longitude=" + String(lon, 4)
-    + "&hourly=pressure_msl&past_hours=3&forecast_hours=1&timezone=auto";
-  HTTPClient http;
-  http.setTimeout(6000);
-  http.begin(url);
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) { http.end(); pTrendLastError = "Open-Meteo HTTP " + String(code); return false; }
-  String payload = http.getString();
-  http.end();
+  if (!cachedCoords(city, lat, lon)) { pTrendLastError = "no coordinates for the city yet"; pTrendDone(city, false); return; }
+  netPost(NJ_PTREND, city, 0, 0, 0, "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) + "&longitude=" + String(lon, 4)
+    + "&hourly=pressure_msl&past_hours=3&forecast_hours=1&timezone=auto");
+}
+
+void pTrendResult(NetJob &j) {
+  if (j.city != currentCity) return;
+  pTrendDone(j.city, parsePressureTrend(j));
+}
+
+bool parsePressureTrend(NetJob &j) {
+  int city = j.city;
+  if (j.code != HTTP_CODE_OK) { pTrendLastError = "Open-Meteo HTTP " + String(j.code); return false; }
   DynamicJsonDocument doc(2048);
-  if (deserializeJson(doc, payload)) { pTrendLastError = "bad JSON"; return false; }
+  if (deserializeJson(doc, j.body)) { pTrendLastError = "bad JSON"; return false; }
   JsonArray p = doc["hourly"]["pressure_msl"];
   // Least-squares slope over the hourly points (past 3 hours + now) - steadier
   // than comparing just the first and last value.
@@ -1416,39 +1540,30 @@ void nowcastLoop() {
   static unsigned long lastAttempt = 0, lastAnalyze = 0;
   if (millis() - lastAnalyze > 15000) { lastAnalyze = millis(); analyzeNowcast(); checkRainAlert(); }
 
-  if (WiFi.status() != WL_CONNECTED || isUpdating || timeStatus() == timeNotSet) return;
-  if (lastAttempt != 0 && millis() - lastAttempt < 10000) return;
+  // A finished background request? Parse it here, on the main loop.
+  NetJob *jp;
+  if (netBusy && xQueueReceive(netDoneQ, &jp, 0) == pdTRUE) {
+    netBusy = false;
+    if (jp->ms > 8000) logDebug("NET slow: job " + String(jp->kind) + " took " + String(jp->ms) + " ms (HTTP " + String(jp->code) + ")");
+    switch (jp->kind) {
+      case NJ_NOW: nowcastResult(*jp); break;
+      case NJ_MODEL: modelResult(*jp); break;
+      case NJ_PTREND: pTrendResult(*jp); break;
+      case NJ_VF_OBS: case NJ_VF_OM: case NJ_VF_OWM: verifyResult(*jp); break;
+    }
+    if (!netBusy) { netJob.body = ""; netJob.url = ""; } // free the reply (unless a follow-up was posted)
+  }
+  if (netBusy) return;
 
-  if (nowCity != currentCity || (long)(millis() - nowNextFetch) >= 0) {
-    lastAttempt = millis();
-    bool cityChanged = nowCity != currentCity;
-    bool ok = fetchNowcast(currentCity);
-    if (ok) { nowFetchedAt = millis(); nowVersion++; }
-    else if (cityChanged) { nowCount = 0; nowVersion++; } // never show the old city's rain
-    nowCity = currentCity;
-    nowNextFetch = millis() + (ok ? (nowRadar ? 5UL : 15UL) * 60000UL : 2UL * 60000UL);
-    analyzeNowcast(); checkRainAlert();
-    if (!ok) logDebug("RAIN 2H fetch failed: " + nowLastError);
-    return;
-  }
+  if (WiFi.status() != WL_CONNECTED || isUpdating || timeStatus() == timeNotSet) return;
+  if (lastAttempt != 0 && millis() - lastAttempt < 3000) return; // a short breather between requests
+
+  if (nowCity != currentCity || (long)(millis() - nowNextFetch) >= 0) { lastAttempt = millis(); nowcastStart(currentCity); return; }
   if (nowRadar && nowCity == currentCity && (modCity != currentCity || (long)(millis() - modNextFetch) >= 0)) {
-    lastAttempt = millis();
-    bool ok = fetchModel15(currentCity);
-    if (ok) { modCity = currentCity; modFetchedAt = millis(); nowVersion++; }
-    else if (modCity != currentCity) { modCity = currentCity; modFetchedAt = 0; }
-    modNextFetch = millis() + (ok ? 15UL : 5UL) * 60000UL;
-    analyzeNowcast();
-    return;
+    lastAttempt = millis(); modelStart(currentCity); return;
   }
-  if (verifyLoop()) { lastAttempt = millis(); return; } // forecast verification (at most one request)
-  if (pTrendCity != currentCity || (long)(millis() - pTrendNextFetch) >= 0) {
-    lastAttempt = millis();
-    bool ok = fetchPressureTrend(currentCity);
-    if (ok) { pTrendCity = currentCity; pTrendFetchedAt = millis(); pTrendVersion++; }
-    else if (pTrendCity != currentCity) { pTrendCity = currentCity; pTrendFetchedAt = 0; pTrendVersion++; }
-    pTrendNextFetch = millis() + (ok ? 60UL : 10UL) * 60000UL;
-    if (!ok) logDebug("PRESSURE TREND fetch failed: " + pTrendLastError);
-  }
+  if (verifyLoop()) { lastAttempt = millis(); return; } // forecast verification
+  if (pTrendCity != currentCity || (long)(millis() - pTrendNextFetch) >= 0) { lastAttempt = millis(); pTrendStart(currentCity); }
 }
 
 // --- [FORECAST VERIFICATION] ---
@@ -1501,49 +1616,43 @@ void vfLoad() {
 }
 
 // Radar rain rate right now at city c (mm/h); reuses the 2-hour outlook when fresh.
-bool vfRadarNow(int c, float &mm) {
+// Radar rain rate right now at city c (mm/h) from the 2-hour outlook, when
+// it's fresh - saves a request. Otherwise verifyLoop() asks the worker.
+bool vfRadarFromNowcast(int c, float &mm) {
   if (c == currentCity && nowRadar && nowCity == c && nowFetchedAt != 0 && millis() - nowFetchedAt < 6UL * 60000UL && nowCount > nowFirst) {
     mm = nowMm[nowFirst];
     return true;
   }
-  double lat, lon;
-  if (!getCityCoords(c, lat, lon)) return false;
-  String url = "https://gps.buienradar.nl/getrr.php?lat=" + String(lat, 2) + "&lon=" + String(lon, 2);
-  HTTPClient http;
-  http.setTimeout(6000);
-  http.begin(url);
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) { http.end(); return false; }
-  String body = http.getString();
-  http.end();
-  float v[3]; String l[3];
-  int n = parseRainText(body, v, l, 3);
-  if (n < 1) return false;
-  mm = v[0];
-  return true;
+  return false;
 }
 
 // Records every source's predicted rain (mm) for the block starting at 'start'.
+// Starts recording every source's predicted rain (mm) for the block starting
+// at 'start': Open-Meteo first (both models in one request), then OWM.
 void vfCapture(int c, int slot, uint32_t start) {
   vfStart[c][slot] = start;
   vfObsSum[c][slot] = 0; vfObsN[c][slot] = 0;
   for (int s = 0; s < VERIFY_SOURCES; s++) { vfFc[c][slot][s] = 0; vfFcOK[c][slot][s] = false; }
   double lat, lon;
-  if (!getCityCoords(c, lat, lon)) return;
+  if (!cachedCoords(c, lat, lon)) return;
+  netPost(NJ_VF_OM, c, 0, slot, start, "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) + "&longitude=" + String(lon, 4)
+    + "&hourly=precipitation&models=best_match,knmi_seamless&forecast_hours=8&timezone=GMT&timeformat=unixtime");
+}
 
-  // Open-Meteo, both models in one request. An hourly value covers the hour
-  // before its timestamp, so the block [start, start+3h) is the values at
-  // start+1h, +2h and +3h.
-  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) + "&longitude=" + String(lon, 4)
-    + "&hourly=precipitation&models=best_match,knmi_seamless&forecast_hours=8&timezone=GMT&timeformat=unixtime";
-  HTTPClient http;
-  http.setTimeout(6000);
-  http.begin(url);
-  if (http.GET() == HTTP_CODE_OK) {
-    String payload = http.getString();
-    http.end();
+void verifyResult(NetJob &j) {
+  int c = j.city, slot = j.slot;
+  uint32_t start = j.start;
+  if (vfStart[c][slot] != start) return; // that block was already scored or replaced
+  if (j.kind == NJ_VF_OBS) {
+    float v[3]; String l[3];
+    if (j.code == HTTP_CODE_OK && parseRainText(j.body, v, l, 3) >= 1) { vfObsSum[c][slot] += v[0]; vfObsN[c][slot]++; }
+    return;
+  }
+  if (j.kind == NJ_VF_OM) {
+    // An hourly value covers the hour before its timestamp, so the block
+    // [start, start+3h) is the values at start+1h, +2h and +3h.
     DynamicJsonDocument doc(3072);
-    if (!deserializeJson(doc, payload)) {
+    if (j.code == HTTP_CODE_OK && !deserializeJson(doc, j.body)) {
       JsonArray t = doc["hourly"]["time"];
       const char *keys[2] = {"precipitation_best_match", "precipitation_knmi_seamless"};
       for (int k = 0; k < 2; k++) {
@@ -1556,21 +1665,22 @@ void vfCapture(int c, int slot, uint32_t start) {
         if (got == 3) { vfFc[c][slot][1 + k] = sum; vfFcOK[c][slot][1 + k] = true; }
       }
     }
-  } else http.end();
-
-  // OpenWeatherMap: its 3-hour slices report the rain of the 3 hours before
-  // their timestamp, so this block is the slice stamped start+3h.
-  if (apiKey.length() > 0) {
-    String payload;
-    if (httpGetJson("http://api.openweathermap.org/data/2.5/forecast?lat=" + String(lat, 4) + "&lon=" + String(lon, 4) + "&cnt=4&units=metric", payload) == HTTP_CODE_OK) {
-      DynamicJsonDocument filter(256);
-      filter["list"][0]["dt"] = true;
-      filter["list"][0]["rain"]["3h"] = true;
-      DynamicJsonDocument doc(2048);
-      if (!deserializeJson(doc, payload, DeserializationOption::Filter(filter))) {
-        for (JsonObject sl : doc["list"].as<JsonArray>()) {
-          if (sl["dt"].as<uint32_t>() == start + VF_BLOCK) { vfFc[c][slot][0] = sl["rain"]["3h"] | 0.0f; vfFcOK[c][slot][0] = true; }
-        }
+    double lat, lon;
+    if (apiKey.length() > 0 && cachedCoords(c, lat, lon)) {
+      netPost(NJ_VF_OWM, c, 0, slot, start, "http://api.openweathermap.org/data/2.5/forecast?lat=" + String(lat, 4) + "&lon=" + String(lon, 4)
+        + "&cnt=4&units=metric&appid=" + apiKey);
+      return;
+    }
+  } else if (j.kind == NJ_VF_OWM && j.code == HTTP_CODE_OK) {
+    // OpenWeatherMap's 3-hour slices report the rain of the 3 hours before
+    // their timestamp, so this block is the slice stamped start+3h.
+    DynamicJsonDocument filter(256);
+    filter["list"][0]["dt"] = true;
+    filter["list"][0]["rain"]["3h"] = true;
+    DynamicJsonDocument doc(2048);
+    if (!deserializeJson(doc, j.body, DeserializationOption::Filter(filter))) {
+      for (JsonObject sl : doc["list"].as<JsonArray>()) {
+        if (sl["dt"].as<uint32_t>() == start + VF_BLOCK) { vfFc[c][slot][0] = sl["rain"]["3h"] | 0.0f; vfFcOK[c][slot][0] = true; }
       }
     }
   }
@@ -1598,7 +1708,7 @@ void vfScore(int c, int slot) {
   logDebug("VERIFY city " + String(c + 1) + ": " + vfStatus[c]);
 }
 
-// Called from nowcastLoop(). Does at most one network job; returns true if it did one.
+// Called from nowcastLoop(). Starts at most one background request; returns true if it did.
 bool verifyLoop() {
   if (timeStatus() == timeNotSet) return false;
   uint32_t t = now();
@@ -1611,12 +1721,14 @@ bool verifyLoop() {
     if (vfSince[c] == 0) { vfSince[c] = t; vfSave(c); }
     for (int sl = 0; sl < 2; sl++) if (vfStart[c][sl] != 0 && t >= vfStart[c][sl] + VF_BLOCK) vfScore(c, sl);
     int ns = (next / VF_BLOCK) & 1, cs = (cur / VF_BLOCK) & 1;
-    if (vfStart[c][ns] != next && t >= next - 7200 && t < next - 3600) { vfCapture(c, ns, next); return true; }
+    if (vfStart[c][ns] != next && t >= next - 7200 && t < next - 3600) { vfCapture(c, ns, next); return netBusy; }
     if (vfStart[c][cs] == cur && millis() - vfLastObs[c] >= 10UL * 60000UL) {
       vfLastObs[c] = millis();
       float mm;
-      if (vfRadarNow(c, mm)) { vfObsSum[c][cs] += mm; vfObsN[c][cs]++; }
-      return c != currentCity || !nowRadar; // reusing the 2-hour outlook costs no request
+      if (vfRadarFromNowcast(c, mm)) { vfObsSum[c][cs] += mm; vfObsN[c][cs]++; continue; } // no request needed
+      double lat, lon;
+      if (!cachedCoords(c, lat, lon)) continue;
+      return netPost(NJ_VF_OBS, c, 0, cs, cur, "https://gps.buienradar.nl/getrr.php?lat=" + String(lat, 2) + "&lon=" + String(lon, 2));
     }
   }
   return false;
@@ -1873,6 +1985,7 @@ void handleApiDebug() {
   json += "\"displayMode\":" + String(displayMode) + ",";
   json += "\"uptimeSec\":" + String(millis() / 1000) + ",";
   json += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"minHeap\":" + String(ESP.getMinFreeHeap()) + ",\"loopMaxMs\":" + String(loopMaxMs) + ",";
   json += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
   // Data sources: what each feed last returned, so feeds can be checked on the device
   auto age = [](unsigned long t) { return t == 0 ? String("never") : String((millis() - t) / 60000) + " min ago"; };
@@ -2349,16 +2462,20 @@ bool histMergeDays(int i, int n, int overwriteFrom, String dropFrom) {
 int histFetchDaily(String url, String who) {
   HTTPClient http;
   http.setTimeout(10000);
-  http.begin(url);
+  WiFiClientSecure tls; WiFiClient plain;
+  httpBeginSafe(http, tls, plain, url);
+  bool locked = netLock(20000); // never alongside a background HTTPS request
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
     String body = code > 0 ? http.getString() : "";
     http.end();
+    if (locked) netUnlock();
     logDebug("HIST " + who + ": HTTP " + String(code) + " " + body.substring(0, 90));
     return -1;
   }
   String payload = http.getString();
   http.end();
+  if (locked) netUnlock();
 
   DynamicJsonDocument doc(32768);
   if (deserializeJson(doc, payload)) { logDebug("HIST " + who + ": bad JSON"); return -1; }
@@ -3983,6 +4100,13 @@ void setup() {
   showRainPreview = prefs.getBool("rainPrevOn", true); // NEW
   rainLedAlert = prefs.getBool("rainLed", true);
   vfLoad();
+  netBegin(); // background task for the rain/pressure/verification requests
+  {
+    esp_reset_reason_t r = esp_reset_reason();
+    const char *why = r == ESP_RST_POWERON ? "power on" : r == ESP_RST_SW ? "restart" : r == ESP_RST_PANIC ? "CRASH (panic)"
+      : r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT ? "CRASH (watchdog)" : r == ESP_RST_BROWNOUT ? "brownout (power dip)" : "other";
+    logDebug("BOOT: reset reason " + String((int)r) + " - " + why);
+  }
   themeMode = constrain(prefs.getInt("theme", THEME_AUTO), 0, 2);
   applyTheme(); // AUTO can't know about sunset yet - re-checked after the first weather fetch
   updateBacklight(); 
@@ -4117,6 +4241,15 @@ void handleSerialCommand() {
 }
 
 void loop() {
+  // Watch for anything that holds up the main loop (touch and web pages wait meanwhile)
+  static unsigned long lastLoopAt = 0;
+  unsigned long loopNow = millis();
+  if (lastLoopAt != 0) {
+    unsigned long gap = loopNow - lastLoopAt;
+    if (gap > loopMaxMs) loopMaxMs = gap;
+    if (gap > 3000) logDebug("LOOP blocked for " + String(gap) + " ms");
+  }
+  lastLoopAt = loopNow;
   server.handleClient();
   checkWifiHealth(); // NEW: watches for a dropped connection and recovers automatically
   handleSerialCommand(); // NEW: read-only ping/status over Serial
@@ -5264,6 +5397,7 @@ const char DEBUG_BODY[] PROGMEM = R"rawliteral(
  <div class="drow"><span>Display page</span><span id="mode">--</span></div>
  <div class="drow"><span>Uptime</span><span id="uptime">--</span></div>
  <div class="drow"><span>Free heap</span><span id="heap">--</span></div>
+ <div class="drow"><span>Longest freeze</span><span id="loopMax">--</span></div>
  <div class="drow"><span>WiFi</span><span id="wifi">--</span></div>
 </section>
 <section class="card"><h3>Data sources <span>last fetch per feed</span></h3><div id="sources">Loading...</div></section>
@@ -5280,7 +5414,8 @@ async function refresh(){
   var sr=$('stuck');sr.innerText=d.stuckResets;sr.className=d.stuckResets>0?'bad':'ok';
   $('mode').innerText=d.displayMode+' ('+(PAGES[d.displayMode]||'?')+')';
   var u=d.uptimeSec;$('uptime').innerText=(u>=86400?Math.floor(u/86400)+'d ':'')+Math.floor(u%86400/3600)+'h '+Math.floor(u%3600/60)+'m '+(u%60)+'s';
-  $('heap').innerText=(d.freeHeap/1024).toFixed(1)+' KB';
+  $('heap').innerText=(d.freeHeap/1024).toFixed(1)+' KB'+(d.minHeap?' (lowest '+(d.minHeap/1024).toFixed(1)+' KB)':'');
+  $('loopMax').innerText=d.loopMaxMs==null?'--':(d.loopMaxMs/1000).toFixed(1)+' s';
   var w=$('wifi');w.innerText=d.wifiConnected?'connected':'DISCONNECTED';w.className=d.wifiConnected?'ok':'bad';
   $('log').innerText=d.log.join('\n');
   $('sources').innerHTML=(d.sources||[]).map(function(x){return '<div class="drow" style="display:block"><div style="display:flex;justify-content:space-between;gap:10px"><b>'+x.name+'</b><span class="'+(x.ok?'ok':'bad')+'">'+(x.ok?'OK':'not available')+' &middot; '+x.age+'</span></div><div class="muted small" style="margin-top:3px;font-family:inherit;font-weight:400">'+String(x.info).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];})+'</div></div>';}).join('');
