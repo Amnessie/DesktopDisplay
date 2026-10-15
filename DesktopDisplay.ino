@@ -1158,7 +1158,7 @@ int parseRainText(const String &body, float *mm, String *lbl, int maxN) {
 // server or a stalled TLS handshake can never freeze the device. One job at a
 // time; the blocking weather and history fetches on the main loop take the
 // same lock, so two HTTPS sessions (~45 KB of RAM each) never run at once.
-enum NetKind { NJ_NOW = 1, NJ_MODEL, NJ_PTREND, NJ_VF_OBS, NJ_VF_OM, NJ_VF_OWM };
+enum NetKind { NJ_NOW = 1, NJ_MODEL, NJ_PTREND, NJ_VF_OBS, NJ_VF_OM, NJ_VF_OWM, NJ_HIST };
 NetJob netJob;
 bool netBusy = false;
 QueueHandle_t netJobQ = nullptr, netDoneQ = nullptr;
@@ -1558,6 +1558,7 @@ void nowcastLoop() {
       case NJ_MODEL: modelResult(*jp); break;
       case NJ_PTREND: pTrendResult(*jp); break;
       case NJ_VF_OBS: case NJ_VF_OM: case NJ_VF_OWM: verifyResult(*jp); break;
+      case NJ_HIST: histResult(*jp); break;
     }
     if (!netBusy) { netJob.body = ""; netJob.url = ""; } // free the reply (unless a follow-up was posted)
   }
@@ -2174,7 +2175,7 @@ String bfEnd[NUM_CITIES];    // where this backfill started (for the progress %)
 String bfMsg[NUM_CITIES];
 int bfFails[NUM_CITIES] = {0, 0, 0};
 
-// Scratch space for one fetch (filled by histFetchDaily, used by histMergeDays)
+// Scratch space for one fetch (filled by histParseDaily, used by the merge)
 char  hfDate[HIST_MAX_FETCH][11];
 float hfMin[HIST_MAX_FETCH], hfMax[HIST_MAX_FETCH], hfRain[HIST_MAX_FETCH];
 float hfHum[HIST_MAX_FETCH], hfPres[HIST_MAX_FETCH], hfGust[HIST_MAX_FETCH], hfSun[HIST_MAX_FETCH];
@@ -2283,6 +2284,7 @@ void histStreamFileBody(File &f) {
 uint32_t histBootId = 0;
 uint32_t histGen[NUM_CITIES] = {0, 0, 0};
 void histTouch(int i) { histGen[i]++; }
+uint32_t histEpoch[NUM_CITIES] = {0, 0, 0}; // bumped when a city's log is renamed, wiped or imported
 String histEtag(int i, size_t size) {
   return "\"" + String(histBootId, HEX) + "-" + String(histGen[i]) + "-" + String((unsigned long)size) + "\"";
 }
@@ -2306,6 +2308,8 @@ void histWriteMeta(int i, String loc) {
 
 // Moves a city's log aside (never deletes it) so a new location starts clean.
 void histArchive(int i) {
+  histMergeAbort(i);
+  histEpoch[i]++;
   String src = histPath(i);
   if (!SD.exists(src)) return;
   int n = 1;
@@ -2418,77 +2422,104 @@ int histFindDay(String d, int n) {
 // keeping it sorted. Days at index >= overwriteFrom replace existing rows;
 // earlier days only fill gaps. Rows dated >= dropFrom ("" = none) are dropped.
 // Streams through the file, so it doesn't matter how big it gets.
-bool histMergeDays(int i, int n, int overwriteFrom, String dropFrom) {
-  if (n <= 0) return true;
-  String winStart = String(hfDate[0]), winEnd = String(hfDate[n - 1]);
-  for (int k = 0; k < n; k++) { hkPresent[k] = false; hkLine[k] = ""; }
+// Merging fetched days into a city's file streams through the whole file
+// (it's kept sorted, and a backfill adds days at the front), which takes
+// seconds once there are years of history. So it runs in slices of ~25 ms
+// per loop() pass instead of all at once: the screen and web pages keep
+// running while it works. The new file is written next to the old one and
+// only swapped in at the end, so readers always see a complete file.
+bool hmActive = false;
+int hmCity = -1, hmN = 0, hmOverwriteFrom = 0;
+String hmDropFrom, hmWinStart, hmWinEnd;
+File hmIn, hmOut;
+LineReader *hmReader = nullptr;
+bool hmFlushed = false;
 
-  String path = histPath(i), tmp = "/hist_c" + String(i) + ".tmp";
-  if (SD.exists(tmp)) SD.remove(tmp);
-  File out = SD.open(tmp, FILE_WRITE);
-  if (!out) return false;
-
-  bool flushed = false;
+void histMergeFlushWindow() {
+  if (hmFlushed) return;
+  hmFlushed = true;
   char buf[100];
-  auto flushWindow = [&]() {
-    if (flushed) return;
-    flushed = true;
-    for (int k = 0; k < n; k++) {
-      if (hkPresent[k]) out.println(hkLine[k]);
-      else if (hfValid[k]) { histFormatRow(k, buf, sizeof(buf)); out.println(buf); }
-      hkLine[k] = ""; // free memory
-    }
-  };
-
-  if (SD.exists(path)) {
-    File in = SD.open(path, FILE_READ);
-    LineReader lr(in);
-    String line;
-    while (in && lr.next(line)) {
-      line.trim();
-      if (line.length() < 11) continue;
-      String d = line.substring(0, 10);
-      if (dropFrom.length() == 10 && d >= dropFrom) continue;
-      if (d < winStart) { out.println(line); continue; }
-      if (d > winEnd) { flushWindow(); out.println(line); continue; }
-      int k = histFindDay(d, n);
-      if (k < 0) continue;
-      if (k >= overwriteFrom && hfValid[k]) continue; // replaced by the fresh value
-      hkPresent[k] = true;
-      hkLine[k] = histUpgradeLine(line, k);
-    }
-    if (in) in.close();
+  for (int k = 0; k < hmN; k++) {
+    if (hkPresent[k]) hmOut.println(hkLine[k]);
+    else if (hfValid[k]) { histFormatRow(k, buf, sizeof(buf)); hmOut.println(buf); }
+    hkLine[k] = ""; // free memory
   }
-  flushWindow();
-  out.close();
-
-  if (SD.exists(path)) SD.remove(path);
-  histTouch(i);
-  return SD.rename(tmp, path);
 }
 
-// Fetches an Open-Meteo daily response into hf*. Returns the number of days, or -1.
-int histFetchDaily(String url, String who) {
-  HTTPClient http;
-  http.setTimeout(10000);
-  WiFiClientSecure tls; WiFiClient plain;
-  httpBeginSafe(http, tls, plain, url);
-  bool locked = netLock(3000); // preferably not alongside a background HTTPS request
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    String body = code > 0 ? http.getString() : "";
-    http.end();
-    if (locked) netUnlock();
-    logDebug("HIST " + who + ": HTTP " + String(code) + " " + body.substring(0, 90));
-    return -1;
-  }
-  String payload = http.getString();
-  http.end();
-  if (locked) netUnlock();
+void histMergeClose() {
+  if (hmReader) { delete hmReader; hmReader = nullptr; }
+  if (hmIn) hmIn.close();
+  if (hmOut) hmOut.close();
+  hmActive = false;
+}
 
+// Merges fetched days hf[0..n-1] (consecutive, oldest first) into city i's file,
+// keeping it sorted. Days at index >= overwriteFrom replace existing rows;
+// earlier days only fill gaps. Rows dated >= dropFrom ("" = none) are dropped.
+// Starts the merge; histMergeStep() does the work and calls histMergeDone().
+bool histMergeBegin(int i, int n, int overwriteFrom, String dropFrom) {
+  if (hmActive || n <= 0) return false;
+  hmCity = i; hmN = n; hmOverwriteFrom = overwriteFrom; hmDropFrom = dropFrom;
+  hmWinStart = String(hfDate[0]); hmWinEnd = String(hfDate[n - 1]);
+  for (int k = 0; k < n; k++) { hkPresent[k] = false; hkLine[k] = ""; }
+  String tmp = "/hist_c" + String(i) + ".tmp";
+  if (SD.exists(tmp)) SD.remove(tmp);
+  hmOut = SD.open(tmp, FILE_WRITE);
+  if (!hmOut) return false;
+  if (SD.exists(histPath(i))) {
+    hmIn = SD.open(histPath(i), FILE_READ);
+    if (hmIn) hmReader = new LineReader(hmIn);
+  }
+  hmFlushed = false;
+  hmActive = true;
+  return true;
+}
+
+// Stops a running merge for city i (or any city with -1) and throws the half-written file away.
+void histMergeAbort(int i) {
+  if (!hmActive || (i >= 0 && hmCity != i)) return;
+  int c = hmCity;
+  histMergeClose();
+  String tmp = "/hist_c" + String(c) + ".tmp";
+  if (SD.exists(tmp)) SD.remove(tmp);
+  histEpoch[c]++; // a fetch in flight for this city is now outdated too
+  histMergeDone(false, true);
+}
+
+// Called from historyLoop() while a merge is running.
+void histMergeStep() {
+  if (!hmActive) return;
+  unsigned long t0 = millis();
+  String line;
+  while (hmReader && millis() - t0 < 25) {
+    if (!hmIn || !hmReader->next(line)) { delete hmReader; hmReader = nullptr; break; }
+    line.trim();
+    if (line.length() < 11) continue;
+    String d = line.substring(0, 10);
+    if (hmDropFrom.length() == 10 && d >= hmDropFrom) continue;
+    if (d < hmWinStart) { hmOut.println(line); continue; }
+    if (d > hmWinEnd) { histMergeFlushWindow(); hmOut.println(line); continue; }
+    int k = histFindDay(d, hmN);
+    if (k < 0) continue;
+    if (k >= hmOverwriteFrom && hfValid[k]) continue; // replaced by the fresh value
+    hkPresent[k] = true;
+    hkLine[k] = histUpgradeLine(line, k);
+  }
+  if (hmReader) return; // more next time
+
+  histMergeFlushWindow();
+  int i = hmCity;
+  histMergeClose();
+  String path = histPath(i), tmp = "/hist_c" + String(i) + ".tmp";
+  if (SD.exists(path)) SD.remove(path);
+  histTouch(i);
+  histMergeDone(SD.rename(tmp, path), false);
+}
+
+// Parses an Open-Meteo daily response into hf*. Returns the number of days, or -1.
+int histParseDaily(const String &payload, String who) {
   DynamicJsonDocument doc(32768);
   if (deserializeJson(doc, payload)) { logDebug("HIST " + who + ": bad JSON"); return -1; }
-  payload = ""; // free memory before the SD work
 
   JsonArray dTime = doc["daily"]["time"];
   JsonArray dMin  = doc["daily"]["temperature_2m_min"];
@@ -2518,81 +2549,126 @@ int histFetchDaily(String url, String who) {
 }
 
 // Regular sync for one city: the last pastDays finished days + today's forecast.
-bool histSyncCity(int i, int pastDays) {
+// What the history download/merge in progress is for (one at a time).
+bool histJobPending = false;  // a download is with the background worker
+int hjKind = 0;               // 0 = regular sync, 1 = backfill chunk
+int hjCity = -1;
+bool hjFull = false;          // sync: the full 92-day one
+String hjChunkStart;          // backfill: first day of the chunk
+int hjToday = -1;             // sync: index of today's entry in hf*
+
+// Regular sync for one city: the last pastDays finished days + today's forecast.
+bool histSyncStart(int i, bool full) {
   double lat = 0, lon = 0;
   if (!getCityCoords(i, lat, lon)) { logDebug("HIST city " + String(i + 1) + ": no coordinates"); return false; }
-
   String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) + "&longitude=" + String(lon, 4)
-    + "&daily=" + String(HIST_DAILY_VARS) + "&timezone=auto&past_days=" + String(pastDays) + "&forecast_days=1";
-  int n = histFetchDaily(url, "city " + String(i + 1));
-  if (n < 2) return false;
-
-  int nPast = n - 1; // last entry is today
-  String today = String(hfDate[n - 1]);
-  if (!histMergeDays(i, nPast, max(0, nPast - HIST_OVERWRITE_DAYS), today)) {
-    logDebug("HIST city " + String(i + 1) + ": SD write failed");
-    return false;
-  }
-
-  int t = n - 1;
-  histTodayValid[i] = hfValid[t];
-  histTodayDate[i] = today;
-  histTodayMin[i] = hfMin[t]; histTodayMax[i] = hfMax[t]; histTodayRain[i] = hfRain[t];
-  histTodayHum[i] = hfHum[t]; histTodayPres[i] = hfPres[t];
-  histTodayGust[i] = hfGust[t]; histTodayGustOK[i] = hfGustOK[t];
-  histTodaySun[i] = hfSun[t]; histTodaySunOK[i] = hfSunOK[t];
+    + "&daily=" + String(HIST_DAILY_VARS) + "&timezone=auto&past_days=" + String(full ? HIST_PAST_DAYS : HIST_SHORT_DAYS) + "&forecast_days=1";
+  if (!netPost(NJ_HIST, i, 0, full ? 1 : 0, histEpoch[i], url)) return false;
+  histJobPending = true; hjKind = 0; hjCity = i; hjFull = full;
   return true;
 }
 
+void histSyncDone(int i, bool ok) {
+  if (ok && hjFull) { histFullDone[i] = true; histLastFull[i] = millis(); }
+  histNextSync[i] = millis() + (ok ? HIST_SYNC_INTERVAL_MS : HIST_RETRY_MS);
+  logDebug("HIST city " + String(i + 1) + (hjFull ? " full" : " light") + " sync " + String(ok ? "OK" : "FAILED"));
+  if (ok && millis() - histLastStorageRefresh > HIST_STORAGE_REFRESH_MS) histRefreshStorage();
+}
+
 // One backfill chunk (up to 90 days) from the historical archive, fill-only.
-void histBackfillStep(int i) {
-  if (bfCursor[i] < bfStart[i]) { histBackfillStop(i, "Done - history goes back to " + bfStart[i]); return; }
+// One backfill chunk (up to 90 days) from the historical archive, fill-only.
+bool histBackfillChunk(int i) {
+  if (bfCursor[i] < bfStart[i]) { histBackfillStop(i, "Done - history goes back to " + bfStart[i]); return true; }
   String chunkEnd = bfCursor[i];
   String chunkStart = histAddDays(chunkEnd, -(HIST_BF_CHUNK_DAYS - 1));
   if (chunkStart < bfStart[i]) chunkStart = bfStart[i];
-
   double lat = 0, lon = 0;
-  int n = -1;
-  if (getCityCoords(i, lat, lon)) {
-    String url = "https://archive-api.open-meteo.com/v1/archive?latitude=" + String(lat, 4) + "&longitude=" + String(lon, 4)
-      + "&start_date=" + chunkStart + "&end_date=" + chunkEnd + "&daily=" + String(HIST_DAILY_VARS) + "&timezone=auto";
-    n = histFetchDaily(url, "backfill city " + String(i + 1));
-  }
-  if (n < 1 || !histMergeDays(i, n, n, "")) {
-    bfFails[i]++;
-    bfMsg[i] = "Request failed - retrying (" + String(bfFails[i]) + "/" + String(HIST_BF_MAX_FAILS) + ")";
-    if (bfFails[i] >= HIST_BF_MAX_FAILS) histBackfillStop(i, "Stopped after repeated errors - see the Debug page");
-    return;
-  }
-  bfFails[i] = 0;
-  bfCursor[i] = histAddDays(chunkStart, -1);
-  bfMsg[i] = "Filled back to " + chunkStart;
-  if (bfCursor[i] < bfStart[i]) histBackfillStop(i, "Done - history goes back to " + bfStart[i]);
-  else histBackfillSave(i);
+  if (!getCityCoords(i, lat, lon)) { histBackfillFailed(i); return true; }
+  String url = "https://archive-api.open-meteo.com/v1/archive?latitude=" + String(lat, 4) + "&longitude=" + String(lon, 4)
+    + "&start_date=" + chunkStart + "&end_date=" + chunkEnd + "&daily=" + String(HIST_DAILY_VARS) + "&timezone=auto";
+  if (!netPost(NJ_HIST, i, 1, 0, histEpoch[i], url)) return false;
+  histJobPending = true; hjKind = 1; hjCity = i; hjChunkStart = chunkStart;
+  return true;
 }
 
-// Call every loop(). Does at most one network job per call, spaced out, so the
-// device never stalls for long. Regular syncs go first, then backfill chunks.
+void histBackfillFailed(int i) {
+  bfFails[i]++;
+  bfMsg[i] = "Request failed - retrying (" + String(bfFails[i]) + "/" + String(HIST_BF_MAX_FAILS) + ")";
+  if (bfFails[i] >= HIST_BF_MAX_FAILS) histBackfillStop(i, "Stopped after repeated errors - see the Debug page");
+}
+
+void histBackfillDone(int i) {
+  bfFails[i] = 0;
+  bfCursor[i] = histAddDays(hjChunkStart, -1);
+  bfMsg[i] = "Filled back to " + hjChunkStart;
+  if (bfCursor[i] < bfStart[i]) histBackfillStop(i, "Done - history goes back to " + bfStart[i]);
+  else histBackfillSave(i);
+  if (millis() - histLastStorageRefresh > HIST_STORAGE_REFRESH_MS) histRefreshStorage();
+}
+
+// A history download came back from the worker: parse it and start the merge.
+void histResult(NetJob &j) {
+  histJobPending = false;
+  int i = j.city;
+  if (j.start != histEpoch[i]) return; // city renamed, wiped or imported meanwhile - drop it
+  String who = String(hjKind ? "backfill city " : "city ") + String(i + 1);
+  int n = -1;
+  if (j.code == HTTP_CODE_OK) n = histParseDaily(j.body, who);
+  else logDebug("HIST " + who + ": HTTP " + String(j.code));
+  j.body = ""; // free memory before the SD work
+  if (hjKind == 0) {
+    if (n < 2) { histSyncDone(i, false); return; }
+    int nPast = n - 1; // last entry is today
+    hjToday = n - 1;
+    if (!histMergeBegin(i, nPast, max(0, nPast - HIST_OVERWRITE_DAYS), String(hfDate[n - 1]))) {
+      logDebug("HIST city " + String(i + 1) + ": SD write failed");
+      histSyncDone(i, false);
+    }
+  } else {
+    if (!bfActive[i]) return; // stopped meanwhile
+    if (n < 1 || !histMergeBegin(i, n, n, "")) histBackfillFailed(i);
+  }
+}
+
+// The merge finished (ok = the new file is in place), or was aborted.
+void histMergeDone(bool ok, bool aborted) {
+  int i = hjCity;
+  if (hjKind == 0) {
+    if (ok) {
+      int t = hjToday;
+      histTodayValid[i] = hfValid[t];
+      histTodayDate[i] = String(hfDate[t]);
+      histTodayMin[i] = hfMin[t]; histTodayMax[i] = hfMax[t]; histTodayRain[i] = hfRain[t];
+      histTodayHum[i] = hfHum[t]; histTodayPres[i] = hfPres[t];
+      histTodayGust[i] = hfGust[t]; histTodayGustOK[i] = hfGustOK[t];
+      histTodaySun[i] = hfSun[t]; histTodaySunOK[i] = hfSunOK[t];
+    } else if (!aborted) logDebug("HIST city " + String(i + 1) + ": SD write failed");
+    histSyncDone(i, ok);
+  } else if (!aborted && bfActive[i]) {
+    if (ok) histBackfillDone(i); else histBackfillFailed(i);
+  }
+}
+
+// Call every loop(). Starts at most one background download at a time, spaced
+// out; regular syncs go first, then backfill chunks. Downloads run on the
+// network worker and merges in short slices, so the device never stalls.
 void historyLoop() {
   if (!sdOK) return;
 
   static unsigned long lastLocCheck = 0;
   if (millis() - lastLocCheck > 2000) { lastLocCheck = millis(); histCheckLocations(); }
 
-  if (WiFi.status() != WL_CONNECTED || isUpdating) return;
+  if (hmActive) { histMergeStep(); return; } // a merge in progress, a slice at a time
+  if (histJobPending) return;                 // waiting for the background download
+  if (WiFi.status() != WL_CONNECTED || isUpdating || netBusy) return;
   if (histLastAttempt != 0 && millis() - histLastAttempt < HIST_MIN_GAP_MS) return;
 
   for (int i = 0; i < NUM_CITIES; i++) {
     if (histTrimmedLoc(i).length() == 0) continue;
     if ((long)(millis() - histNextSync[i]) < 0) continue; // not due yet
-
     bool full = !histFullDone[i] || millis() - histLastFull[i] > HIST_FULL_SYNC_MS;
     histLastAttempt = millis();
-    bool ok = histSyncCity(i, full ? HIST_PAST_DAYS : HIST_SHORT_DAYS);
-    if (ok && full) { histFullDone[i] = true; histLastFull[i] = millis(); }
-    histNextSync[i] = millis() + (ok ? HIST_SYNC_INTERVAL_MS : HIST_RETRY_MS);
-    logDebug("HIST city " + String(i + 1) + (full ? " full" : " light") + " sync " + String(ok ? "OK" : "FAILED"));
-    if (ok && millis() - histLastStorageRefresh > HIST_STORAGE_REFRESH_MS) histRefreshStorage();
+    if (!histSyncStart(i, full)) { hjFull = full; histSyncDone(i, false); }
     return;
   }
 
@@ -2600,8 +2676,7 @@ void historyLoop() {
   for (int i = 0; i < NUM_CITIES; i++) {
     if (!bfActive[i] || histTrimmedLoc(i).length() == 0) continue;
     histLastAttempt = millis();
-    histBackfillStep(i);
-    if (millis() - histLastStorageRefresh > HIST_STORAGE_REFRESH_MS) histRefreshStorage();
+    histBackfillChunk(i);
     return;
   }
 }
@@ -2674,6 +2749,8 @@ int histListArchives(bool deleteThem) {
 }
 
 void histWipeCity(int i) {
+  histMergeAbort(i);
+  histEpoch[i]++;
   if (SD.exists(histPath(i))) SD.remove(histPath(i));
   histTouch(i);
   histTodayValid[i] = false;
@@ -2987,6 +3064,8 @@ bool histParseImportLine(String line, uint32_t &key, float *v) {
 // over existing days with the same date. Existing rows are streamed, so only
 // the imported rows are held in RAM.
 bool histImportProcess(int city, bool replaceAll, String &msg) {
+  histMergeAbort(city); // it writes the same temporary file
+  histEpoch[city]++;
   if (!SD.exists(HIST_IMPORT_TMP)) { msg = "Upload failed."; return false; }
 
   uint32_t key;
