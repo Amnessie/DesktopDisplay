@@ -743,6 +743,19 @@ int httpGetJson(String baseUrlNoKey, String &payload) {
 // (either from cache, or freshly fetched). City coordinates don't change,
 // so once geocoded we don't need to hit that endpoint again unless the
 // location string itself changes.
+// Reads OpenWeatherMap's geocoder reply and remembers the city's coordinates.
+bool applyGeoPayload(int idx, const String &payload, double &lat, double &lon) {
+  DynamicJsonDocument geoDoc(1536);
+  if (deserializeJson(geoDoc, payload) || geoDoc.size() == 0) return false;
+  lat = geoDoc[0]["lat"]; lon = geoDoc[0]["lon"];
+  cityLat[idx] = lat; cityLon[idx] = lon;
+  cityGeoCached[idx] = true; cityGeoLocStr[idx] = locs[idx];
+  prefs.putFloat(("lat" + String(idx)).c_str(), (float)lat);
+  prefs.putFloat(("lon" + String(idx)).c_str(), (float)lon);
+  prefs.putString(("geoLoc" + String(idx)).c_str(), locs[idx]);
+  return true;
+}
+
 bool getCityCoords(int idx, double &lat, double &lon) {
   String loc = locs[idx];
 
@@ -754,162 +767,100 @@ bool getCityCoords(int idx, double &lat, double &lon) {
   String currentLoc = loc;
   currentLoc.replace(",UK", ",GB");
   currentLoc.replace(",uk", ",GB");
-  String encodedLoc = urlEncode(currentLoc);
-  String geoUrl = "http://api.openweathermap.org/geo/1.0/direct?q=" + encodedLoc + "&limit=1";
-
+  String geoUrl = "http://api.openweathermap.org/geo/1.0/direct?q=" + urlEncode(currentLoc) + "&limit=1";
   String payload;
-  bool ok = false;
-  if (httpGetJson(geoUrl, payload) == HTTP_CODE_OK) {
-    DynamicJsonDocument geoDoc(1536);
-    deserializeJson(geoDoc, payload);
-    if (geoDoc.size() > 0) {
-      lat = geoDoc[0]["lat"]; lon = geoDoc[0]["lon"];
-      cityLat[idx] = lat; cityLon[idx] = lon;
-      cityGeoCached[idx] = true; cityGeoLocStr[idx] = loc;
-      prefs.putFloat(("lat" + String(idx)).c_str(), (float)lat);
-      prefs.putFloat(("lon" + String(idx)).c_str(), (float)lon);
-      prefs.putString(("geoLoc" + String(idx)).c_str(), loc);
-      ok = true;
-    }
-  }
-  return ok;
+  return httpGetJson(geoUrl, payload) == HTTP_CODE_OK && applyGeoPayload(idx, payload, lat, lon);
 }
 
 // --- [CORE WEATHER DATA FETCH] ---
 
-// NEW: fetches from OpenWeatherMap - this is the original fetch logic,
-// unchanged, just moved into its own function so getOpenWeatherData() can
-// dispatch to whichever provider the current city is configured to use.
-bool fetchFromOpenWeatherMap() {
+// OpenWeatherMap current weather (the /weather reply) into the globals.
+bool parseOwmNow(const String &payload) {
   bool weatherFetchSuccess = false;
-
-  // Step 1: Geocoding (cached per-city, see getCityCoords)
-  double lat = 0, lon = 0;
-  bool foundByGeo = getCityCoords(currentCity, lat, lon);
-
-  String currentLoc = locs[currentCity];
-  currentLoc.replace(",UK", ",GB");
-  currentLoc.replace(",uk", ",GB");
-  String encodedLoc = urlEncode(currentLoc);
-
-  // Step 2: Weather Call
-  String weatherUrl;
-  if (foundByGeo) weatherUrl = "http://api.openweathermap.org/data/2.5/weather?lat=" + String(lat, 6) + "&lon=" + String(lon, 6) + "&units=metric&cb=" + String(millis());
-  else weatherUrl = "http://api.openweathermap.org/data/2.5/weather?q=" + encodedLoc + "&units=metric&cb=" + String(millis());
-
-  String weatherPayload;
-  if (httpGetJson(weatherUrl, weatherPayload) == HTTP_CODE_OK) {
-    DynamicJsonDocument doc(3072); deserializeJson(doc, weatherPayload);
-    if (doc.containsKey("main")) {
-      tempnum = doc["main"]["temp"].as<float>(); 
-      tempMin = doc["main"]["temp_min"].as<float>(); 
-      tempMax = doc["main"]["temp_max"].as<float>();
-      feels_like = doc["main"]["feels_like"].as<float>();
-      huminum = (int)doc["main"]["humidity"]; 
-      pressure = (int)doc["main"]["pressure"];
-      clouds = (int)doc["clouds"]["all"]; 
-      visibility = (int)doc["visibility"] / 1000;
-      windSpeedKmH = doc["wind"]["speed"].as<float>() * 3.6;
-      windDir = getWindDir(doc["wind"]["deg"]);
-      mainWeather = doc["weather"][0]["main"].as<String>(); 
-      weatherDesc = doc["weather"][0]["description"].as<String>(); 
-      weatherDesc.toUpperCase();
-      rain1h = doc["rain"]["1h"] | 0.0; 
-      rain3h = doc["rain"]["3h"] | 0.0;
-      if (!foundByGeo && doc.containsKey("coord")) { lat = doc["coord"]["lat"]; lon = doc["coord"]["lon"]; }
-      tzOffsetSec[currentCity] = doc["timezone"].as<long>();
-      sysRise = doc["sys"]["sunrise"].as<long>() + tzOffsetSec[currentCity];
-      sysSet  = doc["sys"]["sunset"].as<long>() + tzOffsetSec[currentCity];
-      sunRise = (hour(sysRise) < 10 ? "0" : "") + String(hour(sysRise)) + ":" + (minute(sysRise) < 10 ? "0" : "") + String(minute(sysRise));
-      sunSet  = (hour(sysSet) < 10 ? "0" : "") + String(hour(sysSet)) + ":" + (minute(sysSet) < 10 ? "0" : "") + String(minute(sysSet));
-      setWeatherLED(mainWeather);
-      weatherFetchSuccess = true;
-    }
+  DynamicJsonDocument doc(3072); deserializeJson(doc, payload);
+  if (doc.containsKey("main")) {
+    tempnum = doc["main"]["temp"].as<float>(); 
+    tempMin = doc["main"]["temp_min"].as<float>(); 
+    tempMax = doc["main"]["temp_max"].as<float>();
+    feels_like = doc["main"]["feels_like"].as<float>();
+    huminum = (int)doc["main"]["humidity"]; 
+    pressure = (int)doc["main"]["pressure"];
+    clouds = (int)doc["clouds"]["all"]; 
+    visibility = (int)doc["visibility"] / 1000;
+    windSpeedKmH = doc["wind"]["speed"].as<float>() * 3.6;
+    windDir = getWindDir(doc["wind"]["deg"]);
+    mainWeather = doc["weather"][0]["main"].as<String>(); 
+    weatherDesc = doc["weather"][0]["description"].as<String>(); 
+    weatherDesc.toUpperCase();
+    rain1h = doc["rain"]["1h"] | 0.0; 
+    rain3h = doc["rain"]["3h"] | 0.0;
+    tzOffsetSec[currentCity] = doc["timezone"].as<long>();
+    sysRise = doc["sys"]["sunrise"].as<long>() + tzOffsetSec[currentCity];
+    sysSet  = doc["sys"]["sunset"].as<long>() + tzOffsetSec[currentCity];
+    sunRise = (hour(sysRise) < 10 ? "0" : "") + String(hour(sysRise)) + ":" + (minute(sysRise) < 10 ? "0" : "") + String(minute(sysRise));
+    sunSet  = (hour(sysSet) < 10 ? "0" : "") + String(hour(sysSet)) + ":" + (minute(sysSet) < 10 ? "0" : "") + String(minute(sysSet));
+    setWeatherLED(mainWeather);
+    weatherFetchSuccess = true;
   }
-
-  // Step 3: Forecast (Today + 4 Days)
-  String forecastUrl;
-  if (lat != 0 || lon != 0) forecastUrl = "http://api.openweathermap.org/data/2.5/forecast?lat=" + String(lat, 6) + "&lon=" + String(lon, 6) + "&units=metric&cb=" + String(millis());
-  else forecastUrl = "http://api.openweathermap.org/data/2.5/forecast?q=" + encodedLoc + "&units=metric&cb=" + String(millis());
-
-  String forecastPayload;
-  if (httpGetJson(forecastUrl, forecastPayload) == HTTP_CODE_OK) {
-    // Only keep the fields we actually use - the full 40-slice response is far
-    // bigger than needed and could run out of memory part-way through parsing
-    // (silently dropping the later forecast days).
-    DynamicJsonDocument filter(512);
-    filter["list"][0]["dt"] = true;
-    filter["list"][0]["main"]["temp"] = true;
-    filter["list"][0]["weather"][0]["main"] = true;
-    filter["list"][0]["rain"]["3h"] = true;
-    DynamicJsonDocument fdoc(12288);
-    DeserializationError ferr = deserializeJson(fdoc, forecastPayload, DeserializationOption::Filter(filter));
-    if (ferr) logDebug("Forecast JSON error: " + String(ferr.c_str()));
-    if (!ferr && fdoc.containsKey("list")) {
-      JsonArray list = fdoc["list"];
-      int dIdx = -1; String curL = "";
-      for (JsonObject slice : list) {
-        long dt = slice["dt"].as<long>() + tzOffsetSec[currentCity];
-
-        // Grab the rainfall figure for each of the next few 3-hour slices,
-        // independent of the day-bucketing below, for the precipitation graph
-        if (upcomingRainCount < RAIN_GRAPH_POINTS) {
-          float r3 = slice["rain"]["3h"] | 0.0;
-          upcomingRainMm[upcomingRainCount] = r3;
-          int hh = hour(dt);
-          upcomingRainLabel[upcomingRainCount] = (hh < 10 ? "0" : "") + String(hh) + "h";
-          upcomingRainCount++;
-        }
-
-        String dL = getDayName(weekday(dt)); 
-        if (dL != curL) { 
-          dIdx++;
-          if (dIdx >= 5) break;
-          curL = dL; forecast[dIdx].dayName = dL;
-          forecast[dIdx].high = -99.0; forecast[dIdx].low = 99.0;
-          forecast[dIdx].main = slice["weather"][0]["main"].as<String>();
-          forecast[dIdx].main.toUpperCase();
-          forecast[dIdx].valid = true;
-        }
-        float t = slice["main"]["temp"].as<float>();
-        if (t > forecast[dIdx].high) forecast[dIdx].high = t;
-        if (t < forecast[dIdx].low) forecast[dIdx].low = t;
-      }
-    }
-  }
-
   return weatherFetchSuccess;
 }
 
-// NEW: fetches from Open-Meteo - no API key needed, one combined request
-// gets current + hourly + daily data. useKnmiModel uses KNMI's "seamless"
-// blend: their 2km Harmonie AROME Netherlands model where it has data, filled
-// in with KNMI's Europe model and then ECMWF beyond its ~2.5-day range or
-// outside the Netherlands - so all 5 forecast days always get real values.
+// OpenWeatherMap 5-day / 3-hour forecast (the /forecast reply) into the globals.
+void parseOwmForecast(const String &payload) {
+  // Only keep the fields we actually use - the full 40-slice response is far
+  // bigger than needed and could run out of memory part-way through parsing
+  // (silently dropping the later forecast days).
+  DynamicJsonDocument filter(512);
+  filter["list"][0]["dt"] = true;
+  filter["list"][0]["main"]["temp"] = true;
+  filter["list"][0]["weather"][0]["main"] = true;
+  filter["list"][0]["rain"]["3h"] = true;
+  DynamicJsonDocument fdoc(12288);
+  DeserializationError ferr = deserializeJson(fdoc, payload, DeserializationOption::Filter(filter));
+  if (ferr) logDebug("Forecast JSON error: " + String(ferr.c_str()));
+  if (!ferr && fdoc.containsKey("list")) {
+    JsonArray list = fdoc["list"];
+    int dIdx = -1; String curL = "";
+    for (JsonObject slice : list) {
+      long dt = slice["dt"].as<long>() + tzOffsetSec[currentCity];
+
+      // Grab the rainfall figure for each of the next few 3-hour slices,
+      // independent of the day-bucketing below, for the precipitation graph
+      if (upcomingRainCount < RAIN_GRAPH_POINTS) {
+        float r3 = slice["rain"]["3h"] | 0.0;
+        upcomingRainMm[upcomingRainCount] = r3;
+        int hh = hour(dt);
+        upcomingRainLabel[upcomingRainCount] = (hh < 10 ? "0" : "") + String(hh) + "h";
+        upcomingRainCount++;
+      }
+
+      String dL = getDayName(weekday(dt)); 
+      if (dL != curL) { 
+        dIdx++;
+        if (dIdx >= 5) break;
+        curL = dL; forecast[dIdx].dayName = dL;
+        forecast[dIdx].high = -99.0; forecast[dIdx].low = 99.0;
+        forecast[dIdx].main = slice["weather"][0]["main"].as<String>();
+        forecast[dIdx].main.toUpperCase();
+        forecast[dIdx].valid = true;
+      }
+      float t = slice["main"]["temp"].as<float>();
+      if (t > forecast[dIdx].high) forecast[dIdx].high = t;
+      if (t < forecast[dIdx].low) forecast[dIdx].low = t;
+    }
+  }
+}
+
 // Reads a JSON number as float, or def if it's missing/null (Open-Meteo uses
 // null for values a model doesn't cover).
 float jsonNum(JsonVariant v, float def) { return v.isNull() ? def : v.as<float>(); }
 
-bool fetchFromOpenMeteo(bool useKnmiModel) {
-  double lat = 0, lon = 0;
-  if (!getCityCoords(currentCity, lat, lon)) return false; // Open-Meteo needs coordinates, not a free-text city name
-
-  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 6) + "&longitude=" + String(lon, 6)
-    + "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,pressure_msl,wind_speed_10m,wind_direction_10m,visibility,cloud_cover"
-    + "&hourly=weather_code,precipitation"
-    + "&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset"
-    + "&timezone=auto&forecast_days=5&forecast_hours=15";
-  if (useKnmiModel) url += "&models=knmi_seamless";
-
-  HTTPClient http;
-  http.setTimeout(5000);
-  WiFiClientSecure tls; WiFiClient plain;
-  httpBeginSafe(http, tls, plain, url);
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) { http.end(); return false; }
-  String payload = http.getString();
-  http.end();
-
+// Open-Meteo's combined reply (current + hourly + daily) into the globals. No
+// API key needed. The KNMI option uses KNMI's "seamless" blend: their 2 km
+// Harmonie AROME Netherlands model where it has data, filled in with KNMI's
+// Europe model and then ECMWF beyond its ~2.5-day range or outside the
+// Netherlands - so all 5 forecast days always get real values.
+bool parseOpenMeteo(const String &payload) {
   DynamicJsonDocument doc(8192);
   DeserializationError err = deserializeJson(doc, payload);
   if (err || !doc.containsKey("current")) return false;
@@ -1013,8 +964,101 @@ void restoreCurrentFrom(const WeatherSnapshot &s) {
 int lastDataCity = -1;  // which city the data currently in memory belongs to
 bool lastDataOK = false; // whether that data came from a successful fetch
 
-void getOpenWeatherData() {
-  if (WiFi.status() != WL_CONNECTED) { lastFetchOK = false; return; }
+// --- Weather update as a short sequence of requests, so the same code can run
+// in the background (normal use) or straight through (once, at boot):
+//   OpenWeatherMap: [find the city] -> current weather -> forecast
+//   Open-Meteo:     [find the city] -> one combined request
+// "Find the city" (OpenWeatherMap's geocoder) is only needed the first time.
+const int WX_GEO = 0, WX_OWM_NOW = 1, WX_OWM_FC = 2, WX_OM = 3, WX_DONE = 9;
+int wxStep = WX_DONE, wxCity = -1, wxProvider = 0;
+uint32_t wxGen = 0;              // bumped for every new update; older replies are ignored
+bool wxActive = false;           // an update is running in the background
+bool wxHasCoords = false, wxBackupTried = false, wxNowOK = false, wxFcOK = false;
+double wxLat = 0, wxLon = 0;
+String wxNowBody, wxFcBody;
+unsigned long wxStartedAt = 0;
+
+String wxKey() { return wxBackupTried ? apiKeyBackup : apiKey; }
+
+int wxFirstDataStep() { return wxProvider == PROVIDER_OPENWEATHER ? WX_OWM_NOW : WX_OM; }
+
+void wxBegin(int city) {
+  wxGen++;
+  wxCity = city; wxProvider = constrain(cityProvider[city], 0, 2);
+  wxNowBody = ""; wxFcBody = ""; wxNowOK = wxFcOK = false; wxBackupTried = false;
+  wxHasCoords = cachedCoords(city, wxLat, wxLon);
+  wxStep = wxHasCoords ? wxFirstDataStep() : WX_GEO;
+}
+
+String wxCityQuery() {
+  String loc = locs[wxCity];
+  loc.replace(",UK", ",GB"); loc.replace(",uk", ",GB");
+  return urlEncode(loc);
+}
+
+String wxUrl() {
+  String ll = "lat=" + String(wxLat, 6) + "&lon=" + String(wxLon, 6);
+  switch (wxStep) {
+    case WX_GEO: return "http://api.openweathermap.org/geo/1.0/direct?q=" + wxCityQuery() + "&limit=1&appid=" + wxKey();
+    case WX_OWM_NOW: return "http://api.openweathermap.org/data/2.5/weather?" + (wxHasCoords ? ll : "q=" + wxCityQuery()) + "&units=metric&cb=" + String(millis()) + "&appid=" + wxKey();
+    case WX_OWM_FC: return "http://api.openweathermap.org/data/2.5/forecast?" + (wxHasCoords ? ll : "q=" + wxCityQuery()) + "&units=metric&cb=" + String(millis()) + "&appid=" + wxKey();
+    default: {
+      String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(wxLat, 6) + "&longitude=" + String(wxLon, 6)
+        + "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,pressure_msl,wind_speed_10m,wind_direction_10m,visibility,cloud_cover"
+        + "&hourly=weather_code,precipitation"
+        + "&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset"
+        + "&timezone=auto&forecast_days=5&forecast_hours=15";
+      if (wxProvider == PROVIDER_OPENMETEO_KNMI) url += "&models=knmi_seamless";
+      return url;
+    }
+  }
+}
+
+// One reply came back: store it and move on to the next step.
+void wxOnResult(int code, String &body) {
+  bool owmStep = wxStep != WX_OM;
+  // Rejected or rate-limited key: try the same request once more with the backup key
+  if (owmStep && (code == 401 || code == 429) && !wxBackupTried && apiKeyBackup.length() > 0 && apiKeyBackup != apiKey) {
+    wxBackupTried = true;
+    return;
+  }
+  if (owmStep && code == HTTP_CODE_OK) activeApiKeySource = wxBackupTried ? "backup" : "primary";
+  switch (wxStep) {
+    case WX_GEO:
+      if (code == HTTP_CODE_OK) wxHasCoords = applyGeoPayload(wxCity, body, wxLat, wxLon);
+      // Open-Meteo needs coordinates; OpenWeatherMap can fall back to the city name
+      wxStep = (wxHasCoords || wxProvider == PROVIDER_OPENWEATHER) ? wxFirstDataStep() : WX_DONE;
+      break;
+    case WX_OWM_NOW:
+      wxNowOK = code == HTTP_CODE_OK;
+      if (wxNowOK) {
+        wxNowBody = body;
+        if (!wxHasCoords) { // found by name: use its coordinates for the forecast
+          DynamicJsonDocument filter(64); filter["coord"] = true;
+          DynamicJsonDocument d(256);
+          if (!deserializeJson(d, body, DeserializationOption::Filter(filter)) && d.containsKey("coord")) {
+            wxLat = d["coord"]["lat"]; wxLon = d["coord"]["lon"]; wxHasCoords = true;
+          }
+        }
+      }
+      wxStep = WX_OWM_FC;
+      break;
+    case WX_OWM_FC:
+      wxFcOK = code == HTTP_CODE_OK;
+      if (wxFcOK) wxFcBody = body;
+      wxStep = WX_DONE;
+      break;
+    default:
+      wxNowOK = code == HTTP_CODE_OK;
+      if (wxNowOK) wxNowBody = body;
+      wxStep = WX_DONE;
+  }
+}
+
+// All replies are in: put them into the globals, keeping the previous data if
+// the refresh failed (same rules as always).
+void wxApply() {
+  if (WiFi.status() != WL_CONNECTED && !wxNowOK) { lastFetchOK = false; return; }
 
   // Keep a copy of the current data if it's a good set for this same city -
   // a refresh that fails (or only half-succeeds) then falls back to it.
@@ -1039,11 +1083,13 @@ void getOpenWeatherData() {
   upcomingRainCount = 0;
 
   bool weatherFetchSuccess;
-  if (cityProvider[currentCity] == PROVIDER_OPENWEATHER) {
-    weatherFetchSuccess = fetchFromOpenWeatherMap();
+  if (wxProvider == PROVIDER_OPENWEATHER) {
+    weatherFetchSuccess = wxNowOK && parseOwmNow(wxNowBody);
+    if (wxFcOK) parseOwmForecast(wxFcBody);
   } else {
-    weatherFetchSuccess = fetchFromOpenMeteo(cityProvider[currentCity] == PROVIDER_OPENMETEO_KNMI);
+    weatherFetchSuccess = wxNowOK && parseOpenMeteo(wxNowBody);
   }
+  wxNowBody = ""; wxFcBody = ""; // free memory
 
   if (canRestore) {
     if (!weatherFetchSuccess) {
@@ -1067,10 +1113,21 @@ void getOpenWeatherData() {
   // all three cities in the background regardless of which one is shown.
 }
 
-// --- [NEW: NON-BLOCKING-FEELING UPDATE WRAPPER] ---
-// Shows a small "..." badge instead of wiping the whole screen, so the old
-// data stays visible (and the UI doesn't look frozen/blank) while the
-// network calls run. Once done, forces a full redraw of the current page.
+// Blocking version, used once at boot (before the screen shows anything).
+void getOpenWeatherData() {
+  if (WiFi.status() != WL_CONNECTED) { lastFetchOK = false; return; }
+  wxBegin(currentCity);
+  while (wxStep != WX_DONE) {
+    String body;
+    int code = netGet(wxUrl(), body);
+    wxOnResult(code, body);
+  }
+  wxApply();
+}
+
+// --- [BACKGROUND WEATHER UPDATE] ---
+// Shows a small "..." badge while the update runs in the background; the old
+// data stays on screen meanwhile. Once done, the current page is redrawn.
 void drawUpdatingBadge(bool show) {
   if (show) {
     // Home page: over the city dots (the corners hold the city arrows).
@@ -1087,9 +1144,20 @@ void drawUpdatingBadge(bool show) {
 void triggerWeatherUpdate() {
   isUpdating = true;
   drawUpdatingBadge(true);
-  bool locked = netLock(3000); // let a background request finish first, but never stall the screen for long
-  getOpenWeatherData();
-  if (locked) netUnlock();
+  if (WiFi.status() != WL_CONNECTED) { lastFetchOK = false; wxFinish(); return; }
+  wxBegin(currentCity); // a new city (or a second tap) simply restarts the sequence
+  wxActive = true;
+  wxStartedAt = millis();
+  // nowcastLoop() hands the requests to the background worker one by one and calls wxFinish()
+}
+
+// The background weather update is complete (or couldn't start): show it.
+void wxFinish() {
+  if (wxActive) {
+    wxActive = false;
+    if (wxCity == currentCity) wxApply();
+    if (millis() - wxStartedAt > 8000) logDebug("Weather update took " + String((millis() - wxStartedAt) / 1000) + " s");
+  }
   isUpdating = false;
   applyTheme(); // new sunrise/sunset times (or another city) can change the AUTO theme
   drawPageBackground(displayMode);
@@ -1158,7 +1226,7 @@ int parseRainText(const String &body, float *mm, String *lbl, int maxN) {
 // server or a stalled TLS handshake can never freeze the device. One job at a
 // time; the blocking weather and history fetches on the main loop take the
 // same lock, so two HTTPS sessions (~45 KB of RAM each) never run at once.
-enum NetKind { NJ_NOW = 1, NJ_MODEL, NJ_PTREND, NJ_VF_OBS, NJ_VF_OM, NJ_VF_OWM };
+enum NetKind { NJ_NOW = 1, NJ_MODEL, NJ_PTREND, NJ_VF_OBS, NJ_VF_OM, NJ_VF_OWM, NJ_HIST, NJ_WX };
 NetJob netJob;
 bool netBusy = false;
 QueueHandle_t netJobQ = nullptr, netDoneQ = nullptr;
@@ -1224,11 +1292,6 @@ bool netPost(int kind, int city, int step, int slot, uint32_t start, const Strin
   return true;
 }
 
-// For the blocking fetches still on the main loop (weather, history). They
-// wait at most a few seconds; if the background request is still running they
-// go ahead anyway rather than freezing the screen.
-bool netLock(unsigned long ms) { return netMutex && xSemaphoreTake(netMutex, pdMS_TO_TICKS(ms)) == pdTRUE; }
-void netUnlock() { xSemaphoreGive(netMutex); }
 
 // Coordinates only if already known - never a (blocking) geocoding request.
 bool cachedCoords(int c, double &lat, double &lon) {
@@ -1553,15 +1616,32 @@ void nowcastLoop() {
   if (netBusy && xQueueReceive(netDoneQ, &jp, 0) == pdTRUE) {
     netBusy = false;
     if (jp->ms > 8000) logDebug("NET slow: job " + String(jp->kind) + " took " + String(jp->ms) + " ms (HTTP " + String(jp->code) + ")");
+    unsigned long pt0 = millis();
+    int pkind = jp->kind;
     switch (jp->kind) {
       case NJ_NOW: nowcastResult(*jp); break;
       case NJ_MODEL: modelResult(*jp); break;
       case NJ_PTREND: pTrendResult(*jp); break;
       case NJ_VF_OBS: case NJ_VF_OM: case NJ_VF_OWM: verifyResult(*jp); break;
+      case NJ_HIST: histResult(*jp); break;
+      case NJ_WX:
+        if (jp->start == wxGen && wxActive) { // ignore replies for an update that was restarted
+          wxOnResult(jp->code, jp->body);
+          if (wxStep == WX_DONE) wxFinish();
+        }
+        break;
     }
+    if (millis() - pt0 > 500) logDebug("SLOW handling job " + String(pkind) + ": " + String(millis() - pt0) + " ms");
     if (!netBusy) { netJob.body = ""; netJob.url = ""; } // free the reply (unless a follow-up was posted)
   }
   if (netBusy) return;
+
+  // The weather update for the screen goes first, one request at a time
+  if (wxActive) {
+    if (WiFi.status() != WL_CONNECTED) { lastFetchOK = false; wxFinish(); return; }
+    netPost(NJ_WX, wxCity, wxStep, 0, wxGen, wxUrl());
+    return;
+  }
 
   if (WiFi.status() != WL_CONNECTED || isUpdating || timeStatus() == timeNotSet) return;
   if (lastAttempt != 0 && millis() - lastAttempt < 3000) return; // a short breather between requests
@@ -2049,6 +2129,7 @@ void handleApiStatus() {
   static const char *PROVIDER_NAMES[] = {"OpenWeatherMap", "Open-Meteo", "Open-Meteo KNMI"};
   json += "\"provider\":\"" + String(PROVIDER_NAMES[constrain(cityProvider[currentCity], 0, 2)]) + "\",";
   json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"updating\":" + String(isUpdating ? "true" : "false") + ",";
   analyzeNowcast();
   if (nowValid) {
     json += "\"nowcast\":{\"valid\":true,\"radar\":" + String(nowRadar ? "true" : "false") + ",\"stepMin\":" + String(nowStepMin)
@@ -2174,7 +2255,7 @@ String bfEnd[NUM_CITIES];    // where this backfill started (for the progress %)
 String bfMsg[NUM_CITIES];
 int bfFails[NUM_CITIES] = {0, 0, 0};
 
-// Scratch space for one fetch (filled by histFetchDaily, used by histMergeDays)
+// Scratch space for one fetch (filled by histParseDaily, used by the merge)
 char  hfDate[HIST_MAX_FETCH][11];
 float hfMin[HIST_MAX_FETCH], hfMax[HIST_MAX_FETCH], hfRain[HIST_MAX_FETCH];
 float hfHum[HIST_MAX_FETCH], hfPres[HIST_MAX_FETCH], hfGust[HIST_MAX_FETCH], hfSun[HIST_MAX_FETCH];
@@ -2283,6 +2364,7 @@ void histStreamFileBody(File &f) {
 uint32_t histBootId = 0;
 uint32_t histGen[NUM_CITIES] = {0, 0, 0};
 void histTouch(int i) { histGen[i]++; }
+uint32_t histEpoch[NUM_CITIES] = {0, 0, 0}; // bumped when a city's log is renamed, wiped or imported
 String histEtag(int i, size_t size) {
   return "\"" + String(histBootId, HEX) + "-" + String(histGen[i]) + "-" + String((unsigned long)size) + "\"";
 }
@@ -2306,6 +2388,8 @@ void histWriteMeta(int i, String loc) {
 
 // Moves a city's log aside (never deletes it) so a new location starts clean.
 void histArchive(int i) {
+  histMergeAbort(i);
+  histEpoch[i]++;
   String src = histPath(i);
   if (!SD.exists(src)) return;
   int n = 1;
@@ -2418,77 +2502,104 @@ int histFindDay(String d, int n) {
 // keeping it sorted. Days at index >= overwriteFrom replace existing rows;
 // earlier days only fill gaps. Rows dated >= dropFrom ("" = none) are dropped.
 // Streams through the file, so it doesn't matter how big it gets.
-bool histMergeDays(int i, int n, int overwriteFrom, String dropFrom) {
-  if (n <= 0) return true;
-  String winStart = String(hfDate[0]), winEnd = String(hfDate[n - 1]);
-  for (int k = 0; k < n; k++) { hkPresent[k] = false; hkLine[k] = ""; }
+// Merging fetched days into a city's file streams through the whole file
+// (it's kept sorted, and a backfill adds days at the front), which takes
+// seconds once there are years of history. So it runs in slices of ~25 ms
+// per loop() pass instead of all at once: the screen and web pages keep
+// running while it works. The new file is written next to the old one and
+// only swapped in at the end, so readers always see a complete file.
+bool hmActive = false;
+int hmCity = -1, hmN = 0, hmOverwriteFrom = 0;
+String hmDropFrom, hmWinStart, hmWinEnd;
+File hmIn, hmOut;
+LineReader *hmReader = nullptr;
+bool hmFlushed = false;
 
-  String path = histPath(i), tmp = "/hist_c" + String(i) + ".tmp";
-  if (SD.exists(tmp)) SD.remove(tmp);
-  File out = SD.open(tmp, FILE_WRITE);
-  if (!out) return false;
-
-  bool flushed = false;
+void histMergeFlushWindow() {
+  if (hmFlushed) return;
+  hmFlushed = true;
   char buf[100];
-  auto flushWindow = [&]() {
-    if (flushed) return;
-    flushed = true;
-    for (int k = 0; k < n; k++) {
-      if (hkPresent[k]) out.println(hkLine[k]);
-      else if (hfValid[k]) { histFormatRow(k, buf, sizeof(buf)); out.println(buf); }
-      hkLine[k] = ""; // free memory
-    }
-  };
-
-  if (SD.exists(path)) {
-    File in = SD.open(path, FILE_READ);
-    LineReader lr(in);
-    String line;
-    while (in && lr.next(line)) {
-      line.trim();
-      if (line.length() < 11) continue;
-      String d = line.substring(0, 10);
-      if (dropFrom.length() == 10 && d >= dropFrom) continue;
-      if (d < winStart) { out.println(line); continue; }
-      if (d > winEnd) { flushWindow(); out.println(line); continue; }
-      int k = histFindDay(d, n);
-      if (k < 0) continue;
-      if (k >= overwriteFrom && hfValid[k]) continue; // replaced by the fresh value
-      hkPresent[k] = true;
-      hkLine[k] = histUpgradeLine(line, k);
-    }
-    if (in) in.close();
+  for (int k = 0; k < hmN; k++) {
+    if (hkPresent[k]) hmOut.println(hkLine[k]);
+    else if (hfValid[k]) { histFormatRow(k, buf, sizeof(buf)); hmOut.println(buf); }
+    hkLine[k] = ""; // free memory
   }
-  flushWindow();
-  out.close();
-
-  if (SD.exists(path)) SD.remove(path);
-  histTouch(i);
-  return SD.rename(tmp, path);
 }
 
-// Fetches an Open-Meteo daily response into hf*. Returns the number of days, or -1.
-int histFetchDaily(String url, String who) {
-  HTTPClient http;
-  http.setTimeout(10000);
-  WiFiClientSecure tls; WiFiClient plain;
-  httpBeginSafe(http, tls, plain, url);
-  bool locked = netLock(3000); // preferably not alongside a background HTTPS request
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    String body = code > 0 ? http.getString() : "";
-    http.end();
-    if (locked) netUnlock();
-    logDebug("HIST " + who + ": HTTP " + String(code) + " " + body.substring(0, 90));
-    return -1;
-  }
-  String payload = http.getString();
-  http.end();
-  if (locked) netUnlock();
+void histMergeClose() {
+  if (hmReader) { delete hmReader; hmReader = nullptr; }
+  if (hmIn) hmIn.close();
+  if (hmOut) hmOut.close();
+  hmActive = false;
+}
 
+// Merges fetched days hf[0..n-1] (consecutive, oldest first) into city i's file,
+// keeping it sorted. Days at index >= overwriteFrom replace existing rows;
+// earlier days only fill gaps. Rows dated >= dropFrom ("" = none) are dropped.
+// Starts the merge; histMergeStep() does the work and calls histMergeDone().
+bool histMergeBegin(int i, int n, int overwriteFrom, String dropFrom) {
+  if (hmActive || n <= 0) return false;
+  hmCity = i; hmN = n; hmOverwriteFrom = overwriteFrom; hmDropFrom = dropFrom;
+  hmWinStart = String(hfDate[0]); hmWinEnd = String(hfDate[n - 1]);
+  for (int k = 0; k < n; k++) { hkPresent[k] = false; hkLine[k] = ""; }
+  String tmp = "/hist_c" + String(i) + ".tmp";
+  if (SD.exists(tmp)) SD.remove(tmp);
+  hmOut = SD.open(tmp, FILE_WRITE);
+  if (!hmOut) return false;
+  if (SD.exists(histPath(i))) {
+    hmIn = SD.open(histPath(i), FILE_READ);
+    if (hmIn) hmReader = new LineReader(hmIn);
+  }
+  hmFlushed = false;
+  hmActive = true;
+  return true;
+}
+
+// Stops a running merge for city i (or any city with -1) and throws the half-written file away.
+void histMergeAbort(int i) {
+  if (!hmActive || (i >= 0 && hmCity != i)) return;
+  int c = hmCity;
+  histMergeClose();
+  String tmp = "/hist_c" + String(c) + ".tmp";
+  if (SD.exists(tmp)) SD.remove(tmp);
+  histEpoch[c]++; // a fetch in flight for this city is now outdated too
+  histMergeDone(false, true);
+}
+
+// Called from historyLoop() while a merge is running.
+void histMergeStep() {
+  if (!hmActive) return;
+  unsigned long t0 = millis();
+  String line;
+  while (hmReader && millis() - t0 < 25) {
+    if (!hmIn || !hmReader->next(line)) { delete hmReader; hmReader = nullptr; break; }
+    line.trim();
+    if (line.length() < 11) continue;
+    String d = line.substring(0, 10);
+    if (hmDropFrom.length() == 10 && d >= hmDropFrom) continue;
+    if (d < hmWinStart) { hmOut.println(line); continue; }
+    if (d > hmWinEnd) { histMergeFlushWindow(); hmOut.println(line); continue; }
+    int k = histFindDay(d, hmN);
+    if (k < 0) continue;
+    if (k >= hmOverwriteFrom && hfValid[k]) continue; // replaced by the fresh value
+    hkPresent[k] = true;
+    hkLine[k] = histUpgradeLine(line, k);
+  }
+  if (hmReader) return; // more next time
+
+  histMergeFlushWindow();
+  int i = hmCity;
+  histMergeClose();
+  String path = histPath(i), tmp = "/hist_c" + String(i) + ".tmp";
+  if (SD.exists(path)) SD.remove(path);
+  histTouch(i);
+  histMergeDone(SD.rename(tmp, path), false);
+}
+
+// Parses an Open-Meteo daily response into hf*. Returns the number of days, or -1.
+int histParseDaily(const String &payload, String who) {
   DynamicJsonDocument doc(32768);
   if (deserializeJson(doc, payload)) { logDebug("HIST " + who + ": bad JSON"); return -1; }
-  payload = ""; // free memory before the SD work
 
   JsonArray dTime = doc["daily"]["time"];
   JsonArray dMin  = doc["daily"]["temperature_2m_min"];
@@ -2518,81 +2629,126 @@ int histFetchDaily(String url, String who) {
 }
 
 // Regular sync for one city: the last pastDays finished days + today's forecast.
-bool histSyncCity(int i, int pastDays) {
+// What the history download/merge in progress is for (one at a time).
+bool histJobPending = false;  // a download is with the background worker
+int hjKind = 0;               // 0 = regular sync, 1 = backfill chunk
+int hjCity = -1;
+bool hjFull = false;          // sync: the full 92-day one
+String hjChunkStart;          // backfill: first day of the chunk
+int hjToday = -1;             // sync: index of today's entry in hf*
+
+// Regular sync for one city: the last pastDays finished days + today's forecast.
+bool histSyncStart(int i, bool full) {
   double lat = 0, lon = 0;
   if (!getCityCoords(i, lat, lon)) { logDebug("HIST city " + String(i + 1) + ": no coordinates"); return false; }
-
   String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) + "&longitude=" + String(lon, 4)
-    + "&daily=" + String(HIST_DAILY_VARS) + "&timezone=auto&past_days=" + String(pastDays) + "&forecast_days=1";
-  int n = histFetchDaily(url, "city " + String(i + 1));
-  if (n < 2) return false;
-
-  int nPast = n - 1; // last entry is today
-  String today = String(hfDate[n - 1]);
-  if (!histMergeDays(i, nPast, max(0, nPast - HIST_OVERWRITE_DAYS), today)) {
-    logDebug("HIST city " + String(i + 1) + ": SD write failed");
-    return false;
-  }
-
-  int t = n - 1;
-  histTodayValid[i] = hfValid[t];
-  histTodayDate[i] = today;
-  histTodayMin[i] = hfMin[t]; histTodayMax[i] = hfMax[t]; histTodayRain[i] = hfRain[t];
-  histTodayHum[i] = hfHum[t]; histTodayPres[i] = hfPres[t];
-  histTodayGust[i] = hfGust[t]; histTodayGustOK[i] = hfGustOK[t];
-  histTodaySun[i] = hfSun[t]; histTodaySunOK[i] = hfSunOK[t];
+    + "&daily=" + String(HIST_DAILY_VARS) + "&timezone=auto&past_days=" + String(full ? HIST_PAST_DAYS : HIST_SHORT_DAYS) + "&forecast_days=1";
+  if (!netPost(NJ_HIST, i, 0, full ? 1 : 0, histEpoch[i], url)) return false;
+  histJobPending = true; hjKind = 0; hjCity = i; hjFull = full;
   return true;
 }
 
+void histSyncDone(int i, bool ok) {
+  if (ok && hjFull) { histFullDone[i] = true; histLastFull[i] = millis(); }
+  histNextSync[i] = millis() + (ok ? HIST_SYNC_INTERVAL_MS : HIST_RETRY_MS);
+  logDebug("HIST city " + String(i + 1) + (hjFull ? " full" : " light") + " sync " + String(ok ? "OK" : "FAILED"));
+  if (ok && millis() - histLastStorageRefresh > HIST_STORAGE_REFRESH_MS) histRefreshStorage();
+}
+
 // One backfill chunk (up to 90 days) from the historical archive, fill-only.
-void histBackfillStep(int i) {
-  if (bfCursor[i] < bfStart[i]) { histBackfillStop(i, "Done - history goes back to " + bfStart[i]); return; }
+// One backfill chunk (up to 90 days) from the historical archive, fill-only.
+bool histBackfillChunk(int i) {
+  if (bfCursor[i] < bfStart[i]) { histBackfillStop(i, "Done - history goes back to " + bfStart[i]); return true; }
   String chunkEnd = bfCursor[i];
   String chunkStart = histAddDays(chunkEnd, -(HIST_BF_CHUNK_DAYS - 1));
   if (chunkStart < bfStart[i]) chunkStart = bfStart[i];
-
   double lat = 0, lon = 0;
-  int n = -1;
-  if (getCityCoords(i, lat, lon)) {
-    String url = "https://archive-api.open-meteo.com/v1/archive?latitude=" + String(lat, 4) + "&longitude=" + String(lon, 4)
-      + "&start_date=" + chunkStart + "&end_date=" + chunkEnd + "&daily=" + String(HIST_DAILY_VARS) + "&timezone=auto";
-    n = histFetchDaily(url, "backfill city " + String(i + 1));
-  }
-  if (n < 1 || !histMergeDays(i, n, n, "")) {
-    bfFails[i]++;
-    bfMsg[i] = "Request failed - retrying (" + String(bfFails[i]) + "/" + String(HIST_BF_MAX_FAILS) + ")";
-    if (bfFails[i] >= HIST_BF_MAX_FAILS) histBackfillStop(i, "Stopped after repeated errors - see the Debug page");
-    return;
-  }
-  bfFails[i] = 0;
-  bfCursor[i] = histAddDays(chunkStart, -1);
-  bfMsg[i] = "Filled back to " + chunkStart;
-  if (bfCursor[i] < bfStart[i]) histBackfillStop(i, "Done - history goes back to " + bfStart[i]);
-  else histBackfillSave(i);
+  if (!getCityCoords(i, lat, lon)) { histBackfillFailed(i); return true; }
+  String url = "https://archive-api.open-meteo.com/v1/archive?latitude=" + String(lat, 4) + "&longitude=" + String(lon, 4)
+    + "&start_date=" + chunkStart + "&end_date=" + chunkEnd + "&daily=" + String(HIST_DAILY_VARS) + "&timezone=auto";
+  if (!netPost(NJ_HIST, i, 1, 0, histEpoch[i], url)) return false;
+  histJobPending = true; hjKind = 1; hjCity = i; hjChunkStart = chunkStart;
+  return true;
 }
 
-// Call every loop(). Does at most one network job per call, spaced out, so the
-// device never stalls for long. Regular syncs go first, then backfill chunks.
+void histBackfillFailed(int i) {
+  bfFails[i]++;
+  bfMsg[i] = "Request failed - retrying (" + String(bfFails[i]) + "/" + String(HIST_BF_MAX_FAILS) + ")";
+  if (bfFails[i] >= HIST_BF_MAX_FAILS) histBackfillStop(i, "Stopped after repeated errors - see the Debug page");
+}
+
+void histBackfillDone(int i) {
+  bfFails[i] = 0;
+  bfCursor[i] = histAddDays(hjChunkStart, -1);
+  bfMsg[i] = "Filled back to " + hjChunkStart;
+  if (bfCursor[i] < bfStart[i]) histBackfillStop(i, "Done - history goes back to " + bfStart[i]);
+  else histBackfillSave(i);
+  if (millis() - histLastStorageRefresh > HIST_STORAGE_REFRESH_MS) histRefreshStorage();
+}
+
+// A history download came back from the worker: parse it and start the merge.
+void histResult(NetJob &j) {
+  histJobPending = false;
+  int i = j.city;
+  if (j.start != histEpoch[i]) return; // city renamed, wiped or imported meanwhile - drop it
+  String who = String(hjKind ? "backfill city " : "city ") + String(i + 1);
+  int n = -1;
+  if (j.code == HTTP_CODE_OK) n = histParseDaily(j.body, who);
+  else logDebug("HIST " + who + ": HTTP " + String(j.code));
+  j.body = ""; // free memory before the SD work
+  if (hjKind == 0) {
+    if (n < 2) { histSyncDone(i, false); return; }
+    int nPast = n - 1; // last entry is today
+    hjToday = n - 1;
+    if (!histMergeBegin(i, nPast, max(0, nPast - HIST_OVERWRITE_DAYS), String(hfDate[n - 1]))) {
+      logDebug("HIST city " + String(i + 1) + ": SD write failed");
+      histSyncDone(i, false);
+    }
+  } else {
+    if (!bfActive[i]) return; // stopped meanwhile
+    if (n < 1 || !histMergeBegin(i, n, n, "")) histBackfillFailed(i);
+  }
+}
+
+// The merge finished (ok = the new file is in place), or was aborted.
+void histMergeDone(bool ok, bool aborted) {
+  int i = hjCity;
+  if (hjKind == 0) {
+    if (ok) {
+      int t = hjToday;
+      histTodayValid[i] = hfValid[t];
+      histTodayDate[i] = String(hfDate[t]);
+      histTodayMin[i] = hfMin[t]; histTodayMax[i] = hfMax[t]; histTodayRain[i] = hfRain[t];
+      histTodayHum[i] = hfHum[t]; histTodayPres[i] = hfPres[t];
+      histTodayGust[i] = hfGust[t]; histTodayGustOK[i] = hfGustOK[t];
+      histTodaySun[i] = hfSun[t]; histTodaySunOK[i] = hfSunOK[t];
+    } else if (!aborted) logDebug("HIST city " + String(i + 1) + ": SD write failed");
+    histSyncDone(i, ok);
+  } else if (!aborted && bfActive[i]) {
+    if (ok) histBackfillDone(i); else histBackfillFailed(i);
+  }
+}
+
+// Call every loop(). Starts at most one background download at a time, spaced
+// out; regular syncs go first, then backfill chunks. Downloads run on the
+// network worker and merges in short slices, so the device never stalls.
 void historyLoop() {
   if (!sdOK) return;
 
   static unsigned long lastLocCheck = 0;
   if (millis() - lastLocCheck > 2000) { lastLocCheck = millis(); histCheckLocations(); }
 
-  if (WiFi.status() != WL_CONNECTED || isUpdating) return;
+  if (hmActive) { histMergeStep(); return; } // a merge in progress, a slice at a time
+  if (histJobPending) return;                 // waiting for the background download
+  if (WiFi.status() != WL_CONNECTED || isUpdating || netBusy) return;
   if (histLastAttempt != 0 && millis() - histLastAttempt < HIST_MIN_GAP_MS) return;
 
   for (int i = 0; i < NUM_CITIES; i++) {
     if (histTrimmedLoc(i).length() == 0) continue;
     if ((long)(millis() - histNextSync[i]) < 0) continue; // not due yet
-
     bool full = !histFullDone[i] || millis() - histLastFull[i] > HIST_FULL_SYNC_MS;
     histLastAttempt = millis();
-    bool ok = histSyncCity(i, full ? HIST_PAST_DAYS : HIST_SHORT_DAYS);
-    if (ok && full) { histFullDone[i] = true; histLastFull[i] = millis(); }
-    histNextSync[i] = millis() + (ok ? HIST_SYNC_INTERVAL_MS : HIST_RETRY_MS);
-    logDebug("HIST city " + String(i + 1) + (full ? " full" : " light") + " sync " + String(ok ? "OK" : "FAILED"));
-    if (ok && millis() - histLastStorageRefresh > HIST_STORAGE_REFRESH_MS) histRefreshStorage();
+    if (!histSyncStart(i, full)) { hjFull = full; histSyncDone(i, false); }
     return;
   }
 
@@ -2600,8 +2756,7 @@ void historyLoop() {
   for (int i = 0; i < NUM_CITIES; i++) {
     if (!bfActive[i] || histTrimmedLoc(i).length() == 0) continue;
     histLastAttempt = millis();
-    histBackfillStep(i);
-    if (millis() - histLastStorageRefresh > HIST_STORAGE_REFRESH_MS) histRefreshStorage();
+    histBackfillChunk(i);
     return;
   }
 }
@@ -2674,6 +2829,8 @@ int histListArchives(bool deleteThem) {
 }
 
 void histWipeCity(int i) {
+  histMergeAbort(i);
+  histEpoch[i]++;
   if (SD.exists(histPath(i))) SD.remove(histPath(i));
   histTouch(i);
   histTodayValid[i] = false;
@@ -2987,6 +3144,8 @@ bool histParseImportLine(String line, uint32_t &key, float *v) {
 // over existing days with the same date. Existing rows are streamed, so only
 // the imported rows are held in RAM.
 bool histImportProcess(int city, bool replaceAll, String &msg) {
+  histMergeAbort(city); // it writes the same temporary file
+  histEpoch[city]++;
   if (!SD.exists(HIST_IMPORT_TMP)) { msg = "Upload failed."; return false; }
 
   uint32_t key;
@@ -4307,6 +4466,12 @@ void handleSerialCommand() {
   }
 }
 
+// Times one part of loop(): anything over a second is logged with its name, so
+// a "LOOP blocked" line in the Debug log comes with the part that caused it.
+// (The name is evaluated after the call, so it can describe what just ran.)
+#define TIMED(name, call) do { unsigned long _t0 = millis(); call; unsigned long _dt = millis() - _t0; \
+  if (_dt > 1000) logDebug(String("SLOW ") + (name) + ": " + String(_dt) + " ms"); } while (0)
+
 void loop() {
   // Watch for anything that holds up the main loop (touch and web pages wait meanwhile)
   static unsigned long lastLoopAt = 0;
@@ -4314,17 +4479,17 @@ void loop() {
   if (lastLoopAt != 0) {
     unsigned long gap = loopNow - lastLoopAt;
     if (gap > loopMaxMs) loopMaxMs = gap;
-    if (gap > 3000) logDebug("LOOP blocked for " + String(gap) + " ms");
+    if (gap > 1500) logDebug("LOOP blocked for " + String(gap) + " ms");
   }
   lastLoopAt = loopNow;
-  server.handleClient();
-  checkWifiHealth(); // NEW: watches for a dropped connection and recovers automatically
+  TIMED(String("web page ") + server.uri(), server.handleClient());
+  TIMED("WiFi check", checkWifiHealth()); // NEW: watches for a dropped connection and recovers automatically
   handleSerialCommand(); // NEW: read-only ping/status over Serial
   saveBrightnessIfDue(); // persists slider changes once you've stopped dragging
 #if USE_SD_HISTORY
-  historyLoop(); // NEW: background per-city history sync (one city at a time, every 6h)
+  TIMED(hmActive ? "history (SD merge)" : "history", historyLoop()); // NEW: background per-city history sync (one city at a time, every 6h)
 #endif
-  nowcastLoop(); // rain in the next 2 hours, pressure trend, LED rain alert
+  TIMED("background jobs", nowcastLoop()); // rain in the next 2 hours, pressure trend, LED rain alert
 
   // Text color changed (web sliders) -> redraw once it has settled
   if (accentDirty && millis() - accentChangedAt > 400) {
@@ -4350,9 +4515,9 @@ void loop() {
   // NEW: periodic local sensor read, independent of the network weather timer
   if (bmeOK && millis() - lastBmeRead > 5000) {
     lastBmeRead = millis();
-    readLocalSensor();
+    TIMED("indoor sensor", readLocalSensor());
 #if USE_SD_HISTORY
-    localLogSample(); // NEW: hourly averages to /local.csv on the SD card
+    TIMED("indoor log", localLogSample()); // NEW: hourly averages to /local.csv on the SD card
 #endif
   }
 #endif
@@ -4493,7 +4658,7 @@ void loop() {
       }
     }
 
-    if (!touchHandled && dur > 1500 && dur < 5000) {
+    if (!touchHandled && dur > 2500 && dur < 5000) { // a deliberate long press, not a slow tap
         currentCity = (currentCity + 1) % NUM_CITIES;
         triggerWeatherUpdate(); touchHandled = true;
     }
@@ -4505,6 +4670,8 @@ void loop() {
     isTouched = false;
   }
   
+  unsigned long drawT0 = millis();
+  int drawFrom = drawnMode;
   if (displayMode == 0) drawPageHome();
   else if (displayMode == 1) drawPageStats();
   else if (displayMode == 2) drawPageRain();
@@ -4525,7 +4692,8 @@ void loop() {
   }
   else if (displayMode == 5) drawPageForecast();
   else if (displayMode == 6) drawPageHistory(); // NEW: on-device 7-day history
-  
+  if (millis() - drawT0 > 1000) logDebug("SLOW drawing page " + String(displayMode) + (drawFrom != displayMode ? " (full redraw)" : "") + ": " + String(millis() - drawT0) + " ms");
+
   drawnMode = displayMode;
 }
 
@@ -5026,7 +5194,7 @@ var showBF=function(list){
 var pollBF=async function(){
   clearTimeout(bfTimer);
   try{var j=await (await fetch('/api/history/status')).json();showBF(j.backfill);var act=j.backfill.some(b=>b.active);
-    if(act){bfTick++;if(bfTick%8==0)loadAll();bfTimer=setTimeout(pollBF,5000);}
+    if(act){bfTimer=setTimeout(pollBF,5000);} // the charts reload once when the backfill is done
     else if(bfWas)loadAll();
     bfWas=act;
   }catch(e){bfTimer=setTimeout(pollBF,10000);}
@@ -5345,7 +5513,8 @@ async function refresh(){
   setAccentFromText([d.textR,d.textG,d.textB]);
   $('heroIcon').innerHTML=iconSvg(iconKind(d.main,d.weatherDesc),d.night);
   $('temp').innerHTML=d.temp.toFixed(1)+'<sup>&deg;C</sup>';
-  $('desc').innerText=(d.weatherDesc||'').toLowerCase();
+  $('desc').innerText=d.updating?'Updating...':(d.weatherDesc||'').toLowerCase();
+  if(d.updating&&!window._upd){window._upd=1;setTimeout(function(){window._upd=0;refresh();},1500);} // check back soon
   $('hl').innerHTML='H '+d.tempMax.toFixed(1)+'&deg; &middot; L '+d.tempMin.toFixed(1)+'&deg; &middot; Feels '+d.feelsLike.toFixed(1)+'&deg;';
   var txt=document.documentElement.style.getPropertyValue('--accent')?'var(--accent)':'rgb('+d.textR+','+d.textG+','+d.textB+')';
   $('clock').innerHTML=segClock(d.hour,d.minute,'var(--text)',(d.textR>235&&d.textG>235&&d.textB>235)||(d.textR+d.textG+d.textB<40)?'var(--text)':txt);
