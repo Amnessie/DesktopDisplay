@@ -17,7 +17,7 @@ A touch-screen weather station for the 3.5-inch **E32R35T / E32N35T** ESP32 disp
   - Old data disappears instead of lingering.
   - The pressure trend uses the official WMO classes, with hysteresis so the label doesn't flicker.
 - **Forecast check.** In the radar area, the station scores each weather source's rain forecast against what the radar actually measured. After 10 rainy periods it tells you which source is most accurate where you live, and you can switch to it with one tap.
-- **LED rain alert.** Two slow blue pulses when rain is expected within 30 minutes, once per rain spell. The RGB LED otherwise follows the weather, or shows a color you pick.
+- **LED rain alert.** The LED dims twice, slowly, when rain is expected within 30 minutes, once per rain spell. The RGB LED otherwise follows the weather, or shows a color you pick.
 - **Light, dark or automatic theme.** Auto switches to dark at sunset. Your text color becomes the accent color on the display and on the web pages.
 - **History.** Up to 10 years of daily weather per city on the SD card, with charts, CSV export and import, and backfill from Open-Meteo's archive.
 - **No extra hardware needed.** An optional BME280 adds indoor temperature, humidity and pressure.
@@ -66,7 +66,7 @@ Home, precipitation, sun & moon, and the 5-day forecast:
 - Three cities, switchable from the screen or the web page
 - Rain in the next 2 hours on the home screen: "Rain from 14:35" / "Dry for the next 2 hours" with a bar per 5 minutes, from Buienradar's radar in the Netherlands and Belgium (Open-Meteo's 15-minute forecast elsewhere, labelled as forecast)
 - Past the first hour, the radar outlook is blended with Open-Meteo's 15-minute model ("rain possible from 16:45 (forecast)"), shown as faint bars behind the radar bars
-- Optional LED alert: two slow blue pulses when rain is expected within 30 minutes (once per rain spell; switch it on or off in the web Settings)
+- Optional LED alert: the LED dims twice, slowly, when rain is expected within 30 minutes (once per rain spell; switch it on or off in the web Settings)
 - Pressure trend over the last 3 hours (steady / rising / falling / fast), using the official WMO classes, with an arrow in the pressure tile
 - Rain page with 1h/3h rainfall and upcoming rain in 3-hour steps
 - Astro page with sunrise, sunset and the current moon phase, drawn to the exact phase (mirrored for southern-hemisphere cities), with how much is lit and the days until the next full or new moon

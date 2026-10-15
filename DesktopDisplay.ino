@@ -1466,34 +1466,40 @@ void analyzeNowcast() {
   }
 }
 
-// --- LED rain alert: two slow blue "breaths", once per rain spell. The LED
-// first goes dark, then each breath fades bright blue in and out at full
-// brightness (whatever the LED slider says), so it can't be mistaken for the
-// normal weather color. Afterwards the normal color comes back.
-unsigned long ledPulseStart = 0;
-bool ledPulsing = false;
+// --- LED rain alert: the LED dips twice, slowly, from its normal brightness
+// down to 5% of it and back - same color (custom or weather sync), never
+// brighter than you set it. Afterwards the normal color is written again.
+// The web button only sets a flag; the LED itself is updated from loop().
+unsigned long ledPulseStart = 0, ledPulseLastWrite = 0;
+bool ledPulsing = false, ledPulseRequested = false;
 bool rainAlertArmed = true;
-const unsigned long LED_PULSE_MS = 2200; // one slow breath
+const unsigned long LED_PULSE_MS = 2600; // one slow dip
 
-void ledWriteRaw(int r, int g, int b) { // 0-255 per channel, full scale (the LED is common-anode: 255 = off)
-  analogWrite(LED_R, 255 - r);
-  analogWrite(LED_G, 255 - g);
-  analogWrite(LED_B, 255 - b);
-}
-
-void startLedPulse() {
-  ledPulsing = true; ledPulseStart = millis();
-  ledWriteRaw(0, 0, 0);
-  logDebug("LED pulse started");
-}
+void startLedPulse() { ledPulseRequested = true; }
 
 void ledPulseLoop() {
+  if (ledPulseRequested) {
+    ledPulseRequested = false;
+    ledPulsing = true; ledPulseStart = millis(); ledPulseLastWrite = 0;
+    logDebug("LED pulse started");
+  }
   if (!ledPulsing) return;
-  unsigned long t = millis() - ledPulseStart;
-  if (t >= 2 * LED_PULSE_MS + 300) { ledPulsing = false; setWeatherLED(mainWeather); logDebug("LED pulse done"); return; }
-  if (t >= 2 * LED_PULSE_MS) { ledWriteRaw(0, 0, 0); return; } // a short dark pause before the normal color
-  float k = 0.5f - 0.5f * cosf((t % LED_PULSE_MS) * 2.0f * PI / LED_PULSE_MS); // 0 -> 1 -> 0
-  ledWriteRaw(0, (int)(70 * k), (int)(255 * k));
+  unsigned long nowMs = millis(), t = nowMs - ledPulseStart;
+  if (t >= 2 * LED_PULSE_MS) {
+    ledPulsing = false;
+    setWeatherLED(mainWeather); // back to exactly the normal color and brightness
+    logDebug("LED pulse done");
+    return;
+  }
+  if (nowMs - ledPulseLastWrite < 20) return; // ~50 updates a second is plenty for a smooth fade
+  ledPulseLastWrite = nowMs;
+  float k = 0.5f + 0.5f * cosf((t % LED_PULSE_MS) * 2.0f * PI / LED_PULSE_MS); // 1 -> 0 -> 1
+  int full = ledBrightness, low = ledBrightness * 5 / 100;
+  int val = low + (int)((full - low) * k);
+  // same formula as setWeatherLED() (the LED is common-anode: 255 = off)
+  analogWrite(LED_R, 255 - ((currentLedR * val) / 255));
+  analogWrite(LED_G, 255 - ((currentLedG * val) / 255));
+  analogWrite(LED_B, 255 - ((currentLedB * val) / 255));
 }
 
 // Fires once when rain is expected within 30 minutes. It only re-arms after
@@ -5556,7 +5562,7 @@ const char SETTINGS_BODY[] PROGMEM = R"rawliteral(
 <section class="card"><h3>Display</h3>
  <div class="field"><span>Screen theme</span><select name="theme" id="theme"><option value="2">Auto &ndash; dark from sunset to sunrise</option><option value="0">Light</option><option value="1">Dark</option></select></div>
  <label class="switch"><div>Rain on the home screen<small>The next 2 hours (radar in NL/BE), or the next 15 hours. When off, the card shows today's sunrise and sunset.</small></div><input type="checkbox" name="rainPrevOn" id="rainPrevOn" value="1"></label>
-  <label class="switch"><div>Pulse the LED when rain is coming<small>Two slow blue pulses when rain is expected within 30 minutes. Once per rain spell; uses radar in NL/BE.</small></div><input type="checkbox" name="rainLed" id="rainLed" value="1"></label>
+  <label class="switch"><div>Pulse the LED when rain is coming<small>The LED dims twice, slowly, when rain is expected within 30 minutes. Once per rain spell; uses radar in NL/BE.</small></div><input type="checkbox" name="rainLed" id="rainLed" value="1"></label>
  <div style="margin:2px 0 6px"><button type="button" class="btn" onclick="var b=this;api('/live?action=testPulse').then(function(){flash(b,'Pulsing...');})">Test the pulse</button></div>
  <div class="label" style="margin-top:14px">Brightness <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">&middot; applies right away, saved automatically</span></div>
  <div class="slider"><span>Screen</span><input type="range" id="screenSlider" min="0" max="100"><b id="screenVal"></b></div>
