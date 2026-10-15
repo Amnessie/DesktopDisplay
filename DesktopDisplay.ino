@@ -1087,7 +1087,7 @@ void drawUpdatingBadge(bool show) {
 void triggerWeatherUpdate() {
   isUpdating = true;
   drawUpdatingBadge(true);
-  bool locked = netLock(20000); // let a background request finish first
+  bool locked = netLock(3000); // let a background request finish first, but never stall the screen for long
   getOpenWeatherData();
   if (locked) netUnlock();
   isUpdating = false;
@@ -1208,7 +1208,9 @@ void netBegin() {
   netJobQ = xQueueCreate(1, sizeof(NetJob *));
   netDoneQ = xQueueCreate(1, sizeof(NetJob *));
   netMutex = xSemaphoreCreateMutex();
-  xTaskCreatePinnedToCore(netWorker, "net", 12288, nullptr, 1, nullptr, 0);
+  // Idle priority: it time-shares core 0 with the idle task, so even a long
+  // TLS handshake can't starve the task watchdog (which restarts the chip).
+  xTaskCreatePinnedToCore(netWorker, "net", 12288, nullptr, tskIDLE_PRIORITY, nullptr, 0);
 }
 
 // Main loop: hand a request to the worker. False if one is still running.
@@ -1222,7 +1224,9 @@ bool netPost(int kind, int city, int step, int slot, uint32_t start, const Strin
   return true;
 }
 
-// For the blocking fetches still on the main loop (weather, history).
+// For the blocking fetches still on the main loop (weather, history). They
+// wait at most a few seconds; if the background request is still running they
+// go ahead anyway rather than freezing the screen.
 bool netLock(unsigned long ms) { return netMutex && xSemaphoreTake(netMutex, pdMS_TO_TICKS(ms)) == pdTRUE; }
 void netUnlock() { xSemaphoreGive(netMutex); }
 
@@ -1375,7 +1379,7 @@ void analyzeNowcast() {
   unsigned long maxAge = (nowRadar ? 15UL : 30UL) * 60000UL;
   nowValid = nowCount >= 4 && nowCity == currentCity && nowFetchedAt != 0
              && millis() - nowFetchedAt < maxAge && timeStatus() != timeNotSet;
-  nowMsg = ""; nowStartIdx = -1; nowRainingNow = false; nowMaxMm = 0; nowFirst = 0;
+  nowMsg = ""; nowShort = ""; nowBlend = false; nowStartIdx = -1; nowRainingNow = false; nowMaxMm = 0; nowFirst = 0;
   if (!nowValid) return;
 
   // Skip steps that are already in the past
@@ -1397,7 +1401,6 @@ void analyzeNowcast() {
   }
   if (nowRainingNow || nowStartIdx >= 0) nowMsg += nowMaxMm < 1.0f ? ", light" : (nowMaxMm < 4.0f ? ", moderate" : ", heavy");
   nowShort = nowMsg;
-  nowBlend = false;
 
   // Blending, as weather services do: radar decides the first hour (it sees
   // rain that really exists). Further out the model may know better - so if
@@ -2464,7 +2467,7 @@ int histFetchDaily(String url, String who) {
   http.setTimeout(10000);
   WiFiClientSecure tls; WiFiClient plain;
   httpBeginSafe(http, tls, plain, url);
-  bool locked = netLock(20000); // never alongside a background HTTPS request
+  bool locked = netLock(3000); // preferably not alongside a background HTTPS request
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
     String body = code > 0 ? http.getString() : "";
