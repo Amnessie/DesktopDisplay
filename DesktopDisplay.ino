@@ -836,9 +836,9 @@ bool parseOwmNow(const String &payload) {
     weatherDesc.toUpperCase();
     rain1h = doc["rain"]["1h"] | 0.0; 
     rain3h = doc["rain"]["3h"] | 0.0;
-    tzOffsetSec[currentCity] = doc["timezone"].as<long>();
-    sysRise = doc["sys"]["sunrise"].as<long>() + tzOffsetSec[currentCity];
-    sysSet  = doc["sys"]["sunset"].as<long>() + tzOffsetSec[currentCity];
+    tzOffsetSec[currentCity] = doc["timezone"].as<int>(); // int, not long: as<long>() crashed GCC on Windows (internal compiler error)
+    sysRise = (long)doc["sys"]["sunrise"].as<int>() + tzOffsetSec[currentCity];
+    sysSet  = (long)doc["sys"]["sunset"].as<int>() + tzOffsetSec[currentCity];
     sunRise = (hour(sysRise) < 10 ? "0" : "") + String(hour(sysRise)) + ":" + (minute(sysRise) < 10 ? "0" : "") + String(minute(sysRise));
     sunSet  = (hour(sysSet) < 10 ? "0" : "") + String(hour(sysSet)) + ":" + (minute(sysSet) < 10 ? "0" : "") + String(minute(sysSet));
     setWeatherLED(mainWeather);
@@ -864,7 +864,7 @@ void parseOwmForecast(const String &payload) {
     JsonArray list = fdoc["list"];
     int dIdx = -1; String curL = "";
     for (JsonObject slice : list) {
-      long dt = slice["dt"].as<long>() + tzOffsetSec[currentCity];
+      long dt = (long)slice["dt"].as<int>() + tzOffsetSec[currentCity];
 
       // Grab the rainfall figure for each of the next few 3-hour slices,
       // independent of the day-bucketing below, for the precipitation graph
@@ -924,7 +924,7 @@ bool parseOpenMeteo(const String &payload) {
   weatherDesc = wmoToDesc(codeNow);
   setWeatherLED(mainWeather);
 
-  long utcOffsetSec = doc["utc_offset_seconds"] | 0L;
+  long utcOffsetSec = doc["utc_offset_seconds"] | 0; // read as int: a long here crashed GCC on Windows (internal compiler error)
   tzOffsetSec[currentCity] = utcOffsetSec;
 
   // Daily: today's high/low, sunrise/sunset, and the 5-day forecast page
