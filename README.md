@@ -71,7 +71,7 @@ Home, precipitation, sun & moon, and the 5-day forecast:
 - Rain page with 1h/3h rainfall and upcoming rain in 3-hour steps
 - Astro page with sunrise, sunset and the current moon phase, drawn to the exact phase (mirrored for southern-hemisphere cities), with how much is lit and the days until the next full or new moon
 - Forecast page and an on-device 7-day history
-- Little animated astronaut on the home screen
+- When the rain card is switched off, the home screen shows today's sunrise, sunset and hours of daylight instead
 - Status indicator showing whether the weather data is fresh, updating or failed
 - Light and dark themes, or Auto: dark from sunset to sunrise
 - Anti-aliased weather icons drawn on the display (sun, moon at night, clouds, rain, drizzle, thunder, snow, fog)
@@ -126,7 +126,6 @@ Install the [Arduino IDE](https://www.arduino.cc/en/software) and add ESP32 supp
 Install these through **Tools → Manage Libraries**:
 
 - **TFT_eSPI** by Bodmer (version 2.5 or newer, for the anti-aliased drawing)
-- **TJpg_Decoder** by Bodmer
 - **WiFiManager** by tzapu
 - **ArduinoJson** by Benoit Blanchon
 - **Time** by Michael Margolis (provides `TimeLib.h`)
@@ -240,9 +239,9 @@ Check the API key on the settings page (`/settings`) and that the city is writte
 - Downloading 10 years of data is too much and will slow the device down, making it unusable. (still figuring out if there is a way)
 ## Credits
 
-This project started as a heavily modified version of [SmallDesktopDisplay](https://github.com/SmallDesktopDisplay-team/SmallDesktopDisplay). The astronaut animation comes from that project.
+This project started as a heavily modified version of [SmallDesktopDisplay](https://github.com/SmallDesktopDisplay-team/SmallDesktopDisplay).
 
-Weather data from [OpenWeatherMap](https://openweathermap.org) and [Open-Meteo](https://open-meteo.com) (including KNMI models). Built with [TFT_eSPI](https://github.com/Bodmer/TFT_eSPI), [TJpg_Decoder](https://github.com/Bodmer/TJpg_Decoder), [WiFiManager](https://github.com/tzapu/WiFiManager) and [ArduinoJson](https://arduinojson.org).
+Weather data from [OpenWeatherMap](https://openweathermap.org) and [Open-Meteo](https://open-meteo.com) (including KNMI models). Built with [TFT_eSPI](https://github.com/Bodmer/TFT_eSPI), [WiFiManager](https://github.com/tzapu/WiFiManager) and [ArduinoJson](https://arduinojson.org).
 
 ## License
 

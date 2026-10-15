@@ -18,6 +18,7 @@ All notable changes to this project are listed here.
 - Redesigned web interface for desktop and phone, with light/dark/auto themes: a new dashboard (weather icons, rain chart, sun arc, moon phase, forecast range bars, indoor sensor and device status), card-based Settings, and History and Debug in the same style. Shared stylesheet/script are cached by the browser
 
 ### Fixed
+- LED rain alert: the pulse is now unmistakable: the LED goes dark, then fades bright blue in and out twice at full brightness, then returns to its normal color. Before, it blended the current color towards blue at the normal brightness, which was easy to miss. Start and end are logged on the Debug page
 - The weather update (every 10 minutes, and on every city switch) runs in the background too, so nothing waits on the network anymore: switching city responds right away, shows the "..." badge, and the new weather appears when it's in. Previously it ran on the main loop and first waited up to 3 s for any background download, which during a history backfill froze the screen for several seconds each time
 - A long press now needs 2.5 s (was 1.5 s) to switch city, so a slow tap no longer switches city by accident
 - Freezes of 3-5 s every ~15 s while a history backfill runs: history downloads now go through the background network task, and merging the fetched days into the (sorted, possibly years-long) history file on the SD card runs in ~25 ms slices instead of one long block. The new file is written next to the old one and swapped in at the end, so the History page always reads a complete file; renaming, wiping or importing a city cancels a merge in progress
@@ -40,6 +41,7 @@ All notable changes to this project are listed here.
 - Endpoints that change settings or history now require the `X-Requested-With: DesktopDisplay` header, so other websites can't change them through your browser
 
 ### Changed
+- Removed the home screen animation (and with it the TJpg_Decoder library and the image files). With the rain card switched off, the card shows today's sunrise, sunset and hours of daylight
 - The moon on the Sun & Moon page is now drawn instead of a photo: exact phase with smooth edges in the theme's colors, mirrored for southern-hemisphere cities, plus % lit and days to the next full/new moon. It uses the same phase calculation as the web dashboard (the old 8-picture calculation could be a phase off). The 8 moon images are removed (~45 KB less flash); the dark theme's inner cards are slightly darker
 - The Settings page loads its values from the new `/api/settings` endpoint
 - Requires TFT_eSPI 2.5 or newer (anti-aliased drawing functions)
