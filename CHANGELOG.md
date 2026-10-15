@@ -5,12 +5,21 @@ All notable changes to this project are listed here.
 ## [Unreleased]
 
 ### Added
+- Rain in the next 2 hours: Buienradar radar for cities in the Netherlands/Belgium (5-minute steps, refreshed every 5 minutes), Open-Meteo 15-minute forecast elsewhere. Shown on the home screen, the Precipitation page and the dashboard. Rain only "starts" or "stops" on two consecutive steps, values under 0.1 mm/h count as dry, and the outlook disappears when the data is more than 15 minutes old
+- LED rain alert (web Settings, with a test button): two slow blue pulses when rain is expected within 30 minutes, once per rain spell
+- Pressure trend: least-squares slope over the last 3 hours of Open-Meteo sea-level pressure, in WMO tendency classes with hysteresis so the label can't flicker at a boundary; arrow in the pressure tile, row on the Atmosphere page, text on the dashboard
+- Radar and model blending: where the radar sees no rain for the next hour but Open-Meteo's 15-minute model expects rain 1 to 3 hours out (two wet steps in a row), the outlook says "Dry for the next hour; rain possible from 16:45 (forecast)". The radar always decides the first hour and the LED alert stays radar-only. The model is drawn as faint bars behind the radar bars on the display and the dashboard
+- Forecast check (dashboard): for cities inside the radar area, every 3-hour period is scored afterwards against the radar for OpenWeatherMap, Open-Meteo and Open-Meteo KNMI (hits, misses, false alarms, and a score that ignores easy dry days). After 10 rainy periods it recommends the best source, with a button to switch to it. Counts are kept across reboots and start over when the city is renamed
+- Data sources panel on the Debug page
 - Display themes: Light, Dark and Auto (dark between sunset and sunrise for the city on screen). Switch with the THEME button on the System page or on the web Settings page
 - Redesigned display: weather icons, a new home screen with a clock card, detail tiles and upcoming-rain bars, bold text, and anti-aliased cards on every page
 - Your text color is used as the accent for highlights (page dots, sliders, buttons) on the display and the web pages, when it is a clear, readable color
 - Redesigned web interface for desktop and phone, with light/dark/auto themes: a new dashboard (weather icons, rain chart, sun arc, moon phase, forecast range bars, indoor sensor and device status), card-based Settings, and History and Debug in the same style. Shared stylesheet/script are cached by the browser
 
 ### Fixed
+- Weather icons on the display are drawn with 4x4 supersampling: no more light fringes where a cloud overlaps the sun, seams inside clouds, or a ring around the crescent moon
+- The rain outlook remembers which Buienradar hostname answered and starts there, instead of first waiting on one that's down every time; the forecast check's radar samples use the working hostname too (they were stuck on the first one, so cities could never be scored when it was down)
+- Freezes and a slow web interface: the rain outlook, rain model, pressure trend and forecast check requests now run on a background task, so a slow server can no longer hold up the touchscreen or the web pages. HTTPS requests also give up after 8 s in the TLS handshake instead of the library's 120 s, and they never run two at a time (each needs ~45 KB of RAM). The Debug page shows the longest freeze since boot and the lowest free memory, and the log records why the device last restarted
 - A failed weather refresh no longer blanks the screen (0.0 °C) until the next attempt; the last good data stays up, with the status dot turning red
 - Open-Meteo (KNMI) no longer shows made-up "0/0 C CLEAR" forecast days: it now uses KNMI's seamless model (2 km Netherlands model, topped up with ECMWF), and any day a model doesn't cover shows "NO DATA"
 - The Debug page no longer breaks ("connection lost") after a history sync error; text in the JSON endpoints is now escaped properly
@@ -27,7 +36,7 @@ All notable changes to this project are listed here.
 - Endpoints that change settings or history now require the `X-Requested-With: DesktopDisplay` header, so other websites can't change them through your browser
 
 ### Changed
-- The moon photo on the Sun & Moon page is cropped at the moon's own edge, so only the moon shows (no grey square or frame); the dark theme's inner cards are slightly darker
+- The moon on the Sun & Moon page is now drawn instead of a photo: exact phase with smooth edges in the theme's colors, mirrored for southern-hemisphere cities, plus % lit and days to the next full/new moon. It uses the same phase calculation as the web dashboard (the old 8-picture calculation could be a phase off). The 8 moon images are removed (~45 KB less flash); the dark theme's inner cards are slightly darker
 - The Settings page loads its values from the new `/api/settings` endpoint
 - Requires TFT_eSPI 2.5 or newer (anti-aliased drawing functions)
 - Atmosphere page shows label and value on one line; forecast rows show an icon and a temperature range bar

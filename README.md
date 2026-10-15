@@ -10,8 +10,13 @@ A touch-screen weather station for the 3.5-inch **E32R35T / E32N35T** ESP32 disp
 - Big clock with local time for the selected city (time zone is picked up automatically from the weather data)
 - Current weather: temperature, feels-like, humidity, wind speed and direction, air pressure, visibility
 - Three cities, switchable from the screen or the web page
-- Rain page with 1h/3h rainfall and upcoming rain in 3-hour steps, plus a rain preview on the home screen
-- Astro page with sunrise, sunset and the current moon phase
+- Rain in the next 2 hours on the home screen: "Rain from 14:35" / "Dry for the next 2 hours" with a bar per 5 minutes, from Buienradar's radar in the Netherlands and Belgium (Open-Meteo's 15-minute forecast elsewhere, labelled as forecast)
+- Past the first hour, the radar outlook is blended with Open-Meteo's 15-minute model ("rain possible from 16:45 (forecast)"), shown as faint bars behind the radar bars
+- Forecast check on the dashboard: in the radar area, the station scores each weather source's rain forecast against what the radar actually measured, and after 10 rainy periods tells you which source is most accurate where you live (one tap to switch)
+- Optional LED alert: two slow blue pulses when rain is expected within 30 minutes (once per rain spell; switch it on or off in the web Settings)
+- Pressure trend over the last 3 hours (steady / rising / falling / fast), using the official WMO classes, with an arrow in the pressure tile
+- Rain page with 1h/3h rainfall and upcoming rain in 3-hour steps
+- Astro page with sunrise, sunset and the current moon phase, drawn to the exact phase (mirrored for southern-hemisphere cities), with how much is lit and the days until the next full or new moon
 - Forecast page and an on-device 7-day history
 - Little animated astronaut on the home screen
 - Status indicator showing whether the weather data is fresh, updating or failed
@@ -31,7 +36,7 @@ A touch-screen weather station for the 3.5-inch **E32R35T / E32N35T** ESP32 disp
 - Live dashboard: current weather with icon, 7-segment clock, wind/humidity/pressure/visibility, rain for the next 15 hours, sun position and moon phase, 5-day forecast with temperature ranges, indoor sensor and device status
 - History page with charts per city: temperature, rain, sunshine, wind, humidity, pressure, monthly averages and a summary table
 - CSV export and import of the history, plus backfilling up to 10 years from Open-Meteo's archive
-- Debug console with live touch and system info
+- Debug console with live touch and system info, and a Data sources panel showing what each feed (weather, rain radar, pressure trend) last returned
 
 **Optional extras**
 - microSD card: per-city weather history (`/hist_c0.csv` … `/hist_c2.csv`) and an hourly log of the indoor sensor (`/local.csv`)
