@@ -5,11 +5,9 @@ A touch-screen weather station for the 3.5-inch **E32R35T / E32N35T** ESP32 disp
 ![ESP32](https://img.shields.io/badge/ESP32-E32R35T-orange) ![Arduino](https://img.shields.io/badge/Arduino-IDE-00979D) ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/device-home-dark.png">
-    <img src="docs/screenshots/device-home-light.png" alt="The home screen on the display, in the light and dark theme" width="620">
-  </picture>
+  <img src="docs/screenshots/case.png" alt="The weather station in its 3D-printed case, showing the home screen" width="760">
 </p>
+<p align="center"><sub>In the <a href="https://www.thingiverse.com/thing:6987780">3D-printed case from Thingiverse</a></sub></p>
 
 ## Highlights
 
@@ -26,7 +24,16 @@ A touch-screen weather station for the 3.5-inch **E32R35T / E32N35T** ESP32 disp
 
 ## Screenshots
 
-**On the display**: home, precipitation, sun & moon, and the 5-day forecast.
+**On the display**: the home screen in the light and dark theme.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/device-home-dark.png">
+    <img src="docs/screenshots/device-home-light.png" alt="The home screen on the display, in the light and dark theme" width="620">
+  </picture>
+</p>
+
+Home, precipitation, sun & moon, and the 5-day forecast:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/device-pages-dark.png">
@@ -49,7 +56,7 @@ A touch-screen weather station for the 3.5-inch **E32R35T / E32N35T** ESP32 disp
   </picture>
 </p>
 
-<sub>The screenshots follow your GitHub theme. The display images are rendered by the sketch's own drawing code, and all of them use sample weather data.</sub>
+<sub>The screenshots follow your GitHub theme. The display images are rendered by the sketch's own drawing code (the case picture is a render with that screen placed in it), and all of them use sample weather data.</sub>
 
 ## Features
 
@@ -106,6 +113,7 @@ The device reconnects to WiFi on its own if the connection drops. Rain, pressure
 | E32R35T or E32N35T board | ESP32-WROOM-32E, 4 MB flash, 3.5" 320×480 ST7796 display with resistive touch (E32R35T) |
 | microSD card (optional) | FAT32. Uses the board's built-in slot (CS 5, SCK 18, MISO 19, MOSI 23) |
 | BME280 sensor (optional) | I2C on **SDA 21 / SCL 25** (not the usual 22, which drives the red LED on this board) |
+| Case (optional) | A 3D-printable case for this board: [Thingiverse thing 6987780](https://www.thingiverse.com/thing:6987780) |
 
 ## Installation
 
