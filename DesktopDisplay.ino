@@ -473,8 +473,10 @@ void applyTextColor() {
   if (refreshAccent()) { accentDirty = true; accentChangedAt = millis(); } // loop() redraws the page shortly
 }
 
+int ledBrightnessOverride = -1; // the rain-alert dip uses this; -1 = use the LED slider's value
+
 void setWeatherLED(String weather) {
-  int r, g, b, val = ledBrightness;
+  int r, g, b, val = ledBrightnessOverride >= 0 ? ledBrightnessOverride : ledBrightness;
   if (useCustomColor) { r = custR; g = custG; b = custB; } 
   else {
     if (weather == "Clear") { r = 255; g = 165; b = 0; }      
@@ -1466,14 +1468,17 @@ void analyzeNowcast() {
   }
 }
 
-// --- LED rain alert: the LED dips twice, slowly, from its normal brightness
-// down to 5% of it and back - same color (custom or weather sync), never
-// brighter than you set it. Afterwards the normal color is written again.
-// The web button only sets a flag; the LED itself is updated from loop().
+// --- LED rain alert: the LED dips twice from its normal brightness down to
+// 5% of it and back, 1 second per dip, in its current color (custom or
+// weather sync). It goes through setWeatherLED() - exactly what the LED
+// brightness slider uses - with a temporarily lower brightness, and ends
+// by calling it again at the normal brightness.
+// The web test button only sets a flag; the dip itself runs from loop().
 unsigned long ledPulseStart = 0, ledPulseLastWrite = 0;
 bool ledPulsing = false, ledPulseRequested = false;
 bool rainAlertArmed = true;
-const unsigned long LED_PULSE_MS = 2600; // one slow dip
+const unsigned long LED_PULSE_MS = 1000; // one dip: down and back up
+const int LED_PULSE_COUNT = 2;
 
 void startLedPulse() { ledPulseRequested = true; }
 
@@ -1481,25 +1486,23 @@ void ledPulseLoop() {
   if (ledPulseRequested) {
     ledPulseRequested = false;
     ledPulsing = true; ledPulseStart = millis(); ledPulseLastWrite = 0;
-    logDebug("LED pulse started");
+    logDebug("LED pulse started (normal brightness " + String(ledBrightness) + "/255)");
   }
   if (!ledPulsing) return;
   unsigned long nowMs = millis(), t = nowMs - ledPulseStart;
-  if (t >= 2 * LED_PULSE_MS) {
+  if (t >= LED_PULSE_COUNT * LED_PULSE_MS) {
     ledPulsing = false;
-    setWeatherLED(mainWeather); // back to exactly the normal color and brightness
+    ledBrightnessOverride = -1;
+    setWeatherLED(mainWeather); // back to exactly the normal brightness
     logDebug("LED pulse done");
     return;
   }
-  if (nowMs - ledPulseLastWrite < 20) return; // ~50 updates a second is plenty for a smooth fade
+  if (nowMs - ledPulseLastWrite < 20) return; // ~50 steps a second is plenty for a smooth fade
   ledPulseLastWrite = nowMs;
   float k = 0.5f + 0.5f * cosf((t % LED_PULSE_MS) * 2.0f * PI / LED_PULSE_MS); // 1 -> 0 -> 1
-  int full = ledBrightness, low = ledBrightness * 5 / 100;
-  int val = low + (int)((full - low) * k);
-  // same formula as setWeatherLED() (the LED is common-anode: 255 = off)
-  analogWrite(LED_R, 255 - ((currentLedR * val) / 255));
-  analogWrite(LED_G, 255 - ((currentLedG * val) / 255));
-  analogWrite(LED_B, 255 - ((currentLedB * val) / 255));
+  int low = ledBrightness * 5 / 100;
+  ledBrightnessOverride = low + (int)((ledBrightness - low) * k);
+  setWeatherLED(mainWeather);
 }
 
 // Fires once when rain is expected within 30 minutes. It only re-arms after
@@ -1955,6 +1958,7 @@ void handleLive() {
     }
   }
 
+  server.sendHeader("Cache-Control", "no-store"); // every /live request must reach the device
   server.send(200, "text/plain", "OK");
 }
 
@@ -5562,8 +5566,8 @@ const char SETTINGS_BODY[] PROGMEM = R"rawliteral(
 <section class="card"><h3>Display</h3>
  <div class="field"><span>Screen theme</span><select name="theme" id="theme"><option value="2">Auto &ndash; dark from sunset to sunrise</option><option value="0">Light</option><option value="1">Dark</option></select></div>
  <label class="switch"><div>Rain on the home screen<small>The next 2 hours (radar in NL/BE), or the next 15 hours. When off, the card shows today's sunrise and sunset.</small></div><input type="checkbox" name="rainPrevOn" id="rainPrevOn" value="1"></label>
-  <label class="switch"><div>Pulse the LED when rain is coming<small>The LED dims twice, slowly, when rain is expected within 30 minutes. Once per rain spell; uses radar in NL/BE.</small></div><input type="checkbox" name="rainLed" id="rainLed" value="1"></label>
- <div style="margin:2px 0 6px"><button type="button" class="btn" onclick="var b=this;api('/live?action=testPulse').then(function(){flash(b,'Pulsing...');})">Test the pulse</button></div>
+  <label class="switch"><div>Pulse the LED when rain is coming<small>The LED dims twice (2 seconds) when rain is expected within 30 minutes. Once per rain spell; uses radar in NL/BE.</small></div><input type="checkbox" name="rainLed" id="rainLed" value="1"></label>
+ <div style="margin:2px 0 6px"><button type="button" class="btn" onclick="window.testPulse(this)">Test the pulse</button></div>
  <div class="label" style="margin-top:14px">Brightness <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">&middot; applies right away, saved automatically</span></div>
  <div class="slider"><span>Screen</span><input type="range" id="screenSlider" min="0" max="100"><b id="screenVal"></b></div>
  <div class="slider"><span>LED</span><input type="range" id="ledSlider" min="0" max="100"><b id="ledVal"></b></div>
@@ -5592,6 +5596,10 @@ var PROV=['OpenWeatherMap','Open-Meteo','Open-Meteo KNMI (NL)'],lastSent=0;
 function hsv(h,s,v){s/=100;v/=100;var f=function(n){var k=(n+h/60)%6;return v-v*s*Math.max(0,Math.min(k,4-k,1));};return [Math.round(f(5)*255),Math.round(f(3)*255),Math.round(f(1)*255)];}
 function liveSend(a,v,force){var n=Date.now();if(!force&&n-lastSent<60)return;lastSent=n;api('/live?action='+a+'&value='+v);}
 function flash(b,t){var o=b.innerText;b.innerText=t;setTimeout(function(){b.innerText=o;},1400);}
+// (Called as window.testPulse: inside an inline onclick in this form, the name "api"
+// would mean the API key field, not the api() helper.)
+function testPulse(b){api('/live?action=testPulse&t='+Date.now(),{cache:'no-store'})
+ .then(function(r){flash(b,r.ok?'Pulsing...':'Failed ('+r.status+')');}).catch(function(){flash(b,'No answer');});}
 function saveColor(b){api('/saveColor').then(function(){flash(b,'Saved');});}
 function saveTextColor(b){api('/saveTextColor').then(function(){flash(b,'Saved');});}
 function saveSettings(f){var m=$('saveMsg');m.innerText='Saving...';
