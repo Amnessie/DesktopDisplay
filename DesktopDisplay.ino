@@ -1,4 +1,9 @@
 #include <Arduino.h>
+// File systems first: ESP32 core 3.x's WebServer.h (pulled in by WiFiManager)
+// needs the global FS name, which TFT_eSPI hides when it includes FS.h itself.
+#include <FS.h>
+#include <SPIFFS.h> // touch calibration
+#include <SD.h>     // history
 #include "ArduinoJson.h"
 #include <TimeLib.h>
 #include <HTTPClient.h>
@@ -8,12 +13,9 @@
 #include <WiFiUdp.h>
 #include <TFT_eSPI.h> 
 #include <SPI.h>
-#include <TJpg_Decoder.h>
-#include <FS.h>           
 #include <WiFiManager.h>  
 #include <Preferences.h>  
 #include <WebServer.h>    
-#include <SD.h>
 #include <vector>
 #include <algorithm>
 
@@ -142,24 +144,6 @@ static const char ntpServerName[] = "time.google.com";
 WiFiUDP Udp;                 
 unsigned int localPort = 8000;
 
-#include "img/pangzi/i0.h"
-#include "img/pangzi/i1.h"
-#include "img/pangzi/i2.h"
-#include "img/pangzi/i3.h"
-#include "img/pangzi/i4.h"
-#include "img/pangzi/i5.h"
-#include "img/pangzi/i6.h"
-#include "img/pangzi/i7.h"
-#include "img/pangzi/i8.h"
-#include "img/pangzi/i9.h"
-
-
-// NEW: arrays of pointers instead of repeated switch statements (code hygiene)
-
-const uint8_t* animFrames[10] = { i0, i1, i2, i3, i4, i5, i6, i7, i8, i9 };
-const size_t   animSizes[10]  = { sizeof(i0), sizeof(i1), sizeof(i2), sizeof(i3), sizeof(i4),
-                                   sizeof(i5), sizeof(i6), sizeof(i7), sizeof(i8), sizeof(i9) };
-
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite clk = TFT_eSprite(&tft); 
 
@@ -208,9 +192,7 @@ int huminum, pressure, visibility, clouds;
 float windSpeedKmH, rain1h, rain3h;
 String weatherDesc, mainWeather, windDir, sunRise, sunSet;
 
-int Anim = 0;
-bool showAnimation = true; // NEW: toggle for the home-page animation, set via the web portal
-bool showRainPreview = true; // NEW: toggle for the Home page's compact upcoming-rain preview, shares the same on-screen space as the animation (see drawPageHome)
+bool showRainPreview = true; // web setting: the rain card on the home page (off = today's sunrise/sunset there instead)
 
 // Rain outlook for the next 2 hours and the pressure trend, for the city on
 // screen (see [RAIN NOWCAST + PRESSURE TREND]).
@@ -248,7 +230,7 @@ uint16_t vfCnt[NUM_CITIES][VERIFY_SOURCES][4];
 uint32_t vfSince[NUM_CITIES] = {0, 0, 0};
 String vfLoc[NUM_CITIES];
 String vfStatus[NUM_CITIES];
-unsigned long AprevTime = 0, weatherUpdateTimer = 0;
+unsigned long weatherUpdateTimer = 0;
 time_t prevDisplay = 0, sysRise = 0, sysSet = 0;
 int displayMode = 0, drawnMode = -1;
 
@@ -491,8 +473,10 @@ void applyTextColor() {
   if (refreshAccent()) { accentDirty = true; accentChangedAt = millis(); } // loop() redraws the page shortly
 }
 
+int ledBrightnessOverride = -1; // the rain-alert dip uses this; -1 = use the LED slider's value
+
 void setWeatherLED(String weather) {
-  int r, g, b, val = ledBrightness;
+  int r, g, b, val = ledBrightnessOverride >= 0 ? ledBrightnessOverride : ledBrightness;
   if (useCustomColor) { r = custR; g = custG; b = custB; } 
   else {
     if (weather == "Clear") { r = 255; g = 165; b = 0; }      
@@ -685,12 +669,6 @@ int dayOfWeekFromDateString(String dateStr) {
   tmEl.Day = dateStr.substring(8, 10).toInt();
   tmEl.Hour = 12; tmEl.Minute = 0; tmEl.Second = 0; // noon avoids any DST edge case
   return weekday(makeTime(tmEl));
-}
-
-bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
-  if(y >= tft.height()) return 0;
-  tft.pushImage(x, y, w, h, bitmap); 
-  return 1;
 }
 
 // --- [NEW: LOCAL SENSOR READ] ---
@@ -1490,26 +1468,41 @@ void analyzeNowcast() {
   }
 }
 
-// --- LED rain alert: two slow "breaths" towards blue, once per rain spell.
-unsigned long ledPulseStart = 0;
-bool ledPulsing = false;
+// --- LED rain alert: the LED dips twice from its normal brightness down to
+// 5% of it and back, 1 second per dip, in its current color (custom or
+// weather sync). It goes through setWeatherLED() - exactly what the LED
+// brightness slider uses - with a temporarily lower brightness, and ends
+// by calling it again at the normal brightness.
+// The web test button only sets a flag; the dip itself runs from loop().
+unsigned long ledPulseStart = 0, ledPulseLastWrite = 0;
+bool ledPulsing = false, ledPulseRequested = false;
 bool rainAlertArmed = true;
-const unsigned long LED_PULSE_MS = 2600; // one slow breath
+const unsigned long LED_PULSE_MS = 1000; // one dip: down and back up
+const int LED_PULSE_COUNT = 2;
 
-void startLedPulse() { ledPulsing = true; ledPulseStart = millis(); }
+void startLedPulse() { ledPulseRequested = true; }
 
 void ledPulseLoop() {
+  if (ledPulseRequested) {
+    ledPulseRequested = false;
+    ledPulsing = true; ledPulseStart = millis(); ledPulseLastWrite = 0;
+    logDebug("LED pulse started (normal brightness " + String(ledBrightness) + "/255)");
+  }
   if (!ledPulsing) return;
-  unsigned long t = millis() - ledPulseStart;
-  if (t >= 2 * LED_PULSE_MS) { ledPulsing = false; setWeatherLED(mainWeather); return; }
-  float k = 0.5f - 0.5f * cosf((t % LED_PULSE_MS) * 2.0f * PI / LED_PULSE_MS); // 0 -> 1 -> 0
-  int r = currentLedR + (int)((0 - currentLedR) * k);
-  int g = currentLedG + (int)((90 - currentLedG) * k);
-  int b = currentLedB + (int)((255 - currentLedB) * k);
-  int val = max(ledBrightness, 120); // stays visible even when the LED is dimmed right down
-  analogWrite(LED_R, 255 - ((r * val) / 255));
-  analogWrite(LED_G, 255 - ((g * val) / 255));
-  analogWrite(LED_B, 255 - ((b * val) / 255));
+  unsigned long nowMs = millis(), t = nowMs - ledPulseStart;
+  if (t >= LED_PULSE_COUNT * LED_PULSE_MS) {
+    ledPulsing = false;
+    ledBrightnessOverride = -1;
+    setWeatherLED(mainWeather); // back to exactly the normal brightness
+    logDebug("LED pulse done");
+    return;
+  }
+  if (nowMs - ledPulseLastWrite < 20) return; // ~50 steps a second is plenty for a smooth fade
+  ledPulseLastWrite = nowMs;
+  float k = 0.5f + 0.5f * cosf((t % LED_PULSE_MS) * 2.0f * PI / LED_PULSE_MS); // 1 -> 0 -> 1
+  int low = ledBrightness * 5 / 100;
+  ledBrightnessOverride = low + (int)((ledBrightness - low) * k);
+  setWeatherLED(mainWeather);
 }
 
 // Fires once when rain is expected within 30 minutes. It only re-arms after
@@ -1857,7 +1850,7 @@ void handleApiSettings() {
   for (int i = 0; i < NUM_CITIES; i++) j += String(i ? "," : "") + String(cityProvider[i]);
   j += "],\"api\":\"" + jsonEsc(apiKey) + "\",\"apiBackup\":\"" + jsonEsc(apiKeyBackup) + "\"";
   j += ",\"theme\":" + String(themeMode);
-  j += ",\"animOn\":" + String(showAnimation ? "true" : "false") + ",\"rainPrevOn\":" + String(showRainPreview ? "true" : "false");
+  j += ",\"rainPrevOn\":" + String(showRainPreview ? "true" : "false");
   j += ",\"rainLed\":" + String(rainLedAlert ? "true" : "false");
   j += ",\"screenPct\":" + String(map(globalBrightness, 10, 255, 0, 100)) + ",\"ledPct\":" + String(map(ledBrightness, 0, 255, 0, 100));
   j += ",\"useCustom\":" + String(useCustomColor ? "true" : "false");
@@ -1886,8 +1879,6 @@ void handleSave() {
   prefs.putInt("provider2", cityProvider[2]);
 
   // NEW: checkboxes are only present in the POST body when checked
-  showAnimation = server.hasArg("animOn");
-  prefs.putBool("animOn", showAnimation);
   showRainPreview = server.hasArg("rainPrevOn");
   prefs.putBool("rainPrevOn", showRainPreview);
   rainLedAlert = server.hasArg("rainLed");
@@ -1967,6 +1958,7 @@ void handleLive() {
     }
   }
 
+  server.sendHeader("Cache-Control", "no-store"); // every /live request must reach the device
   server.send(200, "text/plain", "OK");
 }
 
@@ -3749,6 +3741,30 @@ void drawHomeRainPreview() {
   }
 }
 
+// The home page's bottom card when the rain card is switched off: today's
+// sunrise and sunset, and how long the day is.
+void drawHomeSunCard() {
+  static String lastSig = "";
+  String sig = sunRise + "/" + sunSet;
+  if (sig == lastSig && drawnMode == 0) return;
+  lastSig = sig;
+  tft.fillRect(18, 373, 284, 86, T.card);
+  tft.setTextDatum(ML_DATUM); tft.setTextColor(T.muted);
+  tft.drawString("TODAY", 24, 381, 2);
+  int rise = timeStrToMinutes(sunRise), set = timeStrToMinutes(sunSet);
+  tft.setTextDatum(MC_DATUM); tft.setTextColor(T.muted);
+  tft.drawString("SUNRISE", 88, 404, 2);
+  tft.drawString("SUNSET", 232, 404, 2);
+  ffText(sunRise.length() ? sunRise : String("--:--"), 88, 428, &FreeSansBold12pt7b, MC_DATUM, T.sunriseFg);
+  ffText(sunSet.length() ? sunSet : String("--:--"), 232, 428, &FreeSansBold12pt7b, MC_DATUM, T.sunsetFg);
+  if (rise >= 0 && set > rise) {
+    int len = set - rise;
+    tft.setTextColor(T.muted);
+    tft.drawString(String(len / 60) + "h " + String(len % 60) + "m", 160, 428, 2);
+    tft.drawString("daylight", 160, 444, 1);
+  }
+}
+
 void drawPageHome() {
   static String lastDate = "";
   if (now() != prevDisplay || drawnMode != 0) {
@@ -3786,15 +3802,8 @@ void drawPageHome() {
   if (drawnMode == 0 && (pTrendVersion != lastPV || pTrendValid() != lastPValid)) drawPressureTile();
   lastPV = pTrendVersion; lastPValid = pTrendValid();
 
-  if (showRainPreview) {
-    drawHomeRainPreview();
-  } else if (showAnimation) {
-    if (millis() - AprevTime > 100) {
-      Anim++; if (Anim == 10) Anim = 0;
-      AprevTime = millis();
-      TJpgDec.drawJpg(135, 384, animFrames[Anim], animSizes[Anim]);
-    }
-  }
+  if (showRainPreview) drawHomeRainPreview();
+  else drawHomeSunCard();
   drawStatusIndicator(drawnMode != 0);
 }
 
@@ -4278,7 +4287,6 @@ void setup() {
   pinMode(LCD_BL_PIN, OUTPUT); pinMode(LED_R, OUTPUT); pinMode(LED_G, OUTPUT); pinMode(LED_B, OUTPUT); 
   tft.begin(); tft.setRotation(0);
   touch_calibrate(); 
-  TJpgDec.setJpgScale(1); TJpgDec.setSwapBytes(true); TJpgDec.setCallback(tft_output); 
   prefs.begin("weather_app", false); 
 
 #if USE_SD_HISTORY
@@ -4322,7 +4330,6 @@ void setup() {
   textSat = prefs.getInt("txSat", 0);
   textVal = prefs.getInt("txVal", 0);
   applyTextColor();
-  showAnimation = prefs.getBool("animOn", true); // NEW
   showRainPreview = prefs.getBool("rainPrevOn", true); // NEW
   rainLedAlert = prefs.getBool("rainLed", true);
   vfLoad();
@@ -5558,10 +5565,9 @@ const char SETTINGS_BODY[] PROGMEM = R"rawliteral(
 </section>
 <section class="card"><h3>Display</h3>
  <div class="field"><span>Screen theme</span><select name="theme" id="theme"><option value="2">Auto &ndash; dark from sunset to sunrise</option><option value="0">Light</option><option value="1">Dark</option></select></div>
- <label class="switch"><div>Upcoming rain on the home screen<small>Bars for the next 15 hours</small></div><input type="checkbox" name="rainPrevOn" id="rainPrevOn" value="1"></label>
- <label class="switch"><div>Home screen animation<small>Shown instead of the rain bars when those are off</small></div><input type="checkbox" name="animOn" id="animOn" value="1"></label>
- <label class="switch"><div>Pulse the LED when rain is coming<small>Two slow blue pulses when rain is expected within 30 minutes. Once per rain spell; uses radar in NL/BE.</small></div><input type="checkbox" name="rainLed" id="rainLed" value="1"></label>
- <div style="margin:2px 0 6px"><button type="button" class="btn" onclick="var b=this;api('/live?action=testPulse').then(function(){flash(b,'Pulsing...');})">Test the pulse</button></div>
+ <label class="switch"><div>Rain on the home screen<small>The next 2 hours (radar in NL/BE), or the next 15 hours. When off, the card shows today's sunrise and sunset.</small></div><input type="checkbox" name="rainPrevOn" id="rainPrevOn" value="1"></label>
+  <label class="switch"><div>Pulse the LED when rain is coming<small>The LED dims twice (2 seconds) when rain is expected within 30 minutes. Once per rain spell; uses radar in NL/BE.</small></div><input type="checkbox" name="rainLed" id="rainLed" value="1"></label>
+ <div style="margin:2px 0 6px"><button type="button" class="btn" onclick="window.testPulse(this)">Test the pulse</button></div>
  <div class="label" style="margin-top:14px">Brightness <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">&middot; applies right away, saved automatically</span></div>
  <div class="slider"><span>Screen</span><input type="range" id="screenSlider" min="0" max="100"><b id="screenVal"></b></div>
  <div class="slider"><span>LED</span><input type="range" id="ledSlider" min="0" max="100"><b id="ledVal"></b></div>
@@ -5590,6 +5596,10 @@ var PROV=['OpenWeatherMap','Open-Meteo','Open-Meteo KNMI (NL)'],lastSent=0;
 function hsv(h,s,v){s/=100;v/=100;var f=function(n){var k=(n+h/60)%6;return v-v*s*Math.max(0,Math.min(k,4-k,1));};return [Math.round(f(5)*255),Math.round(f(3)*255),Math.round(f(1)*255)];}
 function liveSend(a,v,force){var n=Date.now();if(!force&&n-lastSent<60)return;lastSent=n;api('/live?action='+a+'&value='+v);}
 function flash(b,t){var o=b.innerText;b.innerText=t;setTimeout(function(){b.innerText=o;},1400);}
+// (Called as window.testPulse: inside an inline onclick in this form, the name "api"
+// would mean the API key field, not the api() helper.)
+function testPulse(b){api('/live?action=testPulse&t='+Date.now(),{cache:'no-store'})
+ .then(function(r){flash(b,r.ok?'Pulsing...':'Failed ('+r.status+')');}).catch(function(){flash(b,'No answer');});}
 function saveColor(b){api('/saveColor').then(function(){flash(b,'Saved');});}
 function saveTextColor(b){api('/saveTextColor').then(function(){flash(b,'Saved');});}
 function saveSettings(f){var m=$('saveMsg');m.innerText='Saving...';
@@ -5602,7 +5612,7 @@ function paint(){var c=hsv(+$('hueSlider').value,+$('satSlider').value,+$('valSl
 function bind(id,action,valId,suffix){var s=$(id);s.oninput=function(){$(valId).innerText=s.value+(suffix||'');paint();liveSend(action,s.value,false);};s.onchange=function(){liveSend(action,s.value,true);};}
 fetch('/api/settings').then(function(r){return r.json();}).then(function(d){
  for(var i=1;i<=3;i++){$('c'+i).value=d.cities[i-1];var sel=$('provider'+i);sel.innerHTML=PROV.map(function(p,k){return '<option value="'+k+'">'+p+'</option>';}).join('');sel.value=d.providers[i-1];}
- $('api').value=d.api;$('apiBackup').value=d.apiBackup;$('theme').value=d.theme;$('animOn').checked=d.animOn;$('rainPrevOn').checked=d.rainPrevOn;$('rainLed').checked=d.rainLed;
+ $('api').value=d.api;$('apiBackup').value=d.apiBackup;$('theme').value=d.theme;$('rainPrevOn').checked=d.rainPrevOn;$('rainLed').checked=d.rainLed;
  var set=function(id,v,suffix){$(id+'Slider').value=v;$(id+'Val').innerText=v+(suffix||'');};
  set('screen',d.screenPct,'%');set('led',d.ledPct,'%');set('hue',d.hue);set('sat',d.satPct,'%');set('val',d.valPct,'%');
  set('textHue',d.textHue);set('textSat',d.textSatPct,'%');set('textVal',d.textValPct,'%');

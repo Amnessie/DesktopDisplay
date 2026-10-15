@@ -7,7 +7,7 @@ All notable changes to this project are listed here.
 ### Added
 - README with screenshots of the display and the web dashboard (desktop and phone) that follow your GitHub light/dark theme, and a short Highlights section
 - Rain in the next 2 hours: Buienradar radar for cities in the Netherlands/Belgium (5-minute steps, refreshed every 5 minutes), Open-Meteo 15-minute forecast elsewhere. Shown on the home screen, the Precipitation page and the dashboard. Rain only "starts" or "stops" on two consecutive steps, values under 0.1 mm/h count as dry, and the outlook disappears when the data is more than 15 minutes old
-- LED rain alert (web Settings, with a test button): two slow blue pulses when rain is expected within 30 minutes, once per rain spell
+- LED rain alert (web Settings, with a test button): the LED dims twice, slowly, when rain is expected within 30 minutes, once per rain spell
 - Pressure trend: least-squares slope over the last 3 hours of Open-Meteo sea-level pressure, in WMO tendency classes with hysteresis so the label can't flicker at a boundary; arrow in the pressure tile, row on the Atmosphere page, text on the dashboard
 - Radar and model blending: where the radar sees no rain for the next hour but Open-Meteo's 15-minute model expects rain 1 to 3 hours out (two wet steps in a row), the outlook says "Dry for the next hour; rain possible from 16:45 (forecast)". The radar always decides the first hour and the LED alert stays radar-only. The model is drawn as faint bars behind the radar bars on the display and the dashboard
 - Forecast check (dashboard): for cities inside the radar area, every 3-hour period is scored afterwards against the radar for OpenWeatherMap, Open-Meteo and Open-Meteo KNMI (hits, misses, false alarms, and a score that ignores easy dry days). After 10 rainy periods it recommends the best source, with a button to switch to it. Counts are kept across reboots and start over when the city is renamed
@@ -18,6 +18,9 @@ All notable changes to this project are listed here.
 - Redesigned web interface for desktop and phone, with light/dark/auto themes: a new dashboard (weather icons, rain chart, sun arc, moon phase, forecast range bars, indoor sensor and device status), card-based Settings, and History and Debug in the same style. Shared stylesheet/script are cached by the browser
 
 ### Fixed
+- Compile error on ESP32 core 3.x ("'FS' was not declared" in WebServer.h) after the image decoder was removed: the file-system headers (FS, SPIFFS, SD) are now included first and explicitly, instead of relying on another library to pull them in
+- "Test the pulse" never reached the device: its inline click handler sits inside the Settings form, where the name `api` means the API key field, not the request helper ("api is not a function"). The handler now lives in the page script
+- LED rain alert: the LED dips twice from its normal brightness to 5% of it and back, 1 second per dip, in its current color (custom or weather sync), through the same code the LED brightness slider uses, then returns to exactly where it was. Start and end are logged on the Debug page
 - The weather update (every 10 minutes, and on every city switch) runs in the background too, so nothing waits on the network anymore: switching city responds right away, shows the "..." badge, and the new weather appears when it's in. Previously it ran on the main loop and first waited up to 3 s for any background download, which during a history backfill froze the screen for several seconds each time
 - A long press now needs 2.5 s (was 1.5 s) to switch city, so a slow tap no longer switches city by accident
 - Freezes of 3-5 s every ~15 s while a history backfill runs: history downloads now go through the background network task, and merging the fetched days into the (sorted, possibly years-long) history file on the SD card runs in ~25 ms slices instead of one long block. The new file is written next to the old one and swapped in at the end, so the History page always reads a complete file; renaming, wiping or importing a city cancels a merge in progress
@@ -40,6 +43,7 @@ All notable changes to this project are listed here.
 - Endpoints that change settings or history now require the `X-Requested-With: DesktopDisplay` header, so other websites can't change them through your browser
 
 ### Changed
+- Removed the home screen animation (and with it the TJpg_Decoder library and the image files). With the rain card switched off, the card shows today's sunrise, sunset and hours of daylight
 - The moon on the Sun & Moon page is now drawn instead of a photo: exact phase with smooth edges in the theme's colors, mirrored for southern-hemisphere cities, plus % lit and days to the next full/new moon. It uses the same phase calculation as the web dashboard (the old 8-picture calculation could be a phase off). The 8 moon images are removed (~45 KB less flash); the dark theme's inner cards are slightly darker
 - The Settings page loads its values from the new `/api/settings` endpoint
 - Requires TFT_eSPI 2.5 or newer (anti-aliased drawing functions)

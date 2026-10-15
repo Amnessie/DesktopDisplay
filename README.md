@@ -17,7 +17,7 @@ A touch-screen weather station for the 3.5-inch **E32R35T / E32N35T** ESP32 disp
   - Old data disappears instead of lingering.
   - The pressure trend uses the official WMO classes, with hysteresis so the label doesn't flicker.
 - **Forecast check.** In the radar area, the station scores each weather source's rain forecast against what the radar actually measured. After 10 rainy periods it tells you which source is most accurate where you live, and you can switch to it with one tap.
-- **LED rain alert.** Two slow blue pulses when rain is expected within 30 minutes, once per rain spell. The RGB LED otherwise follows the weather, or shows a color you pick.
+- **LED rain alert.** The LED dims twice (2 seconds) when rain is expected within 30 minutes, once per rain spell. The RGB LED otherwise follows the weather, or shows a color you pick.
 - **Light, dark or automatic theme.** Auto switches to dark at sunset. Your text color becomes the accent color on the display and on the web pages.
 - **History.** Up to 10 years of daily weather per city on the SD card, with charts, CSV export and import, and backfill from Open-Meteo's archive.
 - **No extra hardware needed.** An optional BME280 adds indoor temperature, humidity and pressure.
@@ -66,12 +66,12 @@ Home, precipitation, sun & moon, and the 5-day forecast:
 - Three cities, switchable from the screen or the web page
 - Rain in the next 2 hours on the home screen: "Rain from 14:35" / "Dry for the next 2 hours" with a bar per 5 minutes, from Buienradar's radar in the Netherlands and Belgium (Open-Meteo's 15-minute forecast elsewhere, labelled as forecast)
 - Past the first hour, the radar outlook is blended with Open-Meteo's 15-minute model ("rain possible from 16:45 (forecast)"), shown as faint bars behind the radar bars
-- Optional LED alert: two slow blue pulses when rain is expected within 30 minutes (once per rain spell; switch it on or off in the web Settings)
+- Optional LED alert: the LED dims twice (2 seconds) when rain is expected within 30 minutes (once per rain spell; switch it on or off in the web Settings)
 - Pressure trend over the last 3 hours (steady / rising / falling / fast), using the official WMO classes, with an arrow in the pressure tile
 - Rain page with 1h/3h rainfall and upcoming rain in 3-hour steps
 - Astro page with sunrise, sunset and the current moon phase, drawn to the exact phase (mirrored for southern-hemisphere cities), with how much is lit and the days until the next full or new moon
 - Forecast page and an on-device 7-day history
-- Little animated astronaut on the home screen
+- When the rain card is switched off, the home screen shows today's sunrise, sunset and hours of daylight instead
 - Status indicator showing whether the weather data is fresh, updating or failed
 - Light and dark themes, or Auto: dark from sunset to sunrise
 - Anti-aliased weather icons drawn on the display (sun, moon at night, clouds, rain, drizzle, thunder, snow, fog)
@@ -119,14 +119,13 @@ The device reconnects to WiFi on its own if the connection drops. Rain, pressure
 
 ### 1. Arduino IDE and ESP32 support
 
-Install the [Arduino IDE](https://www.arduino.cc/en/software) and add ESP32 support through the Boards Manager (search for **esp32** by Espressif).
+Install the [Arduino IDE](https://www.arduino.cc/en/software) and add ESP32 support through the Boards Manager (search for **esp32** by Espressif). The sketch is tested with ESP32 core 3.3 (and the older 2.0.17).
 
 ### 2. Libraries
 
 Install these through **Tools → Manage Libraries**:
 
 - **TFT_eSPI** by Bodmer (version 2.5 or newer, for the anti-aliased drawing)
-- **TJpg_Decoder** by Bodmer
 - **WiFiManager** by tzapu
 - **ArduinoJson** by Benoit Blanchon
 - **Time** by Michael Margolis (provides `TimeLib.h`)
@@ -240,9 +239,9 @@ Check the API key on the settings page (`/settings`) and that the city is writte
 - Downloading 10 years of data is too much and will slow the device down, making it unusable. (still figuring out if there is a way)
 ## Credits
 
-This project started as a heavily modified version of [SmallDesktopDisplay](https://github.com/SmallDesktopDisplay-team/SmallDesktopDisplay). The astronaut animation comes from that project.
+This project started as a heavily modified version of [SmallDesktopDisplay](https://github.com/SmallDesktopDisplay-team/SmallDesktopDisplay).
 
-Weather data from [OpenWeatherMap](https://openweathermap.org) and [Open-Meteo](https://open-meteo.com) (including KNMI models). Built with [TFT_eSPI](https://github.com/Bodmer/TFT_eSPI), [TJpg_Decoder](https://github.com/Bodmer/TJpg_Decoder), [WiFiManager](https://github.com/tzapu/WiFiManager) and [ArduinoJson](https://arduinojson.org).
+Weather data from [OpenWeatherMap](https://openweathermap.org) and [Open-Meteo](https://open-meteo.com) (including KNMI models). Built with [TFT_eSPI](https://github.com/Bodmer/TFT_eSPI), [WiFiManager](https://github.com/tzapu/WiFiManager) and [ArduinoJson](https://arduinojson.org).
 
 ## License
 
