@@ -1,4 +1,9 @@
 #include <Arduino.h>
+// File systems first: ESP32 core 3.x's WebServer.h (pulled in by WiFiManager)
+// needs the global FS name, which TFT_eSPI hides when it includes FS.h itself.
+#include <FS.h>
+#include <SPIFFS.h> // touch calibration
+#include <SD.h>     // history
 #include "ArduinoJson.h"
 #include <TimeLib.h>
 #include <HTTPClient.h>
@@ -8,11 +13,9 @@
 #include <WiFiUdp.h>
 #include <TFT_eSPI.h> 
 #include <SPI.h>
-#include <FS.h>           
 #include <WiFiManager.h>  
 #include <Preferences.h>  
 #include <WebServer.h>    
-#include <SD.h>
 #include <vector>
 #include <algorithm>
 

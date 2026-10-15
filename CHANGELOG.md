@@ -18,6 +18,7 @@ All notable changes to this project are listed here.
 - Redesigned web interface for desktop and phone, with light/dark/auto themes: a new dashboard (weather icons, rain chart, sun arc, moon phase, forecast range bars, indoor sensor and device status), card-based Settings, and History and Debug in the same style. Shared stylesheet/script are cached by the browser
 
 ### Fixed
+- Compile error on ESP32 core 3.x ("'FS' was not declared" in WebServer.h) after the image decoder was removed: the file-system headers (FS, SPIFFS, SD) are now included first and explicitly, instead of relying on another library to pull them in
 - LED rain alert: the pulse is now unmistakable: the LED goes dark, then fades bright blue in and out twice at full brightness, then returns to its normal color. Before, it blended the current color towards blue at the normal brightness, which was easy to miss. Start and end are logged on the Debug page
 - The weather update (every 10 minutes, and on every city switch) runs in the background too, so nothing waits on the network anymore: switching city responds right away, shows the "..." badge, and the new weather appears when it's in. Previously it ran on the main loop and first waited up to 3 s for any background download, which during a history backfill froze the screen for several seconds each time
 - A long press now needs 2.5 s (was 1.5 s) to switch city, so a slow tap no longer switches city by accident

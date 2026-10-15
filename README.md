@@ -119,7 +119,7 @@ The device reconnects to WiFi on its own if the connection drops. Rain, pressure
 
 ### 1. Arduino IDE and ESP32 support
 
-Install the [Arduino IDE](https://www.arduino.cc/en/software) and add ESP32 support through the Boards Manager (search for **esp32** by Espressif).
+Install the [Arduino IDE](https://www.arduino.cc/en/software) and add ESP32 support through the Boards Manager (search for **esp32** by Espressif). The sketch is tested with ESP32 core 3.3 (and the older 2.0.17).
 
 ### 2. Libraries
 
