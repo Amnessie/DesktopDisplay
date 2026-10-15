@@ -1085,12 +1085,15 @@ void drawUpdatingBadge(bool show) {
 }
 
 void triggerWeatherUpdate() {
+  unsigned long t0 = millis();
   isUpdating = true;
   drawUpdatingBadge(true);
   bool locked = netLock(3000); // let a background request finish first, but never stall the screen for long
+  unsigned long waited = millis() - t0;
   getOpenWeatherData();
   if (locked) netUnlock();
   isUpdating = false;
+  if (millis() - t0 > 1000) logDebug("SLOW weather update: " + String(millis() - t0) + " ms (waited " + String(waited) + " ms for a background request)");
   applyTheme(); // new sunrise/sunset times (or another city) can change the AUTO theme
   drawPageBackground(displayMode);
   drawnMode = -1;
@@ -1553,6 +1556,8 @@ void nowcastLoop() {
   if (netBusy && xQueueReceive(netDoneQ, &jp, 0) == pdTRUE) {
     netBusy = false;
     if (jp->ms > 8000) logDebug("NET slow: job " + String(jp->kind) + " took " + String(jp->ms) + " ms (HTTP " + String(jp->code) + ")");
+    unsigned long pt0 = millis();
+    int pkind = jp->kind;
     switch (jp->kind) {
       case NJ_NOW: nowcastResult(*jp); break;
       case NJ_MODEL: modelResult(*jp); break;
@@ -1560,6 +1565,7 @@ void nowcastLoop() {
       case NJ_VF_OBS: case NJ_VF_OM: case NJ_VF_OWM: verifyResult(*jp); break;
       case NJ_HIST: histResult(*jp); break;
     }
+    if (millis() - pt0 > 500) logDebug("SLOW handling job " + String(pkind) + ": " + String(millis() - pt0) + " ms");
     if (!netBusy) { netJob.body = ""; netJob.url = ""; } // free the reply (unless a follow-up was posted)
   }
   if (netBusy) return;
@@ -4386,6 +4392,12 @@ void handleSerialCommand() {
   }
 }
 
+// Times one part of loop(): anything over a second is logged with its name, so
+// a "LOOP blocked" line in the Debug log comes with the part that caused it.
+// (The name is evaluated after the call, so it can describe what just ran.)
+#define TIMED(name, call) do { unsigned long _t0 = millis(); call; unsigned long _dt = millis() - _t0; \
+  if (_dt > 1000) logDebug(String("SLOW ") + (name) + ": " + String(_dt) + " ms"); } while (0)
+
 void loop() {
   // Watch for anything that holds up the main loop (touch and web pages wait meanwhile)
   static unsigned long lastLoopAt = 0;
@@ -4393,17 +4405,17 @@ void loop() {
   if (lastLoopAt != 0) {
     unsigned long gap = loopNow - lastLoopAt;
     if (gap > loopMaxMs) loopMaxMs = gap;
-    if (gap > 3000) logDebug("LOOP blocked for " + String(gap) + " ms");
+    if (gap > 1500) logDebug("LOOP blocked for " + String(gap) + " ms");
   }
   lastLoopAt = loopNow;
-  server.handleClient();
-  checkWifiHealth(); // NEW: watches for a dropped connection and recovers automatically
+  TIMED(String("web page ") + server.uri(), server.handleClient());
+  TIMED("WiFi check", checkWifiHealth()); // NEW: watches for a dropped connection and recovers automatically
   handleSerialCommand(); // NEW: read-only ping/status over Serial
   saveBrightnessIfDue(); // persists slider changes once you've stopped dragging
 #if USE_SD_HISTORY
-  historyLoop(); // NEW: background per-city history sync (one city at a time, every 6h)
+  TIMED(hmActive ? "history (SD merge)" : "history", historyLoop()); // NEW: background per-city history sync (one city at a time, every 6h)
 #endif
-  nowcastLoop(); // rain in the next 2 hours, pressure trend, LED rain alert
+  TIMED("background jobs", nowcastLoop()); // rain in the next 2 hours, pressure trend, LED rain alert
 
   // Text color changed (web sliders) -> redraw once it has settled
   if (accentDirty && millis() - accentChangedAt > 400) {
@@ -4429,9 +4441,9 @@ void loop() {
   // NEW: periodic local sensor read, independent of the network weather timer
   if (bmeOK && millis() - lastBmeRead > 5000) {
     lastBmeRead = millis();
-    readLocalSensor();
+    TIMED("indoor sensor", readLocalSensor());
 #if USE_SD_HISTORY
-    localLogSample(); // NEW: hourly averages to /local.csv on the SD card
+    TIMED("indoor log", localLogSample()); // NEW: hourly averages to /local.csv on the SD card
 #endif
   }
 #endif
@@ -4584,6 +4596,8 @@ void loop() {
     isTouched = false;
   }
   
+  unsigned long drawT0 = millis();
+  int drawFrom = drawnMode;
   if (displayMode == 0) drawPageHome();
   else if (displayMode == 1) drawPageStats();
   else if (displayMode == 2) drawPageRain();
@@ -4604,7 +4618,8 @@ void loop() {
   }
   else if (displayMode == 5) drawPageForecast();
   else if (displayMode == 6) drawPageHistory(); // NEW: on-device 7-day history
-  
+  if (millis() - drawT0 > 1000) logDebug("SLOW drawing page " + String(displayMode) + (drawFrom != displayMode ? " (full redraw)" : "") + ": " + String(millis() - drawT0) + " ms");
+
   drawnMode = displayMode;
 }
 
@@ -5105,7 +5120,7 @@ var showBF=function(list){
 var pollBF=async function(){
   clearTimeout(bfTimer);
   try{var j=await (await fetch('/api/history/status')).json();showBF(j.backfill);var act=j.backfill.some(b=>b.active);
-    if(act){bfTick++;if(bfTick%8==0)loadAll();bfTimer=setTimeout(pollBF,5000);}
+    if(act){bfTimer=setTimeout(pollBF,5000);} // the charts reload once when the backfill is done
     else if(bfWas)loadAll();
     bfWas=act;
   }catch(e){bfTimer=setTimeout(pollBF,10000);}
