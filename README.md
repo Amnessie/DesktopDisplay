@@ -1,8 +1,55 @@
 # DesktopDisplay – ESP32 Weather Station
 
-A touch-screen weather station for the 3.5-inch **E32R35T / E32N35T** ESP32 display board. It shows live weather for up to three cities, a rain forecast, sunrise/sunset and moon phase, keeps a day-by-day weather history on a microSD card, can read an optional BME280 indoor sensor, and has a full web interface for settings, a live dashboard and history charts.
+A touch-screen weather station for the 3.5-inch **E32R35T / E32N35T** ESP32 display board. Live weather for three cities, a radar-based rain outlook for the next two hours, pressure trend, sun and moon, a day-by-day history on a microSD card, and a web dashboard that looks as good on your phone as on the display itself.
 
-<!-- Tip: add a photo of the display here, e.g. ![DesktopDisplay](docs/photo.jpg) -->
+![ESP32](https://img.shields.io/badge/ESP32-E32R35T-orange) ![Arduino](https://img.shields.io/badge/Arduino-IDE-00979D) ![License: MIT](https://img.shields.io/badge/license-MIT-green)
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/device-home-dark.png">
+    <img src="docs/screenshots/device-home-light.png" alt="The home screen on the display, in the light and dark theme" width="620">
+  </picture>
+</p>
+
+## Highlights
+
+- **Rain in the next 2 hours, minute by minute.** Buienradar's radar in the Netherlands and Belgium ("Rain from 15:50, moderate"), Open-Meteo's 15-minute forecast elsewhere. Past the first hour it's blended with the weather model, the way weather services do it, and the model shows as faint bars behind the radar.
+- **Rules against false alarms.**
+  - A single wet radar pixel doesn't count as rain, and anything under 0.1 mm/h counts as dry.
+  - Old data disappears instead of lingering.
+  - The pressure trend uses the official WMO classes, with hysteresis so the label doesn't flicker.
+- **Forecast check.** In the radar area, the station scores each weather source's rain forecast against what the radar actually measured. After 10 rainy periods it tells you which source is most accurate where you live, and you can switch to it with one tap.
+- **LED rain alert.** Two slow blue pulses when rain is expected within 30 minutes, once per rain spell. The RGB LED otherwise follows the weather, or shows a color you pick.
+- **Light, dark or automatic theme.** Auto switches to dark at sunset. Your text color becomes the accent color on the display and on the web pages.
+- **History.** Up to 10 years of daily weather per city on the SD card, with charts, CSV export and import, and backfill from Open-Meteo's archive.
+- **No extra hardware needed.** An optional BME280 adds indoor temperature, humidity and pressure.
+
+## Screenshots
+
+**On the display**: home, precipitation, sun & moon, and the 5-day forecast.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/device-pages-dark.png">
+  <img src="docs/screenshots/device-pages-light.png" alt="Four pages of the display: home, precipitation, sun and moon, 5-day forecast">
+</picture>
+
+**Web dashboard**: open the device's IP address in any browser.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/dashboard-desktop-dark.png">
+  <img src="docs/screenshots/dashboard-desktop-light.png" alt="The web dashboard on a desktop browser">
+</picture>
+
+**On a phone**
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/dashboard-phone-dark.png">
+    <img src="docs/screenshots/dashboard-phone-light.png" alt="The web dashboard on a phone" width="640">
+  </picture>
+</p>
+
+<sub>The screenshots follow your GitHub theme. The display images are rendered by the sketch's own drawing code, and all of them use sample weather data.</sub>
 
 ## Features
 
@@ -12,7 +59,6 @@ A touch-screen weather station for the 3.5-inch **E32R35T / E32N35T** ESP32 disp
 - Three cities, switchable from the screen or the web page
 - Rain in the next 2 hours on the home screen: "Rain from 14:35" / "Dry for the next 2 hours" with a bar per 5 minutes, from Buienradar's radar in the Netherlands and Belgium (Open-Meteo's 15-minute forecast elsewhere, labelled as forecast)
 - Past the first hour, the radar outlook is blended with Open-Meteo's 15-minute model ("rain possible from 16:45 (forecast)"), shown as faint bars behind the radar bars
-- Forecast check on the dashboard: in the radar area, the station scores each weather source's rain forecast against what the radar actually measured, and after 10 rainy periods tells you which source is most accurate where you live (one tap to switch)
 - Optional LED alert: two slow blue pulses when rain is expected within 30 minutes (once per rain spell; switch it on or off in the web Settings)
 - Pressure trend over the last 3 hours (steady / rising / falling / fast), using the official WMO classes, with an arrow in the pressure tile
 - Rain page with 1h/3h rainfall and upcoming rain in 3-hour steps
@@ -21,7 +67,7 @@ A touch-screen weather station for the 3.5-inch **E32R35T / E32N35T** ESP32 disp
 - Little animated astronaut on the home screen
 - Status indicator showing whether the weather data is fresh, updating or failed
 - Light and dark themes, or Auto: dark from sunset to sunrise
-- Weather icons drawn on the display (sun, moon at night, clouds, rain, drizzle, thunder, snow, fog)
+- Anti-aliased weather icons drawn on the display (sun, moon at night, clouds, rain, drizzle, thunder, snow, fog)
 - RGB LED that changes color with the weather (or a fixed color you pick)
 
 **Weather sources** (selectable per city)
@@ -32,17 +78,26 @@ A touch-screen weather station for the 3.5-inch **E32R35T / E32N35T** ESP32 disp
 **Web interface** (open the device's IP address in a browser; it starts on the live dashboard)
 - Works on desktop and phone, in light or dark (the theme button in the top bar switches between Auto, Light and Dark; Auto follows your phone/PC setting)
 - Uses your chosen text color as the accent color, just like the display
-- Settings: cities, weather source per city, API keys (with an optional backup key), screen and LED brightness (remembered across restarts), colors
-- Live dashboard: current weather with icon, 7-segment clock, wind/humidity/pressure/visibility, rain for the next 15 hours, sun position and moon phase, 5-day forecast with temperature ranges, indoor sensor and device status
+- Settings: cities, weather source per city, API keys (with an optional backup key), screen and LED brightness (remembered across restarts), colors, LED rain alert
+- Live dashboard:
+  - current weather with icon and 7-segment clock
+  - wind, humidity, pressure (with trend) and visibility
+  - 2-hour rain outlook and rain for the next 15 hours
+  - sun position and moon phase
+  - 5-day forecast with temperature ranges
+  - forecast check, indoor sensor and device status
+- Forecast check: per weather source, how many rainy periods it caught, its false alarms and an overall score, with a button to switch to the best source
 - History page with charts per city: temperature, rain, sunshine, wind, humidity, pressure, monthly averages and a summary table
 - CSV export and import of the history, plus backfilling up to 10 years from Open-Meteo's archive
-- Debug console with live touch and system info, and a Data sources panel showing what each feed (weather, rain radar, pressure trend) last returned
+- Debug console:
+  - live touch and system info, including the longest freeze and the lowest free memory since boot
+  - a Data sources panel showing what each feed (weather, rain radar, rain model, pressure trend, forecast check) last returned
 
 **Optional extras**
 - microSD card: per-city weather history (`/hist_c0.csv` … `/hist_c2.csv`) and an hourly log of the indoor sensor (`/local.csv`)
 - BME280 sensor: indoor temperature, humidity and pressure on the stats page and in the history
 
-The device also reconnects to WiFi on its own if the connection drops.
+The device reconnects to WiFi on its own if the connection drops. Rain, pressure and forecast-check requests run in the background, so the touchscreen and the web pages stay responsive while data is loading.
 
 ## Hardware
 
