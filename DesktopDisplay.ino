@@ -2056,7 +2056,9 @@ void handleAppJs() {
 
 // NEW: JSON snapshot of live touch/system diagnostics for the /debug console.
 void handleApiDebug() {
-  String json = "{";
+  String json;
+  json.reserve(6144); // one allocation up front instead of one per +=; this is polled every second
+  json = "{";
   json += "\"rawX\":" + String(debugRawX) + ",\"rawY\":" + String(debugRawY) + ",";
   json += "\"pressed\":" + String(debugPressed ? "true" : "false") + ",";
   json += "\"isTouched\":" + String(isTouched ? "true" : "false") + ",";
@@ -2066,7 +2068,7 @@ void handleApiDebug() {
   json += "\"displayMode\":" + String(displayMode) + ",";
   json += "\"uptimeSec\":" + String(millis() / 1000) + ",";
   json += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
-  json += "\"minHeap\":" + String(ESP.getMinFreeHeap()) + ",\"loopMaxMs\":" + String(loopMaxMs) + ",";
+  json += "\"minHeap\":" + String(ESP.getMinFreeHeap()) + ",\"maxBlock\":" + String(ESP.getMaxAllocHeap()) + ",\"loopMaxMs\":" + String(loopMaxMs) + ",";
   json += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
   // Data sources: what each feed last returned, so feeds can be checked on the device
   auto age = [](unsigned long t) { return t == 0 ? String("never") : String((millis() - t) / 60000) + " min ago"; };
@@ -2099,7 +2101,7 @@ void handleApiDebug() {
 }
 
 // Live debug console: what the touch controller reports, plus the event log,
-// without needing a Serial Monitor connection. Polls /api/debug every 400ms.
+// without needing a Serial Monitor connection. Polls /api/debug every second.
 void handleDebugPage() {
   sendPage("Debug", "debug", false, DEBUG_BODY);
 }
@@ -2110,7 +2112,9 @@ void handleApiStatus() {
   SunCountdown sc = computeSunCountdown();
   int moonIdx = moonPhaseIndex(moonPhaseFraction());
 
-  String json = "{";
+  String json;
+  json.reserve(4096); // one allocation up front instead of one per += (polled every 7 s)
+  json = "{";
   json += "\"cityIndex\":" + String(currentCity) + ",";
   json += "\"cityNames\":[\"" + jsonEsc(getDisplayCity(locs[0])) + "\",\"" + jsonEsc(getDisplayCity(locs[1])) + "\",\"" + jsonEsc(getDisplayCity(locs[2])) + "\"],";
   json += "\"city\":\"" + jsonEsc(getDisplayCity(locs[currentCity])) + "\",";
@@ -3652,18 +3656,28 @@ void drawStatusIndicator(bool forceDraw = false) {
   tft.drawString(lastFetchOK ? (String(ageMin) + "m") : String("ERR"), STATUS_DOT_X - STATUS_DOT_R - 5, STATUS_DOT_Y + 1, 2);
 }
 
+// Change detection for the redraw checks that run on every loop() pass: a hash
+// instead of a String, so they don't allocate memory thousands of times a
+// second (that churn slowly fragments the heap until HTTPS requests fail).
+uint32_t sigInt(uint32_t h, uint32_t v) { return (h ^ v) * 16777619u; }
+uint32_t sigStr(uint32_t h, const String &s) {
+  for (unsigned int i = 0; i < s.length(); i++) h = sigInt(h, (uint8_t)s[i]);
+  return sigInt(h, 0xFF); // separator, so "ab"+"c" differs from "a"+"bc"
+}
+
 // Bottom card of the home page. When there's a fresh 2-hour outlook (radar in
 // NL/BE, 15-min forecast elsewhere) it shows that: a one-line message and a
 // bar per step. Otherwise the 3-hour steps for the next 15 hours. Only
 // redraws when something visible changed.
 void drawHomeRainPreview() {
-  static String lastSig = "";
-  String sig;
+  static uint32_t lastSig = 0;
+  uint32_t sig = 2166136261u;
   if (nowValid) {
-    sig = "N" + nowShort + "/" + String(nowVersion) + "/" + String(nowFirst) + "/" + String(modelValid() ? modFetchedAt : 0);
+    sig = sigStr(sigInt(sig, 'N'), nowShort);
+    sig = sigInt(sigInt(sigInt(sig, nowVersion), nowFirst), modelValid() ? modFetchedAt : 0);
   } else {
-    sig = "F";
-    for (int i = 0; i < upcomingRainCount; i++) sig += String(upcomingRainMm[i], 1) + ",";
+    sig = sigInt(sig, 'F');
+    for (int i = 0; i < upcomingRainCount; i++) sig = sigInt(sig, (uint32_t)lroundf(upcomingRainMm[i] * 10));
   }
   if (sig == lastSig && drawnMode == 0) return;
   lastSig = sig;
@@ -3744,8 +3758,8 @@ void drawHomeRainPreview() {
 // The home page's bottom card when the rain card is switched off: today's
 // sunrise and sunset, and how long the day is.
 void drawHomeSunCard() {
-  static String lastSig = "";
-  String sig = sunRise + "/" + sunSet;
+  static uint32_t lastSig = 0;
+  uint32_t sig = sigStr(sigStr(2166136261u, sunRise), sunSet);
   if (sig == lastSig && drawnMode == 0) return;
   lastSig = sig;
   tft.fillRect(18, 373, 284, 86, T.card);
@@ -3924,15 +3938,16 @@ SunCountdown computeSunCountdown() {
 
 // Sunrise/sunset countdown badge - ticks live while you're on the page.
 void drawAstroCountdown() {
-  static String lastLabel = "";
+  static int lastDiff = -1;
+  static bool lastRise = false;
   SunCountdown c = computeSunCountdown();
   if (c.eventName == "") return; // no data yet
 
   bool rise = c.eventName == "SUNRISE";
+  if (c.diffMin == lastDiff && rise == lastRise && drawnMode == 3) return; // nothing changed since last draw
+  lastDiff = c.diffMin; lastRise = rise;
   uint16_t fg = rise ? T.sunriseFg : T.sunsetFg, bg = rise ? T.sunriseBg : T.sunsetBg;
   String label = c.eventName + " IN " + String(c.diffMin / 60) + "H " + String(c.diffMin % 60) + "M";
-  if (label == lastLabel && drawnMode == 3) return; // nothing changed since last draw
-  lastLabel = label;
 
   int badgeW = 230, badgeH = 30, badgeCY = 440; // inside the moon card (ends at y=460)
   drawCard(160 - badgeW / 2, badgeCY - badgeH / 2, badgeW, badgeH, 8, bg, fg, T.card2);
@@ -4339,6 +4354,8 @@ void setup() {
     const char *why = r == ESP_RST_POWERON ? "power on" : r == ESP_RST_SW ? "restart" : r == ESP_RST_PANIC ? "CRASH (panic)"
       : r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT ? "CRASH (watchdog)" : r == ESP_RST_BROWNOUT ? "brownout (power dip)" : "other";
     logDebug("BOOT: reset reason " + String((int)r) + " - " + why);
+    String autoWhy = prefs.getString("rstWhy", ""); // set by memoryWatch() just before it restarts
+    if (autoWhy.length()) { logDebug("BOOT: automatic restart - " + autoWhy); prefs.remove("rstWhy"); }
   }
   themeMode = constrain(prefs.getInt("theme", THEME_AUTO), 0, 2);
   applyTheme(); // AUTO can't know about sunset yet - re-checked after the first weather fetch
@@ -4473,6 +4490,39 @@ void handleSerialCommand() {
   }
 }
 
+// --- [MEMORY WATCH] ---
+// Logs free memory once an hour (Debug page), so a slow leak or fragmentation
+// shows up as a trend. As a last resort it restarts the device when memory is
+// too low or too fragmented for an HTTPS request (one ~17 KB piece for the TLS
+// buffer, ~40 KB in all) for 10 minutes straight: a 10-second restart beats a
+// display that slowly grinds to a halt. Settings are all saved already.
+const uint32_t MEM_MIN_BLOCK = 20000, MEM_MIN_FREE = 30000;
+const unsigned long MEM_LOW_RESTART_MS = 10UL * 60000UL;
+
+void memoryWatch() {
+  static unsigned long lastCheck = 0, lastLog = 0, lowSince = 0;
+  if (lastCheck != 0 && millis() - lastCheck < 10000) return;
+  lastCheck = millis();
+  uint32_t freeH = ESP.getFreeHeap(), block = ESP.getMaxAllocHeap();
+  if (lastLog == 0 || millis() - lastLog >= 3600000UL) {
+    lastLog = millis();
+    logDebug("MEM free " + String(freeH / 1024) + " KB, largest block " + String(block / 1024) + " KB, lowest " + String(ESP.getMinFreeHeap() / 1024) + " KB");
+  }
+  if (block >= MEM_MIN_BLOCK && freeH >= MEM_MIN_FREE) { lowSince = 0; return; }
+  if (lowSince == 0) {
+    lowSince = millis();
+    logDebug("MEM low: free " + String(freeH / 1024) + " KB, largest block " + String(block / 1024) + " KB");
+    return;
+  }
+  if (millis() - lowSince < MEM_LOW_RESTART_MS || netBusy) return;
+#if USE_SD_HISTORY
+  if (hmActive) return; // let a history merge finish first
+#endif
+  if (brightnessDirty) { brightnessChangedAt = 0; saveBrightnessIfDue(); }
+  prefs.putString("rstWhy", "memory low for 10 min (free " + String(freeH / 1024) + " KB, largest block " + String(block / 1024) + " KB, up " + String(millis() / 3600000UL) + " h)");
+  ESP.restart();
+}
+
 // Times one part of loop(): anything over a second is logged with its name, so
 // a "LOOP blocked" line in the Debug log comes with the part that caused it.
 // (The name is evaluated after the call, so it can describe what just ran.)
@@ -4493,6 +4543,7 @@ void loop() {
   TIMED("WiFi check", checkWifiHealth()); // NEW: watches for a dropped connection and recovers automatically
   handleSerialCommand(); // NEW: read-only ping/status over Serial
   saveBrightnessIfDue(); // persists slider changes once you've stopped dragging
+  memoryWatch();         // hourly memory log; restarts if memory stays too low for HTTPS
 #if USE_SD_HISTORY
   TIMED(hmActive ? "history (SD merge)" : "history", historyLoop()); // NEW: background per-city history sync (one city at a time, every 6h)
 #endif
@@ -5307,6 +5358,14 @@ const char APP_JS[] PROGMEM = R"rawliteral(
 var H={'X-Requested-With':'DesktopDisplay'};
 function api(u,o){o=o||{};o.headers=Object.assign({},o.headers||{},H);return fetch(u,o);}
 var $=function(id){return document.getElementById(id);};
+// Calls fn (which returns a promise) every ms milliseconds, but only after the
+// previous call has finished, and not while the tab is hidden. setInterval
+// kept firing even when the device was slow to answer, so requests piled up,
+// and a tab forgotten in the background kept the device busy for days.
+function poll(fn,ms){var t,busy=false;
+ function run(){clearTimeout(t);if(busy||document.hidden)return;busy=true;
+  Promise.race([fn(),new Promise(function(r){setTimeout(r,15000);})]).then(function(){busy=false;t=setTimeout(run,ms);},function(){busy=false;t=setTimeout(run,ms);});}
+ document.addEventListener('visibilitychange',run);run();}
 
 // ---- theme: auto (follows the phone/PC setting) -> light -> dark
 var THEME_ICONS={auto:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor"/></svg>',
@@ -5546,7 +5605,7 @@ async function refresh(){
 }
 document.addEventListener('themechange',function(){if(cur){refresh();}});
 var rz;window.addEventListener('resize',function(){clearTimeout(rz);rz=setTimeout(function(){if(cur){rainChart(cur);nowcast(cur);}},150);});
-refresh();setInterval(refresh,7000);
+poll(refresh,7000);
 </script>
 )rawliteral";
 
@@ -5643,6 +5702,7 @@ const char DEBUG_BODY[] PROGMEM = R"rawliteral(
  <div class="drow"><span>Display page</span><span id="mode">--</span></div>
  <div class="drow"><span>Uptime</span><span id="uptime">--</span></div>
  <div class="drow"><span>Free heap</span><span id="heap">--</span></div>
+ <div class="drow"><span>Largest free block</span><span id="block">--</span></div>
  <div class="drow"><span>Longest freeze</span><span id="loopMax">--</span></div>
  <div class="drow"><span>WiFi</span><span id="wifi">--</span></div>
 </section>
@@ -5661,12 +5721,13 @@ async function refresh(){
   $('mode').innerText=d.displayMode+' ('+(PAGES[d.displayMode]||'?')+')';
   var u=d.uptimeSec;$('uptime').innerText=(u>=86400?Math.floor(u/86400)+'d ':'')+Math.floor(u%86400/3600)+'h '+Math.floor(u%3600/60)+'m '+(u%60)+'s';
   $('heap').innerText=(d.freeHeap/1024).toFixed(1)+' KB'+(d.minHeap?' (lowest '+(d.minHeap/1024).toFixed(1)+' KB)':'');
+  var bk=$('block');bk.innerText=d.maxBlock==null?'--':(d.maxBlock/1024).toFixed(1)+' KB';bk.className=d.maxBlock<30720?'bad':'ok';
   $('loopMax').innerText=d.loopMaxMs==null?'--':(d.loopMaxMs/1000).toFixed(1)+' s';
   var w=$('wifi');w.innerText=d.wifiConnected?'connected':'DISCONNECTED';w.className=d.wifiConnected?'ok':'bad';
   $('log').innerText=d.log.join('\n');
   $('sources').innerHTML=(d.sources||[]).map(function(x){return '<div class="drow" style="display:block"><div style="display:flex;justify-content:space-between;gap:10px"><b>'+x.name+'</b><span class="'+(x.ok?'ok':'bad')+'">'+(x.ok?'OK':'not available')+' &middot; '+x.age+'</span></div><div class="muted small" style="margin-top:3px;font-family:inherit;font-weight:400">'+String(x.info).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];})+'</div></div>';}).join('');
  }catch(e){$('log').innerText='connection lost: '+e;}
 }
-refresh();setInterval(refresh,400);
+poll(refresh,1000);
 </script>
 )rawliteral";
