@@ -2553,6 +2553,7 @@ bool histMergeBegin(int i, int n, int overwriteFrom, String dropFrom) {
 
 // Stops a running merge for city i (or any city with -1) and throws the half-written file away.
 void histMergeAbort(int i) {
+  histCheckAbort(i); // a backfill check reading the same file
   if (!hmActive || (i >= 0 && hmCity != i)) return;
   int c = hmCity;
   histMergeClose();
@@ -2651,18 +2652,90 @@ void histSyncDone(int i, bool ok) {
   if (ok && millis() - histLastStorageRefresh > HIST_STORAGE_REFRESH_MS) histRefreshStorage();
 }
 
+// Before a backfill chunk is downloaded, the city's file is read to see
+// whether every day in it is already there with all 8 values. If so, the
+// download and the rewrite of the whole file are skipped, so re-running a
+// backfill only fetches what is really missing. The file is sorted, so the
+// check stops at the chunk's last day; it reads in ~25 ms slices like the merge.
+bool hcActive = false;
+int hcCity = -1, hcHave = 0;
+String hcStart, hcEnd, hcLast; // hcLast: previous row's date, so a duplicated day isn't counted twice
+File hcFile;
+LineReader *hcReader = nullptr;
+int hcReadyCity = -1; // checked and incomplete: download this chunk next
+String hcReadyEnd;
+
+void histCheckClose() {
+  if (hcReader) { delete hcReader; hcReader = nullptr; }
+  if (hcFile) hcFile.close();
+  hcActive = false;
+}
+
+void histCheckAbort(int i) {
+  if (hcReadyCity == i || i < 0) hcReadyCity = -1;
+  if (hcActive && (i < 0 || hcCity == i)) histCheckClose();
+}
+
+// A row counts only with all 8 values (rows from older versions lack wind/sun,
+// which a backfill adds) and no 999 placeholder from the original logger.
+bool histRowComplete(const String &line) {
+  String f[8];
+  if (histSplit(line, f, 8) < 8) return false;
+  for (int k = 1; k < 8; k++) if (!histFieldOK(f[k])) return false;
+  return f[1].toFloat() < 900 && f[2].toFloat() > -900;
+}
+
+void histCheckStep() {
+  unsigned long t0 = millis();
+  String line;
+  bool done = false;
+  while (!done && millis() - t0 < 25) {
+    if (!hcReader->next(line)) { done = true; break; }
+    line.trim();
+    if (line.length() < 10) continue;
+    String d = line.substring(0, 10);
+    if (d > hcEnd) done = true; // sorted: nothing further can be in the chunk
+    else if (d >= hcStart && d != hcLast && histRowComplete(line)) hcHave++;
+    hcLast = d;
+  }
+  if (!done) return; // more next time
+
+  int i = hcCity;
+  histCheckClose();
+  if (!bfActive[i]) return; // stopped meanwhile
+  int days = (int)((histDateToTime(hcEnd) - histDateToTime(hcStart)) / 86400L) + 1;
+  histLastAttempt = 0; // no 15 s wait: the next step needs no request yet, or is the one this check was for
+  if (hcHave >= days) {
+    hjChunkStart = hcStart;
+    histBackfillDone(i);
+    if (bfActive[i]) bfMsg[i] = "Already complete back to " + hcStart;
+  } else {
+    hcReadyCity = i; hcReadyEnd = hcEnd;
+  }
+}
+
 // One backfill chunk (up to 90 days) from the historical archive, fill-only.
-// One backfill chunk (up to 90 days) from the historical archive, fill-only.
+// Checks the file first (see above) and only downloads when days are missing.
 bool histBackfillChunk(int i) {
   if (bfCursor[i] < bfStart[i]) { histBackfillStop(i, "Done - history goes back to " + bfStart[i]); return true; }
   String chunkEnd = bfCursor[i];
   String chunkStart = histAddDays(chunkEnd, -(HIST_BF_CHUNK_DAYS - 1));
   if (chunkStart < bfStart[i]) chunkStart = bfStart[i];
+  if (hcReadyCity != i || hcReadyEnd != chunkEnd) {
+    hcReadyCity = -1;
+    if (SD.exists(histPath(i))) hcFile = SD.open(histPath(i), FILE_READ);
+    if (hcFile) {
+      hcReader = new LineReader(hcFile);
+      hcActive = true; hcCity = i; hcHave = 0; hcStart = chunkStart; hcEnd = chunkEnd; hcLast = "";
+      return true;
+    }
+  }
   double lat = 0, lon = 0;
   if (!getCityCoords(i, lat, lon)) { histBackfillFailed(i); return true; }
   String url = "https://archive-api.open-meteo.com/v1/archive?latitude=" + String(lat, 4) + "&longitude=" + String(lon, 4)
     + "&start_date=" + chunkStart + "&end_date=" + chunkEnd + "&daily=" + String(HIST_DAILY_VARS) + "&timezone=auto";
-  if (!netPost(NJ_HIST, i, 1, 0, histEpoch[i], url)) return false;
+  if (!netPost(NJ_HIST, i, 1, 0, histEpoch[i], url)) return false; // still checked: the download is retried next time
+  hcReadyCity = -1;
   histJobPending = true; hjKind = 1; hjCity = i; hjChunkStart = chunkStart;
   return true;
 }
@@ -2735,6 +2808,7 @@ void historyLoop() {
   if (millis() - lastLocCheck > 2000) { lastLocCheck = millis(); histCheckLocations(); }
 
   if (hmActive) { histMergeStep(); return; } // a merge in progress, a slice at a time
+  if (hcActive) { histCheckStep(); return; } // a backfill check, a slice at a time
   if (histJobPending) return;                 // waiting for the background download
   if (WiFi.status() != WL_CONNECTED || isUpdating || netBusy) return;
   if (histLastAttempt != 0 && millis() - histLastAttempt < HIST_MIN_GAP_MS) return;
@@ -4864,7 +4938,7 @@ const char HISTORY_PAGE_BOTTOM[] PROGMEM = R"rawliteral(
 <select id='bfCity'></select> back <select id='bfYears'><option value='1'>1 year</option><option value='2'>2 years</option><option value='5' selected>5 years</option><option value='10'>10 years</option></select>
 <button onclick='doBackfill()'>Start</button><button onclick='stopBackfill()'>Stop</button>
 <div id='bfStatus' class='note' style='text-align:left;'></div>
-<div class='note' style='text-align:left;'>Runs in the background on the device (one 90-day chunk about every 15 seconds) and only fills days that are missing, so it's safe to run again. 5 years for all three cities uses roughly 1,000 of Open-Meteo's 10,000 free daily API calls; 10 years roughly 2,000. It continues after a restart.</div>
+<div class='note' style='text-align:left;'>Runs in the background on the device (one 90-day chunk about every 15 seconds) and only fills days that are missing, so it's safe to run again: chunks that are already complete are skipped without a download. 5 years for all three cities uses roughly 1,000 of Open-Meteo's 10,000 free daily API calls; 10 years roughly 2,000. It continues after a restart.</div>
 </div>
 <div class='mg'><h3>Export to CSV</h3><div id='expRow'></div></div>
 <div class='mg'><h3>Import from CSV</h3>

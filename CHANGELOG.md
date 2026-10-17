@@ -5,6 +5,7 @@ All notable changes to this project are listed here.
 ## [Unreleased]
 
 ### Added
+- Backfill skips what's already there: before downloading a 90-day chunk it checks the city's file, and when every day in it already has all values it skips the download and the rewrite of the whole file. Re-running a backfill now only fetches missing or incomplete days (status: "Already complete back to ...")
 - README with screenshots of the display and the web dashboard (desktop and phone) that follow your GitHub light/dark theme, and a short Highlights section
 - Rain in the next 2 hours: Buienradar radar for cities in the Netherlands/Belgium (5-minute steps, refreshed every 5 minutes), Open-Meteo 15-minute forecast elsewhere. Shown on the home screen, the Precipitation page and the dashboard. Rain only "starts" or "stops" on two consecutive steps, values under 0.1 mm/h count as dry, and the outlook disappears when the data is more than 15 minutes old
 - LED rain alert (web Settings, with a test button): the LED dims twice, slowly, when rain is expected within 30 minutes, once per rain spell
