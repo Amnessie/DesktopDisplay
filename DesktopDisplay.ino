@@ -4465,9 +4465,32 @@ void setup() {
 // never changes anything - so it can't interfere with normal operation.
 // Type "ping" or "status" into the Serial Monitor's message box and hit
 // Enter (line ending set to "New Line" or "Newline" works fine).
+//
+// Reads whatever has arrived without waiting, at most 64 bytes per loop()
+// pass, and drops overlong lines. Serial.readStringUntil() blocked for as long
+// as bytes kept coming and grew its String without limit, so noise on the RX
+// pin (or a PC program probing the COM port) froze the device for tens of
+// seconds at a time.
+void runSerialCommand(String cmd);
+
 void handleSerialCommand() {
-  if (!Serial.available()) return;
-  String cmd = Serial.readStringUntil('\n');
+  static char buf[33];
+  static uint8_t len = 0;
+  static bool overflow = false;
+  for (int n = 0; n < 64 && Serial.available(); n++) {
+    char ch = (char)Serial.read();
+    if (ch != '\n') {
+      if (len < sizeof(buf) - 1) buf[len++] = ch; else overflow = true;
+      continue;
+    }
+    buf[len] = 0;
+    bool skip = overflow;
+    len = 0; overflow = false;
+    if (!skip) runSerialCommand(String(buf));
+  }
+}
+
+void runSerialCommand(String cmd) {
   cmd.trim();
   cmd.toLowerCase();
 
@@ -4541,7 +4564,7 @@ void loop() {
   lastLoopAt = loopNow;
   TIMED(String("web page ") + server.uri(), server.handleClient());
   TIMED("WiFi check", checkWifiHealth()); // NEW: watches for a dropped connection and recovers automatically
-  handleSerialCommand(); // NEW: read-only ping/status over Serial
+  TIMED("serial input", handleSerialCommand()); // NEW: read-only ping/status over Serial
   saveBrightnessIfDue(); // persists slider changes once you've stopped dragging
   memoryWatch();         // hourly memory log; restarts if memory stays too low for HTTPS
 #if USE_SD_HISTORY
@@ -4592,7 +4615,8 @@ void loop() {
 #if DIAG_DISABLE_TOUCH
   bool pressed = false; // DIAGNOSTIC: touch read skipped - see DIAG_DISABLE_TOUCH above
 #else
-  bool pressed = tft.getTouch(&rawX, &rawY);
+  bool pressed = false;
+  TIMED("touch read", pressed = tft.getTouch(&rawX, &rawY));
 #endif
   uint16_t x, y;
   if (pressed) {
